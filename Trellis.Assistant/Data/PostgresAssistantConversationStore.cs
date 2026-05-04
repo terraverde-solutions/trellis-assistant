@@ -23,15 +23,18 @@ namespace Trellis.Assistant.Data;
 ///
 /// AppendTurnsAsync acquires a transaction-scoped Postgres advisory
 /// lock keyed on the conversation id before computing the next
-/// position — this serializes concurrent appends to the same
-/// conversation across the orchestrator's full read-history → call-LLM
-/// → persist sequence. The orchestrator owns the outer transaction +
-/// the lock acquisition; this method participates in that transaction
-/// when one is active. (Phase 1 ships the lock acquisition INSIDE this
-/// method since the orchestrator's transaction wraps a single
-/// AppendTurnsAsync call; Phase 3+ tool-dispatch may move the lock
-/// acquisition to the orchestrator layer when multiple LLM/tool
-/// round-trips need to share one lock window.)
+/// position. The lock covers the position read + the INSERT pair —
+/// it serializes position assignment and prevents unique-constraint
+/// races on (conversation_id, position). It does NOT cover the
+/// orchestrator's history read or LLM call (those run BEFORE this
+/// method is entered). For Phase 1 that's acceptable: the stub LLM
+/// is history-independent and each AppendTurnsAsync writes an atomic
+/// user+assistant pair at unique positions. Phase 3+ tool-dispatch
+/// MUST re-evaluate this boundary — if multiple LLM/tool round-trips
+/// need to observe each other's intermediate turns, the lock window
+/// expands to the orchestrator layer (orchestrator opens the
+/// transaction, AppendTurnsAsync becomes a persist-only step inside
+/// it).
 /// </summary>
 public sealed class PostgresAssistantConversationStore : IAssistantConversationStore
 {
@@ -161,21 +164,33 @@ public sealed class PostgresAssistantConversationStore : IAssistantConversationS
         // Acquire the per-conversation advisory lock. hashtextextended +
         // the GUID-as-text form gives a stable 64-bit key that's the
         // same across reconnections — no risk of two callers hashing
-        // to different keys.
+        // to different keys. The interpolation hole binds as a
+        // parameter; the trailing ::text cast disambiguates the
+        // hashtextextended(text, bigint) overload so Postgres doesn't
+        // have to resolve overloads from a CLR-string parameter type.
+        var lockKey = conversationId.ToString();
         await _db.Database
             .ExecuteSqlInterpolatedAsync(
-                $"SELECT pg_advisory_xact_lock(hashtextextended({conversationId.ToString()}, 0))",
+                $"SELECT pg_advisory_xact_lock(hashtextextended({lockKey}::text, 0))",
                 cancellationToken)
             .ConfigureAwait(false);
 
-        // Compute the next position under the lock. MAX over the join is
-        // tenant-scoped so a forgotten WHERE on the inner query couldn't
-        // pull in another tenant's turn count.
-        var nextPosition = (await _db.Turns
+        // Compute the next position under the lock. The bare WHERE on
+        // conversationId is sufficient because ownerCheck above already
+        // confirmed this conversationId belongs to (tenantId, userId)
+        // — and we hold the advisory lock so no concurrent writer can
+        // change ownership underneath us.
+        //
+        // MAX returns null on an empty turns set (first append). Read
+        // it as int? then explicit (-1) sentinel + 1 gives 0 for the
+        // empty case and (max + 1) otherwise — unambiguous in either
+        // direction without leaning on null + 1 = null nullable arithmetic.
+        var maxPosition = await _db.Turns
             .Where(t => t.ConversationId == conversationId)
             .Select(t => (int?)t.Position)
             .MaxAsync(cancellationToken)
-            .ConfigureAwait(false)) + 1 ?? 0;
+            .ConfigureAwait(false);
+        var nextPosition = (maxPosition ?? -1) + 1;
 
         var now = DateTime.UtcNow;
         var entities = new List<TurnEntity>(turns.Count);
@@ -195,16 +210,25 @@ public sealed class PostgresAssistantConversationStore : IAssistantConversationS
             });
         }
         _db.Turns.AddRange(entities);
+        await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
 
         // Bump the parent conversation's UpdatedAt so a future "list
         // conversations newest-first" query has a single sortable column.
-        var parent = await _db.Conversations
-            .Where(c => c.Id == conversationId)
-            .FirstAsync(cancellationToken)
+        // ExecuteUpdateAsync issues a single UPDATE without loading the
+        // entity into the change tracker — under Phase 3+ load this
+        // matters; in Phase 1 the win is just keeping the tenant filter
+        // unmissable on the WHERE clause. The (tenantId, userId) filter
+        // mirrors the chokepoint contract spelled out in this class's
+        // XML doc — every query in this impl carries it.
+        await _db.Conversations
+            .Where(c => c.Id == conversationId
+                     && c.TenantId == tenantId
+                     && c.UserId == userId)
+            .ExecuteUpdateAsync(
+                s => s.SetProperty(c => c.UpdatedAt, now),
+                cancellationToken)
             .ConfigureAwait(false);
-        parent.UpdatedAt = now;
 
-        await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
         await tx.CommitAsync(cancellationToken).ConfigureAwait(false);
 
         return entities.Select(ToCore).ToList();

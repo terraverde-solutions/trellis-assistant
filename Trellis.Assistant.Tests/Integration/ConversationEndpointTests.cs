@@ -207,16 +207,20 @@ public sealed class ConversationEndpointTests : IClassFixture<PostgresFixture>, 
         resp.StatusCode.Should().Be(HttpStatusCode.Unauthorized);
     }
 
-    [SkippableFact]
-    public async Task PostConversations_WithEmptyHeaders_Returns401()
+    [SkippableTheory]
+    [InlineData("   ", "")]
+    [InlineData("", "   ")]
+    [InlineData("   ", "   ")]
+    [InlineData("", "")]
+    public async Task PostConversations_WithBlankHeaders_Returns401(string tenant, string user)
     {
         Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
 
-        using var client = NewClient(tenantId: "   ", userId: "");
+        using var client = NewClient(tenantId: tenant, userId: user);
         var resp = await client.PostAsJsonAsync("/api/conversations",
             new ConversationEndpoints.CreateConversationRequest(Channel: "api"));
         resp.StatusCode.Should().Be(HttpStatusCode.Unauthorized,
-            "whitespace + empty headers are treated as absent — no surprise auth-bypass via space-padded values");
+            "whitespace + empty headers on either side are treated as absent — no surprise auth-bypass via space-padded values");
     }
 
     // ---------------- Test #4 (concurrency) ----------------
@@ -270,10 +274,15 @@ public sealed class ConversationEndpointTests : IClassFixture<PostgresFixture>, 
             opts => opts.WithStrictOrdering(),
             "positions must be contiguous 0..(2N-1); no gaps, no duplicates");
 
-        // User + assistant alternation: with the lock holding for the
-        // full read-history → call-LLM → persist sequence, each request
-        // sees a complete 2-row block at a stable starting position.
-        // Roles must alternate user, assistant, user, assistant, ...
+        // User + assistant alternation: each AppendTurnsAsync call
+        // inserts a contiguous (user, assistant) pair under the
+        // advisory lock — the lock covers position assignment + the
+        // INSERT pair, NOT the upstream history read or LLM call. So
+        // even though histories may have been read concurrently, the
+        // per-pair atomic persistence keeps positions alternating
+        // user, assistant, user, assistant, ... starting at even
+        // indices. (See ConversationOrchestrator's CONCURRENCY
+        // CONTRACT for the full reasoning.)
         for (var i = 0; i < concurrentCount; i++)
         {
             getBody.Turns[i * 2].Role.Should().Be("user",

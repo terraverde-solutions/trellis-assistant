@@ -19,29 +19,45 @@ namespace Trellis.Assistant.Services;
 ///
 /// CONCURRENCY CONTRACT — load-bearing.
 ///
-/// Concurrent POST /turns requests on the same conversation MUST queue,
-/// not interleave. A chat is intrinsically ordered: turn N's persistence
-/// happens before turn N+1's history-read can begin. We enforce this via
-/// a per-conversation Postgres advisory lock acquired inside the
-/// <see cref="IAssistantConversationStore.AppendTurnsAsync"/>
-/// transaction. The lock is transaction-scoped — it releases on commit
-/// OR rollback OR connection drop, no leak risk.
+/// The per-conversation Postgres advisory lock is acquired INSIDE
+/// <see cref="IAssistantConversationStore.AppendTurnsAsync"/>, covering
+/// the position read + the INSERT pair. This serializes position
+/// assignment and prevents unique-constraint races on
+/// (conversation_id, position).
 ///
-/// The lock + the per-request timeout are NOT separable concerns. ASP.NET
-/// Core's default per-request timeout is "no timeout"; combined with a
-/// stuck LLM call that never responds, the advisory lock would be held
-/// indefinitely and every other concurrent request to that conversation
-/// would queue forever. The endpoint MUST configure an explicit per-
-/// request CancellationToken with a wall-clock deadline:
+/// It does NOT serialize history reads or LLM calls: two concurrent
+/// requests on the same conversation can read the same history snapshot
+/// and call the LLM concurrently. For Phase 1 this is acceptable —
+/// the stub LLM result is independent of history, and each append
+/// writes an atomic user+assistant pair at a unique position, so
+/// the persisted shape is always alternating user/assistant from an
+/// even starting position regardless of read-history interleaving.
+///
+/// Phase 3 (tool dispatch) MUST re-evaluate this boundary: if
+/// tool-dispatch rounds need to observe each other's intermediate
+/// turns, the lock scope must expand to the orchestrator layer
+/// (open the transaction in the orchestrator, hold for the full
+/// sequence, AppendTurnsAsync becomes a persist-only step inside
+/// the orchestrator's broader transaction).
+///
+/// The lock + the per-request timeout ARE NOT separable. ASP.NET
+/// Core's default per-request timeout is "no timeout"; without a
+/// wall-clock budget, a stuck LLM call holds the advisory lock
+/// (on the eventual AppendTurnsAsync) until the connection drops.
+/// The endpoint MUST configure an explicit per-request CT deadline:
 ///   - Phase 1: 60 s (well above the stub's ~200 ms 5-chunk yield budget)
 ///   - Phase 2: 180 s (real Ollama; cold-loading a 70B model can take
-///     >60 s on first call)
-/// On timeout, the linked CT trips, the LLM call cancels, the advisory
-/// lock releases via transaction abort, the next queued request proceeds.
+///     &gt;60 s on first call)
+/// On timeout, the linked CT trips, the LLM call cancels, the
+/// in-flight AppendTurnsAsync transaction (if running) aborts and
+/// releases the advisory lock, the next queued append proceeds.
 ///
-/// Pin: <see cref="ConversationOrchestratorTests"/> covers the
-/// concurrent-requests-on-same-conversation case + the timeout-releases-
-/// the-lock case.
+/// Pin: ConversationEndpointTests
+/// .PostTurns_ConcurrentRequestsOnSameConversation_PreserveOrderingAndUniqueness
+/// covers concurrent requests on the same conversation; that test
+/// passes precisely because each append writes a contiguous
+/// (user, assistant) pair under the lock, not because the lock
+/// holds across the history-read + LLM call.
 /// </summary>
 public sealed class ConversationOrchestrator
 {
@@ -141,9 +157,12 @@ public sealed class ConversationOrchestrator
         var assistantContent = assistantBuffer.ToString();
 
         // Persist user + assistant turns in one AppendTurnsAsync call.
-        // The store acquires the per-conversation advisory lock for the
-        // duration of the transaction; positions are computed inside the
-        // lock so concurrent requests can't race the unique constraint.
+        // The store acquires the per-conversation advisory lock around
+        // the position read + INSERT pair (NOT around the history read
+        // or LLM call above — see CONCURRENCY CONTRACT in this class's
+        // XML doc). Positions are computed under the lock, so concurrent
+        // requests can't race the unique constraint on
+        // (conversation_id, position).
         var newTurns = await _store
             .AppendTurnsAsync(
                 tenantId,
