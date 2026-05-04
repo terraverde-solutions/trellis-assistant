@@ -1,0 +1,48 @@
+# .NET
+bin/
+obj/
+[Dd]ebug/
+[Rr]elease/
+*.user
+*.suo
+*.userprefs
+
+# Test results
+TestResults/
+[Cc]overage/
+*.coverage
+*.coveragexml
+
+# Editors
+.vs/
+.idea/
+*.DotSettings.user
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build / temp / publish
+*.binlog
+*.log
+[Pp]ublish/
+publish_*/
+
+# NuGet
+*.nupkg
+**/packages/
+
+# Secrets — operator-local config + key material; canonical exclude pattern
+# (also enforced at the csproj level via <None Remove> + <Content Remove>
+# so a leaked file never rides into a `dotnet publish` bundle, mirroring
+# trellis-trainer #41 / trellis-web #14 / trellis-server #56). Defense in
+# depth: gitignore stops accidental commit; csproj stops publish leak.
+appsettings.user.json
+appsettings.Development.json
+appsettings.Production.json
+*.keystore
+*.pfx
+*.key
+*.p12
