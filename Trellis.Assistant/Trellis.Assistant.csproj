@@ -1,0 +1,53 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>Trellis.Assistant</RootNamespace>
+    <AssemblyName>Trellis.Assistant</AssemblyName>
+    <Description>Always-on personal AI surface for the TerraVerde Trellis system. Voice-first multi-channel presence; MCP-based tool dispatch; cross-surface memory. Phase 0 scaffold — orchestrator + channel adapters + tool dispatch + voice land in Phase 1+.</Description>
+    <Authors>Terraverde Solutions LLC</Authors>
+    <Company>Terraverde Solutions LLC</Company>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- appsettings.user.json is operator-local Dev convenience; gitignored.
+         Microsoft.NET.Sdk.Web's implicit auto-include for appsettings*.json
+         classifies the file as <Content> with CopyToOutputDirectory=PreserveNewest,
+         so it rides into `dotnet publish`'s output by default and onto the
+         deployed host. On 2026-05-02 a developer's local Postgres connection
+         string leaked onto GB10 via this exact path during the trainer-qa
+         bootstrap. The canonical fix landed in trellis-trainer PR #41,
+         trellis-web PR #14, and trellis-server PR #56; Assistant's csproj
+         carries it from day one so Phase 0 doesn't repeat the bootstrap-day
+         appsettings leak.
+
+         Two Remove rules — defense in depth. The SDK uses <Content>; the
+         <Content Remove> line is the load-bearing one. The <None Remove>
+         line covers the variant where a future SDK change (or another
+         project tweaking these implicit-include semantics) reclassifies
+         the file as <None>. Either rule is silent if its target item type
+         doesn't carry the file; together they guarantee the file is gone
+         from publish output regardless of which item-type the SDK uses.
+
+         Pinned by Trellis.Assistant.Tests/DotnetPublishTests, which
+         actually invokes `dotnet publish` against this project + asserts
+         the file is absent from the output dir. An XML-only test would
+         false-green: trainer #41's broken <None Update> form passed XML
+         inspection but still leaked, because the SDK classifies the file
+         as <Content> not <None>. -->
+    <None Remove="appsettings.user.json" />
+    <Content Remove="appsettings.user.json" />
+  </ItemGroup>
+
+  <!-- Trellis.Core lives in a sibling repo at ..\..\core\. Local builds
+       assume that layout (per trellis-docs/MarkdownFiles/56-project-structure.md).
+       Phase 0 doesn't actually consume any Trellis.Core types yet — the
+       reference is wired up so Phase 1 can pull in BearerAuthHandler /
+       ITenantIdProvider / IOllamaClient without a project-shape change. -->
+  <ItemGroup>
+    <ProjectReference Include="..\..\core\Trellis.Core\Trellis.Core.csproj" />
+  </ItemGroup>
+
+</Project>
