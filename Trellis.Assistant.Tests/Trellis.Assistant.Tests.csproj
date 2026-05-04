@@ -17,6 +17,13 @@
     <PackageReference Include="FluentAssertions" Version="6.*" />
     <PackageReference Include="Microsoft.AspNetCore.Mvc.Testing" Version="10.0.7" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <!-- Testcontainers.PostgreSql for the EF migration smoke + endpoint
+         integration tests. Same package + version as trellis-trainer's
+         test project so a developer with Docker already running for
+         trainer-qa work gets immediate test execution; without Docker,
+         the integration tests skip cleanly via Skip.IfNot(IsDockerAvailable). -->
+    <PackageReference Include="Testcontainers.PostgreSql" Version="4.11.0" />
+    <PackageReference Include="Xunit.SkippableFact" Version="1.5.23" />
     <PackageReference Include="xunit" Version="2.9.2" />
     <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
   </ItemGroup>
