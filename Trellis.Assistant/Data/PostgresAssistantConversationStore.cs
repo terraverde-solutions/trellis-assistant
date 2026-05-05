@@ -49,6 +49,7 @@ public sealed class PostgresAssistantConversationStore : IAssistantConversationS
         string tenantId,
         string userId,
         string channel,
+        string? model,
         CancellationToken cancellationToken = default)
     {
         ValidateTenantUser(tenantId, userId);
@@ -63,6 +64,14 @@ public sealed class PostgresAssistantConversationStore : IAssistantConversationS
             TenantId = tenantId,
             UserId = userId,
             Channel = channel,
+            // Model: caller-supplied value wins; otherwise apply the
+            // column DEFAULT manually on the C# side. EF tracks every
+            // property by default, so we can't omit it from the INSERT
+            // and rely on the SQL DEFAULT to fill in — the SQL DEFAULT
+            // is defense-in-depth for raw inserts (see EFMigrationSmokeTests
+            // pattern). Keep the C# default in sync with the migration's
+            // DEFAULT: "mistral-small:24b".
+            Model = string.IsNullOrWhiteSpace(model) ? "mistral-small:24b" : model,
             CreatedAt = now,
             UpdatedAt = now,
         };
@@ -247,6 +256,7 @@ public sealed class PostgresAssistantConversationStore : IAssistantConversationS
         TenantId: e.TenantId,
         UserId: e.UserId,
         Channel: e.Channel,
+        Model: e.Model,
         CreatedAt: e.CreatedAt,
         UpdatedAt: e.UpdatedAt);
 

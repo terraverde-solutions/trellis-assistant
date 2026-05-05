@@ -52,6 +52,7 @@ public sealed class EFMigrationSmokeTests : IClassFixture<PostgresFixture>
             new ColumnShape("tenant_id", "character varying", IsNullable: false, ColumnDefault: null),
             new ColumnShape("user_id", "character varying", IsNullable: false, ColumnDefault: null),
             new ColumnShape("channel", "character varying", IsNullable: false, ColumnDefault: "'api'::character varying"),
+            new ColumnShape("model", "character varying", IsNullable: false, ColumnDefault: "'mistral-small:24b'::character varying"),
             new ColumnShape("created_at", "timestamp with time zone", IsNullable: false, ColumnDefault: null),
             new ColumnShape("updated_at", "timestamp with time zone", IsNullable: false, ColumnDefault: null),
         }, opts => opts.WithoutStrictOrdering(),
@@ -140,6 +141,32 @@ public sealed class EFMigrationSmokeTests : IClassFixture<PostgresFixture>
             .SingleAsync(c => c.Id == id);
         inserted.Channel.Should().Be("api",
             "DEFAULT 'api' on the channel column applies to inserts that don't specify channel");
+    }
+
+    [SkippableFact]
+    public async Task Migration_ModelDefault_ApplyAtRawSqlInsert()
+    {
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        await using var db = NewContext();
+        await db.Database.MigrateAsync();
+
+        // Raw SQL insert that omits the model column — the DEFAULT
+        // 'mistral-small:24b' (Phase 2 add) should apply at the DB layer.
+        // Defense-in-depth for non-EF inserts; the C# side in
+        // PostgresAssistantConversationStore.CreateConversationAsync also
+        // applies the same default explicitly because EF tracks every
+        // property and would send NULL otherwise.
+        var id = Guid.NewGuid();
+        await db.Database.ExecuteSqlInterpolatedAsync($@"
+            INSERT INTO conversations (id, tenant_id, user_id, created_at, updated_at)
+            VALUES ({id}, 't1', 'u1', NOW(), NOW())");
+
+        var inserted = await db.Conversations
+            .AsNoTracking()
+            .SingleAsync(c => c.Id == id);
+        inserted.Model.Should().Be("mistral-small:24b",
+            "DEFAULT 'mistral-small:24b' on the model column applies to inserts that don't specify model");
     }
 
     private AssistantDbContext NewContext()

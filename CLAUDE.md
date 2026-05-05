@@ -2,13 +2,13 @@
 
 Part of the **TerraVerde Trellis System**. Canonical system docs are in the
 `trellis-docs` repo at <https://github.com/terraverde-solutions/trellis-docs>
-(or locally at `c:\dev\trellis-kimi\docs\MarkdownFiles\` if you have the
-sibling clone).
+(or locally at `c:\dev\docs\MarkdownFiles\` if you have the sibling clone).
 
 Read first:
 - [`MarkdownFiles/50-trellis-for-llms.md`](https://github.com/terraverde-solutions/trellis-docs/blob/main/MarkdownFiles/50-trellis-for-llms.md) — system overview
 - [`MarkdownFiles/59-trellis-assistant.md`](https://github.com/terraverde-solutions/trellis-docs/blob/main/MarkdownFiles/59-trellis-assistant.md) — Assistant design (the source of truth)
 - [`MarkdownFiles/56-project-structure.md`](https://github.com/terraverde-solutions/trellis-docs/blob/main/MarkdownFiles/56-project-structure.md) — repo layout + sibling-repo project-reference convention
+- [`docs/phase-2-design.md`](docs/phase-2-design.md) — Phase 2 design rationale (Q1–Q5 ratifications, worker concerns, scope deltas from Phase 1)
 
 ## What this component is
 
@@ -22,27 +22,31 @@ phase + guard-rails for what NOT to do yet.
 
 ## Status
 
-**Phase 0 scaffold.** What exists:
+**Phase 2 — real Ollama wiring landed.** What exists:
 
 - ASP.NET Core net10.0 minimal-API project (`Microsoft.NET.Sdk.Web`)
-- A single `/healthz` endpoint returning `{"status":"ok"}`
-- `Trellis.Assistant.Tests` xUnit project with 4 tests:
-  - `Get_Healthz_Returns200`
-  - `Get_Healthz_BodyHasStatusOk`
-  - `DotnetPublish_DoesNotCopy_AppsettingsUserJson_IntoPublishOutput` (Integration trait)
-  - `Appsettings_DoesNotPin_UrlsKey`
-- `<None Remove>` + `<Content Remove>` for `appsettings.user.json` from day one (canonical pattern from trainer #41 / web #14 / server #56)
-- ProjectReference to sibling `..\..\core\Trellis.Core\Trellis.Core.csproj` (wired but not consumed in Phase 0)
-- Deploy infrastructure in [`trellis-deploy/scripts/qa/`](https://github.com/terraverde-solutions/trellis-deploy/tree/main/scripts/qa) (parallel PR): unit + env file + nginx vhosts (GB10 + Hetzner) + bootstrap walkthrough + `Deploy-Assistant-Standalone.ps1` with the post-deploy smoke wrapper
+- Three conversation endpoints under `/api/conversations`:
+  - `POST /api/conversations` — create with optional channel + model
+  - `GET /api/conversations/{id}` — read conversation + all turns
+  - `POST /api/conversations/{id}/turns` — append user turn + stream LLM reply, persist atomically
+- Two operational endpoints:
+  - `/healthz` — liveness (200 once Kestrel listens)
+  - `/readyz` — readiness (200 once `OllamaWarmupHostedService` has succeeded; 503 until then)
+- `TenantHeadersMiddleware` validates `X-Trellis-Tenant-Id` + `X-Trellis-User-Id` for `/api/*`; bypasses `/healthz` + `/readyz`
+- Postgres-backed `IAssistantConversationStore` impl with per-conversation advisory lock around position assignment + INSERT pair
+- Real `Trellis.Core.Services.OllamaClient` wired via `IHttpClientFactory` (Phase 1's stub still in the binary for tests)
+- Per-conversation model selection: `conversations.model varchar(64) NOT NULL DEFAULT 'mistral-small:24b'`; pinned at create time, immutable for Phase 2
+- 31-test suite (3 + 19 + 5 + 1 SkippableFact + 2 + 1 in `RealOllamaSmokeTests`) — see test breakdown in README
 
-What does NOT exist (Phase 1+):
+What does NOT exist (Phase 3+):
 
-- Orchestrator (`IAssistantOrchestrator`)
-- Channel adapters (Slack / WhatsApp / Telegram webhook handlers)
-- Tool dispatch (MCP client, `send_message`, `search_documents`, etc.)
+- First tool: `search_documents` → Trainer integration (Phase 3)
+- Streaming responses to the HTTP caller via SSE (Phase 3+)
+- Channel adapters (Slack / WhatsApp / Telegram webhook handlers — Phase 4)
+- Tool dispatch (MCP client, `send_message`, etc.)
 - Voice (TTS / STT, push-to-talk, wake word)
-- Cross-surface memory / `IConversationStore` integration
-- Identity / sandboxing / DM allowlist
+- Cross-surface memory + `IConversationStore` integration
+- Identity / sandboxing / DM allowlist (Phase 5)
 - Production deploy (Hetzner)
 
 ## Solution layout
@@ -51,44 +55,113 @@ What does NOT exist (Phase 1+):
 Trellis.Assistant.sln
 ├── Trellis.Assistant/
 │   ├── Trellis.Assistant.csproj   Microsoft.NET.Sdk.Web, net10.0,
+│   │                                TreatWarningsAsErrors=true,
 │   │                                ProjectReference Trellis.Core,
+│   │                                EF Core 10 + Npgsql 10.0.1, Ulid 1.3.4,
 │   │                                canonical appsettings.user.json
 │   │                                exclude rule (trainer #41 / web #14 /
 │   │                                server #56 pattern)
-│   ├── Program.cs                 minimal: WebApplication.CreateBuilder
-│   │                                + /healthz + app.Run()
-│   │                                + `public partial class Program {}`
-│   │                                so WebApplicationFactory<Program>
-│   │                                can host the app in-process for tests
-│   └── appsettings.json           Logging + AllowedHosts; NOTHING else.
-│                                  No "Urls" key. No "Gateway" key. No
-│                                  "Trainer" key. Phase 1 adds those when
-│                                  the code that reads them lands.
+│   ├── Program.cs                 DI: AddDbContext (late-resolution),
+│   │                                AddHttpClient<IOllamaClient>().AddTypedClient
+│   │                                (Func<Uri> base-URL provider, late-resolution),
+│   │                                OllamaReadinessState singleton + warm-up
+│   │                                hosted service + readiness endpoint,
+│   │                                TenantHeadersMiddleware, conversation
+│   │                                endpoints, auto-migrate on startup,
+│   │                                `public partial class Program {}` for
+│   │                                WebApplicationFactory<Program>
+│   ├── appsettings.json           Logging + ConnectionStrings + Ollama:BaseUrl
+│   │                                + Assistant:{TurnRequestTimeoutSeconds,
+│   │                                WarmupModel, AutoMigrate} + AllowedHosts.
+│   │                                NO top-level "Urls" key.
+│   ├── Data/
+│   │   ├── AssistantDbContext.cs  ConversationEntity + TurnEntity entities;
+│   │   │                            snake_case column maps; advisory-lock
+│   │   │                            unique-index on (conversation_id, position);
+│   │   │                            FK ON DELETE CASCADE turns→conversations
+│   │   ├── PostgresAssistantConversationStore.cs   IAssistantConversationStore
+│   │   │                            impl. Single tenant-filtering chokepoint;
+│   │   │                            advisory lock around position read +
+│   │   │                            INSERT; ExecuteUpdateAsync with tenant
+│   │   │                            filter for UpdatedAt bump; ToCore
+│   │   │                            mappers handle the entity ↔ Core POCO
+│   │   │                            shape conversion
+│   │   └── AssistantDbContextDesignTimeFactory.cs   for `dotnet ef`
+│   ├── Endpoints/
+│   │   └── ConversationEndpoints.cs   3 endpoints; Ulid<->Guid wire
+│   │                            converters at the boundary; per-request
+│   │                            timeout from
+│   │                            ConversationOrchestratorOptions.TurnRequestTimeoutSeconds;
+│   │                            504 on timeout, 404 on missing, 400 on
+│   │                            invalid input, 502 on upstream Ollama
+│   │                            error (HttpRequestException), 201 on
+│   │                            create
+│   ├── Middleware/
+│   │   └── TenantHeadersMiddleware.cs   Phase-1 stub trust-the-headers
+│   │                            auth; Phase 5 swaps to JWT-claim
+│   │                            extraction. Bypass list: /healthz, /readyz
+│   ├── Migrations/
+│   │   ├── 20260504171253_InitialCreate.cs (Phase 1 — conversations + turns)
+│   │   └── 20260504192737_AddModelColumnToConversations.cs (Phase 2)
+│   └── Services/
+│       ├── ConversationOrchestrator.cs   read history → call LLM with
+│       │                            conv.Model → persist user+assistant
+│       │                            turn pair atomically; CONCURRENCY
+│       │                            CONTRACT class doc covers the Phase
+│       │                            3 lock-scope re-evaluation
+│       ├── ConversationOrchestratorOptions.cs   bound from "Assistant"
+│       │                            section (TurnRequestTimeoutSeconds:
+│       │                            int, WarmupModel: string)
+│       ├── OllamaReadinessState.cs   singleton; Volatile.Read/Write flag;
+│       │                            MarkReady is idempotent + monotonic
+│       ├── OllamaWarmupHostedService.cs   BackgroundService; tiny ping
+│       │                            against Assistant:WarmupModel; backoff
+│       │                            10s→30s→60s (capped); 180s per-attempt
+│       │                            wall-clock cap; ApplicationStopping CT
+│       │                            flows through for clean shutdown
+│       └── StubLlmClient.cs        Phase 1 stub; still in binary for tests;
+│                                    overridden via ConfigureTestServices in
+│                                    AssistantWebApplicationFactory
 └── Trellis.Assistant.Tests/       xUnit + FluentAssertions +
-    │                                Microsoft.AspNetCore.Mvc.Testing
-    ├── HealthCheckTests.cs        WebApplicationFactory<Program> +
-    │                                /healthz returns 200 + body
-    ├── DotnetPublishTests.cs      [Trait("Category", "Integration")];
-    │                                invokes real `dotnet publish` against
-    │                                Trellis.Assistant.csproj + asserts
-    │                                appsettings.user.json absent +
-    │                                production appsettings.json IS
-    │                                present (over-broad-Remove guard)
-    └── AppsettingsConventionsTests.cs
-                                    XML-inspection of appsettings.json;
-                                    asserts no top-level "Urls" key
-                                    (case-insensitive)
+    │                                Microsoft.AspNetCore.Mvc.Testing +
+    │                                Testcontainers.PostgreSql 4.11.0 +
+    │                                Xunit.SkippableFact 1.5.23 +
+    │                                TreatWarningsAsErrors=true
+    ├── HealthCheckTests.cs        /healthz 200 + body shape (Phase 1) +
+    │                                /readyz toggle from 503→200 on
+    │                                MarkReady (Phase 2)
+    ├── DotnetPublishTests.cs      [Trait("Category", "Integration")]
+    ├── AppsettingsConventionsTests.cs   no top-level "Urls" key pin
+    ├── Integration/
+    │   ├── ConversationEndpointTests.cs   stub-driven; orchestrator +
+    │   │                            store + lock invariants; 17+ tests
+    │   │                            including SkippableTheory variants
+    │   ├── EFMigrationSmokeTests.cs   schema shape via information_schema;
+    │   │                            FK CASCADE; channel + model DEFAULTs
+    │   └── RealOllamaSmokeTests.cs   [SkippableFact] gated on
+    │                                OLLAMA_BASE_URL env var; full
+    │                                real-LLM round-trip + upstream-502
+    │                                pin on invalid model
+    └── TestFixtures/
+        ├── PostgresFixture.cs           Testcontainers postgres:16
+        ├── AssistantWebApplicationFactory.cs   stub IOllamaClient via
+        │                                ConfigureTestServices
+        └── RealOllamaWebApplicationFactory.cs   production IOllamaClient,
+                                          for the real-LLM smoke
 ```
 
 ## Tech stack
 
-- ASP.NET Core .NET 10 (`Microsoft.NET.Sdk.Web`)
-- xUnit + FluentAssertions + `Microsoft.AspNetCore.Mvc.Testing` + coverlet (mirrors `trellis-web` / `trellis-trainer` test stacks)
+- ASP.NET Core .NET 10 (`Microsoft.NET.Sdk.Web`) with `TreatWarningsAsErrors=true`
+- EF Core 10 + `Npgsql.EntityFrameworkCore.PostgreSQL` 10.0.1 (matches trellis-trainer's versions for consistent migration tooling)
+- `Ulid` 1.3.4 for time-sortable conversation/turn IDs (Trellis.Core stays Ulid-free; we convert at the EF boundary so the column stays native uuid)
+- xUnit + FluentAssertions + `Microsoft.AspNetCore.Mvc.Testing` + `Testcontainers.PostgreSql` 4.11.0 + `Xunit.SkippableFact` 1.5.23 (mirrors `trellis-web` / `trellis-trainer` test stacks)
 - `Trellis.Core` consumed via sibling-repo project reference (`..\..\core\Trellis.Core\Trellis.Core.csproj`); same pattern as `trellis-web` / `trellis-server` / `trellis-desktop` (per `docs/56-project-structure.md`)
 
-Phase 1+ will add:
-- Channel-adapter SDKs (Slack / WhatsApp / Telegram)
-- MCP client library (TBD; see 59-doc for the dispatch design)
+Phase 3+ will add:
+- MCP client library for tool dispatch (TBD; see 59-doc for the design)
+- Trellis.Trainer integration via the search_documents tool path
+- Channel-adapter SDKs (Slack / WhatsApp / Telegram — Phase 4)
 - Voice toolchain (Whisper.net for STT — already in trainer for audio ingestion; TTS choice TBD)
 - Identity (likely the same OIDC posture as the rest of the system once it lands)
 
@@ -101,15 +174,23 @@ dotnet test  Trellis.Assistant.sln --configuration Release
 dotnet run   --project Trellis.Assistant
 ```
 
-Fast suite (skips the publish-output integration test):
+Fast suite (skips Docker-dependent integration tests):
 
 ```bash
 dotnet test Trellis.Assistant.sln --configuration Release --filter "Category!=Integration"
 ```
 
+Real-Ollama smoke (requires a running Ollama):
+
+```powershell
+$env:OLLAMA_BASE_URL = "http://localhost:11434/"
+$env:OLLAMA_TEST_MODEL = "mistral-small:24b"   # optional; default is mistral-small:24b
+dotnet test --configuration Release --filter "FullyQualifiedName~RealOllamaSmokeTests"
+```
+
 ## QA deploy
 
-Steady-state QA redeploys: `trellis-deploy/scripts/qa/Deploy-Assistant-Standalone.ps1` (sibling repo, parallel PR). Mirrors the trainer-qa + web-qa shape: publish → tar → scp → ssh-and-extract → systemctl restart → in-tunnel `/healthz` smoke from the deploy box.
+Steady-state QA redeploys: `trellis-deploy/scripts/qa/Deploy-Assistant-Standalone.ps1`. Mirrors the trainer-qa + web-qa shape: publish → tar → scp → ssh-and-extract → systemctl restart → in-tunnel `/healthz` smoke from the deploy box. A sibling deploy PR adds a `/readyz` poll (120s budget) after the `/healthz` check so the deploy script declares "live" only after Ollama warm-up completes.
 
 - Public hostname: `assistant-qa.chat.terraverdellc.com`
 - Loopback bind: `127.0.0.1:5117`
@@ -117,23 +198,26 @@ Steady-state QA redeploys: `trellis-deploy/scripts/qa/Deploy-Assistant-Standalon
 - Auth: shared `trellisqa` HTTP Basic credential at the Hetzner edge (same as web-qa + trainer-qa); GB10-side nginx is auth-free
 - Bootstrap walkthrough: `trellis-deploy/scripts/qa/bootstrap-assistant.md`
 
-The deploy script ends with a real HTTP probe via `curl -s -o /dev/null -w '%{http_code}' -m 5 http://127.0.0.1:5117/healthz` over the SSH session and exits non-zero (after dumping 30 lines of `journalctl -u trellis-assistant-qa`) if the unit isn't responsive within 30 s. `systemctl status active(running)` alone isn't enough — that's the lesson from the trainer-qa bootstrap day.
+## Don't (Phase 2)
 
-## Don't (Phase 0)
-
-- **Don't add an orchestrator skeleton, interface, or DI seam.** Phase 1's brief owns that surface; pre-empting it locks in shape decisions before the design conversation has happened. If you find yourself reaching for `IAssistantOrchestrator`, stop.
-- **Don't add channel adapters.** Slack / WhatsApp / Telegram webhook handlers all live in Phase 1+. Adding them now would force premature decisions about identity, payload shape, and tool dispatch.
-- **Don't add tool dispatch / MCP plumbing.** Same reasoning — the tool surface is Phase 1+'s scope.
-- **Don't add voice surface.** TTS / STT / push-to-talk / wake-word — all Phase 2+.
-- **Don't add `appsettings.user.json` to the repo.** Gitignored. Operator-local Dev convenience only. The csproj's `<None Remove>` + `<Content Remove>` rules ensure it never rides into a publish bundle even if it appears in the source tree (the same canonical defense from trainer #41 / web #14 / server #56).
-- **Don't pin a top-level `"Urls"` key in `appsettings.json`.** Defense-in-depth against the trainer-qa bootstrap-day port-binding bug. Dev port pinning lives in launchSettings.json (none yet — Phase 1 adds when needed); deploy port pinning lives in the systemd unit's `--urls` + `Environment=ASPNETCORE_URLS` directives.
-- **Don't add `Gateway:*` / `Trainer:*` config sections.** Phase 0 has no code that consumes them. Add them in Phase 1 alongside the consumers.
-- **Don't fork wire types or auth handlers from `Trellis.Core`.** The project reference is already wired; consume the canonical types when Phase 1 needs them.
-- **Don't bind ports outside 5117 without coordinating with the box's other QA services.** Trainer is on 5114, Web is on 5116, Gateway is on 5111 (see [`31-qa-environment.md` port table](https://github.com/terraverde-solutions/trellis-docs/blob/main/MarkdownFiles/31-qa-environment.md)).
+- **Don't add an SSE / streaming response surface.** Phase 1's POST /turns contract (buffer + return one JSON object) is preserved through Phase 2. SSE lands in Phase 3+ when there's a concrete streaming consumer (Slack/WhatsApp/Telegram inherently buffer; web/desktop/chat connect to the gateway, not the Assistant).
+- **Don't add channel adapters.** Phase 4 owns that surface.
+- **Don't add tool dispatch / MCP plumbing.** Phase 3 owns the first tool (`search_documents` → Trainer); broader MCP plumbing follows.
+- **Don't add voice surface.** TTS / STT / push-to-talk / wake-word — all post-tool-dispatch.
+- **Don't add `appsettings.user.json` to the repo.** Gitignored; canonical csproj `<None Remove>` + `<Content Remove>` rules ensure it never rides into a publish bundle.
+- **Don't pin a top-level `"Urls"` key in `appsettings.json`.** Defense-in-depth against the trainer-qa bootstrap-day port-binding bug. Pinned by `AppsettingsConventionsTests`.
+- **Don't add a model allowlist** at conversation create time. Phase 2 ships free-text varchar(64); invalid tags surface as a 502 from Ollama on first turn. Phase 3+ tool registry adds an allowlist when `search_documents` needs model-aware embedding selection.
+- **Don't add a re-pin operation for `Model`.** Per-conversation model is immutable in Phase 2. Phase 3+ may add re-pin if model-switching mid-conversation becomes a real need.
+- **Don't capture `Ollama:BaseUrl` or the connection string eagerly at builder time.** The late-resolution rule in `Program.cs` is load-bearing for `WebApplicationFactory<Program>` test overlays + future runtime config changes. Phase 5's JWT swap follows the same pattern.
+- **Don't merge the stub-driven endpoint tests with the real-Ollama smoke.** X1 split: stub-driven verifies orchestrator/store/lock invariants; OLLAMA_BASE_URL-gated verifies the real-LLM path. 5-parallel against real Ollama on a single GPU would spend ~5 minutes serializing — keep the test surfaces split.
+- **Don't fork wire types or auth handlers from `Trellis.Core`.** Use `IAssistantConversationStore` + `IOllamaClient` + `ChatMessage` + `ChatRole` directly.
+- **Don't bind ports outside 5117** without coordinating with the box's other QA services (Trainer 5114, Web 5116, Gateway 5111).
 
 ## Cross-component changes
 
-Phase 0 doesn't touch any cross-component contract. Phase 1+ will:
+Phase 2 touches one cross-component surface: `Trellis.Core/Services/IAssistantConversationStore.cs` (PR #11 — `CreateConversationAsync` adds `string? model` parameter; `AssistantConversation` record adds `Model` field). Sequencing: Core PR first → merge → rebase Assistant PR against merged Core (Phase 1 pattern).
+
+Phase 3+ will:
 - Tool dispatch hits Trellis.Server's chat-proxy + Trellis.Trainer's `/api/search`
 - Cross-surface memory shares an `IConversationStore` shape with Trellis.Web (DB-backed once Web's persistence lands)
 - Voice transcription likely reuses the trainer's Whisper.net path
@@ -142,4 +226,10 @@ Use the **Feature Orchestrator** persona in trellis-docs for any change crossing
 
 ## Workflow
 
-Per the project's git rules: feature branches off `main`; PR creation requires explicit user approval; PR bodies include a checkbox list of test cases; user merges and deletes branches.
+Per the project's git rules: feature branches off `main`; PR creation auto-approved; PR bodies include a checkbox list of test cases; user merges and deletes branches.
+
+Phase 2 non-negotiables (apply to every PR going forward, not just this one):
+- `TreatWarningsAsErrors=true` on every project — 0-warning Release builds
+- Test:production LoC ratio ≥ 90%
+- Doc updates ride the same commit as the code (CLAUDE.md + Phase N design doc; cross-repo doc rows are hub-side)
+- Three deterministic Release test runs before opening a PR

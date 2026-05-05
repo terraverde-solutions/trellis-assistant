@@ -107,6 +107,112 @@ public sealed class ConversationEndpointTests : IClassFixture<PostgresFixture>, 
             "channel defaults to 'api' when omitted (matches the schema's DEFAULT 'api')");
     }
 
+    [SkippableFact]
+    public async Task PostConversations_WithoutModelInBody_DefaultsToMistralSmall()
+    {
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        using var client = NewClient();
+        var resp = await client.PostAsJsonAsync("/api/conversations",
+            new ConversationEndpoints.CreateConversationRequest(Channel: "api"));
+        resp.StatusCode.Should().Be(HttpStatusCode.Created);
+
+        var body = await resp.Content.ReadFromJsonAsync<ConversationEndpoints.CreateConversationResponse>();
+        body!.Model.Should().Be("mistral-small:24b",
+            "model defaults to 'mistral-small:24b' when omitted — matches the schema column DEFAULT and the C#-side fallback in PostgresAssistantConversationStore");
+
+        // GET reads back the same model — the column persists, not just
+        // the response shape.
+        var getResp = await client.GetAsync($"/api/conversations/{body.Id}");
+        var getBody = await getResp.Content.ReadFromJsonAsync<ConversationEndpoints.GetConversationResponse>();
+        getBody!.Model.Should().Be("mistral-small:24b");
+    }
+
+    [SkippableFact]
+    public async Task PostConversations_WithModelInBody_PinsThatModel()
+    {
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        using var client = NewClient();
+        var resp = await client.PostAsJsonAsync("/api/conversations",
+            new ConversationEndpoints.CreateConversationRequest(Channel: "api", Model: "llama3.3:70b"));
+        resp.StatusCode.Should().Be(HttpStatusCode.Created);
+
+        var body = await resp.Content.ReadFromJsonAsync<ConversationEndpoints.CreateConversationResponse>();
+        body!.Model.Should().Be("llama3.3:70b",
+            "caller-supplied model overrides the column DEFAULT");
+
+        var getResp = await client.GetAsync($"/api/conversations/{body.Id}");
+        var getBody = await getResp.Content.ReadFromJsonAsync<ConversationEndpoints.GetConversationResponse>();
+        getBody!.Model.Should().Be("llama3.3:70b",
+            "GET returns the pinned model — model is per-conversation + immutable for Phase 2");
+    }
+
+    [SkippableTheory]
+    [InlineData("")]
+    [InlineData("   ")]
+    [InlineData("\t")]
+    public async Task PostConversations_WithBlankModel_FallsBackToColumnDefault(string blankModel)
+    {
+        // Sister case to PostConversations_WithoutModelInBody_DefaultsToMistralSmall:
+        // hub explicitly required "fallback-to-DEFAULT on null/whitespace".
+        // The endpoint normalizes blank values (string.IsNullOrWhiteSpace)
+        // to null before passing to the store; the store then applies
+        // its C#-side default that mirrors the SQL DEFAULT.
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        using var client = NewClient();
+        var resp = await client.PostAsJsonAsync("/api/conversations",
+            new ConversationEndpoints.CreateConversationRequest(Channel: "api", Model: blankModel));
+        resp.StatusCode.Should().Be(HttpStatusCode.Created);
+
+        var body = await resp.Content.ReadFromJsonAsync<ConversationEndpoints.CreateConversationResponse>();
+        body!.Model.Should().Be("mistral-small:24b",
+            $"blank model value {blankModel.Length}-char-whitespace must fall back to the column DEFAULT — no API surprise where '   ' silently becomes a real model tag");
+    }
+
+    [SkippableFact]
+    public async Task Model_OnceCreated_IsImmutableThroughMultipleTurnAppends()
+    {
+        // Phase 2 ships no re-pin endpoint — model is immutable post-
+        // creation. Verify by creating with an explicit model, appending
+        // multiple turns (the orchestrator reads conv.Model on each
+        // append), and re-reading. Model stays unchanged.
+        //
+        // Phase 3+ may add a re-pin operation if model-switching
+        // mid-conversation becomes a real need; this test is the pin
+        // that guards against an accidental mutation slipping in via
+        // a future endpoint or store-impl change.
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        using var client = NewClient();
+        var convResp = await client.PostAsJsonAsync("/api/conversations",
+            new ConversationEndpoints.CreateConversationRequest(Channel: "api", Model: "qwen2.5:72b"));
+        var conv = await convResp.Content.ReadFromJsonAsync<ConversationEndpoints.CreateConversationResponse>();
+        conv!.Model.Should().Be("qwen2.5:72b");
+
+        // Append three turns. Each one passes through the orchestrator's
+        // GetConversationAsync → reads conv.Model → calls
+        // StreamChatAsync(conv.Model, ...). The stub LLM ignores model
+        // but the read path exercises the data flow.
+        for (var i = 0; i < 3; i++)
+        {
+            var turnResp = await client.PostAsJsonAsync(
+                $"/api/conversations/{conv.Id}/turns",
+                new ConversationEndpoints.AppendTurnRequest(Content: $"turn {i}"));
+            turnResp.StatusCode.Should().Be(HttpStatusCode.OK,
+                $"turn {i} must succeed — Model immutability test depends on the append path executing cleanly");
+        }
+
+        // Re-read; Model unchanged after 3 round-trips.
+        var getResp = await client.GetAsync($"/api/conversations/{conv.Id}");
+        var getBody = await getResp.Content.ReadFromJsonAsync<ConversationEndpoints.GetConversationResponse>();
+        getBody!.Model.Should().Be("qwen2.5:72b",
+            "Model is immutable post-creation — no endpoint or store-impl path may mutate it");
+        getBody.Turns.Should().HaveCount(6,
+            "3 user turns + 3 assistant turns = 6; if the count regresses, Append-side mutation may have hit Conversations too");
+    }
+
     // ---------------- Test #2 ----------------
 
     [SkippableFact]

@@ -63,18 +63,13 @@ public sealed class ConversationOrchestrator
 {
     private readonly IAssistantConversationStore _store;
     private readonly IOllamaClient _llm;
-    private readonly string _model;
 
     public ConversationOrchestrator(
         IAssistantConversationStore store,
-        IOllamaClient llm,
-        ConversationOrchestratorOptions options)
+        IOllamaClient llm)
     {
         _store = store ?? throw new ArgumentNullException(nameof(store));
         _llm = llm ?? throw new ArgumentNullException(nameof(llm));
-        ArgumentNullException.ThrowIfNull(options);
-        ArgumentException.ThrowIfNullOrWhiteSpace(options.Model);
-        _model = options.Model;
     }
 
     /// <summary>
@@ -91,7 +86,9 @@ public sealed class ConversationOrchestrator
     /// <param name="userContent">The new user message text.</param>
     /// <param name="cancellationToken">Per-request CT — endpoint layer
     /// composes this from <c>HttpContext.RequestAborted</c> +
-    /// the explicit timeout (60s Phase 1).</param>
+    /// the explicit timeout
+    /// (<see cref="ConversationOrchestratorOptions.TurnRequestTimeoutSeconds"/>;
+    /// Phase 2 default 180s).</param>
     public async Task<TurnPairResult> HandleUserTurnAsync(
         string tenantId,
         string userId,
@@ -143,12 +140,19 @@ public sealed class ConversationOrchestrator
 
         // Stream the LLM response into a buffer. The stub yields 5 chunks
         // ~40ms apart; production Ollama yields tokens at 5-50/sec. The
-        // orchestrator persists the concatenated full response — Phase 1
+        // orchestrator persists the concatenated full response — Phase 2
         // doesn't push streaming chunks back to the HTTP caller (that's
-        // a Phase 4+ channel-adapter concern). The endpoint returns the
+        // a Phase 3+ channel-adapter concern). The endpoint returns the
         // full assembled assistant reply.
+        //
+        // Model selection: per-conversation, pinned at create time. The
+        // conversation row's Model column was assigned by the storage
+        // layer (caller-supplied at POST /api/conversations or the
+        // column DEFAULT). Phase 3+ may add a re-pin operation if
+        // model-switching mid-conversation becomes a real need; Phase 2
+        // is single-model-per-conversation.
         var assistantBuffer = new StringBuilder();
-        await foreach (var chunk in _llm.StreamChatAsync(_model, llmHistory, cancellationToken)
+        await foreach (var chunk in _llm.StreamChatAsync(conv.Model, llmHistory, cancellationToken)
             .WithCancellation(cancellationToken)
             .ConfigureAwait(false))
         {
@@ -199,20 +203,50 @@ public sealed class ConversationOrchestrator
 }
 
 /// <summary>
-/// Configuration for the orchestrator. <see cref="Model"/> is the LLM tag
-/// passed to <see cref="IOllamaClient.StreamChatAsync"/> — Phase 1 stub
-/// ignores it; Phase 2's real Ollama uses it. Bound from
-/// <c>Assistant:Model</c> in appsettings.
+/// Configuration bound from <c>Assistant:*</c> in appsettings.
+///
+/// <para><see cref="TurnRequestTimeoutSeconds"/> is read as <c>int</c>
+/// (not <see cref="TimeSpan"/>) on purpose — culture-dependent
+/// <see cref="TimeSpan"/> parsing in <see cref="IConfiguration"/> is a
+/// foot-gun for QA + production deploys where the system culture may
+/// differ from dev. Integer seconds is unambiguous everywhere. The
+/// endpoint converts to <see cref="TimeSpan"/> at the single use
+/// site.</para>
+///
+/// <para><see cref="WarmupModel"/> drives
+/// <see cref="OllamaWarmupHostedService"/>'s tiny ping at startup
+/// to force the model into VRAM. Per-conversation model selection
+/// (Phase 2 Q4=B) means there's no single "default model" anymore;
+/// the warm-up model is a hint for the most-likely-needed model.
+/// First user request to a different model still pays the cold-load
+/// cost lazily. Set to empty/whitespace to disable warm-up entirely
+/// (e.g. dev environments without Ollama running).</para>
 /// </summary>
 public sealed class ConversationOrchestratorOptions
 {
     public const string SectionName = "Assistant";
 
     /// <summary>
-    /// LLM model tag. Phase 1 default is a placeholder that the stub
-    /// ignores. Phase 2 redeploys with the real Ollama tag in env.
+    /// Wall-clock budget for a single POST /turns request. Bounds how
+    /// long the per-conversation Postgres advisory lock can be held;
+    /// see <see cref="ConversationOrchestrator"/>'s CONCURRENCY
+    /// CONTRACT for why the lock + the timeout are not separable.
+    /// Phase 2 default 180s — sized for cold 70B model load (60-90s)
+    /// + token-heavy responses (60-90s additional). Phase 1 used 60s
+    /// against the stub (which yielded ~200ms).
     /// </summary>
-    public string Model { get; set; } = "llama3.3:70b";
+    public int TurnRequestTimeoutSeconds { get; set; } = 180;
+
+    /// <summary>
+    /// LLM model tag for the startup warm-up call. Empty/whitespace
+    /// disables warm-up; /readyz then stays 503 until the user-facing
+    /// path warms a model lazily (which doesn't actually flip /readyz
+    /// — see <see cref="OllamaReadinessState"/> docs). Operators should
+    /// set this to whichever model is most-frequently-used on this
+    /// instance; on GB10 production that's <c>mistral-small:24b</c>
+    /// (matches the Trellis.Gateway allowlist).
+    /// </summary>
+    public string WarmupModel { get; set; } = "";
 }
 
 /// <summary>

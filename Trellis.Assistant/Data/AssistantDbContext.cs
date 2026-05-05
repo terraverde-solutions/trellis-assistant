@@ -44,6 +44,17 @@ public sealed class AssistantDbContext : DbContext
             .HasMaxLength(32)
             .IsRequired()
             .HasDefaultValue("api");
+        // varchar(64) NOT NULL DEFAULT 'mistral-small:24b'. The C# layer
+        // also applies this default in PostgresAssistantConversationStore
+        // because EF tracks every property and would send NULL otherwise;
+        // the SQL DEFAULT covers raw INSERTs (the EFMigrationSmokeTests
+        // pattern). Phase 2 doesn't enforce an allowlist on this value;
+        // an invalid model tag surfaces as a 502 from Ollama on first
+        // turn, not a 400 at create time.
+        convo.Property(c => c.Model).HasColumnName("model")
+            .HasMaxLength(64)
+            .IsRequired()
+            .HasDefaultValue("mistral-small:24b");
         convo.Property(c => c.CreatedAt).HasColumnName("created_at").IsRequired();
         convo.Property(c => c.UpdatedAt).HasColumnName("updated_at").IsRequired();
 
@@ -99,6 +110,7 @@ public sealed class ConversationEntity
     public string TenantId { get; set; } = "";
     public string UserId { get; set; } = "";
     public string Channel { get; set; } = "api";
+    public string Model { get; set; } = "mistral-small:24b";
     public DateTime CreatedAt { get; set; }
     public DateTime UpdatedAt { get; set; }
 }

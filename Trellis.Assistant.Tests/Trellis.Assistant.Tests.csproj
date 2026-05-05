@@ -4,6 +4,9 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <!-- Phase 2 non-negotiable: warnings fail the build. Same setting as
+         Trellis.Assistant.csproj so the test project doesn't drift. -->
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
 
     <IsPackable>false</IsPackable>
     <IsTestProject>true</IsTestProject>

@@ -1,16 +1,31 @@
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
+using Trellis.Assistant.Services;
+using Trellis.Core.Services;
 
 namespace Trellis.Assistant.Tests.TestFixtures;
 
 /// <summary>
-/// Custom <see cref="WebApplicationFactory{TEntryPoint}"/> for the
-/// Phase 1 endpoint integration tests. Injects the
+/// Custom <see cref="WebApplicationFactory{TEntryPoint}"/> for the Phase
+/// 1+2 endpoint integration tests. Injects the
 /// <see cref="PostgresFixture"/>'s connection string + leaves
 /// <c>Assistant:AutoMigrate=true</c> so the host applies the EF
 /// migration on first request — matches QA's deploy-time auto-migrate
 /// posture.
+///
+/// LLM swap (Phase 2): production Program.cs registers
+/// <see cref="OllamaClient"/> via <c>AddHttpClient&lt;IOllamaClient&gt;().AddTypedClient</c>;
+/// this factory REPLACES that registration with
+/// <see cref="StubLlmClient"/> so the endpoint tests verify
+/// orchestrator/store/lock invariants WITHOUT depending on a reachable
+/// Ollama server. The X1-confirmed test split: stub-driven tests verify
+/// the orchestrator/store/lock surface; the real-Ollama integration
+/// smoke (separate test class, gated on <c>OLLAMA_BASE_URL</c> env var)
+/// verifies the real-LLM path.
 ///
 /// Per-test-class fixture pattern: each test class that holds a
 /// PostgresFixture gets its own AssistantWebApplicationFactory bound
@@ -40,11 +55,35 @@ public sealed class AssistantWebApplicationFactory : WebApplicationFactory<Progr
                 // class; auto-migrate is the cheapest way to land the
                 // schema before the first endpoint call.
                 ["Assistant:AutoMigrate"] = "true",
-                // Stub LLM doesn't read the model tag; pin a sentinel
-                // so a future regression that sneaks a real LLM call
-                // onto the test path fails loud.
-                ["Assistant:Model"] = "test-stub-model",
+                // Disable the warm-up service — the stub LLM doesn't
+                // need warming, and the production warm-up would fire
+                // outbound HTTP at the dummy Ollama:BaseUrl below and
+                // pollute test output with retry warnings.
+                ["Assistant:WarmupModel"] = "",
+                // Phase-1-compatible turn timeout. The stub yields
+                // ~200ms; 60s is a 300x margin and matches Phase 1's
+                // hardcoded value, which the existing tests were
+                // implicitly written against.
+                ["Assistant:TurnRequestTimeoutSeconds"] = "60",
+                // Dummy Ollama:BaseUrl — IOllamaClient is overridden
+                // below to a stub, but the AddHttpClient registration
+                // in Program.cs still resolves at startup. A non-null
+                // value keeps that resolution clean.
+                ["Ollama:BaseUrl"] = "http://test-host-unreachable:11434/",
             });
+        });
+
+        // Replace the production OllamaClient registration with the
+        // stub. ConfigureTestServices runs AFTER the production
+        // ConfigureServices, so the last registration wins.
+        builder.ConfigureTestServices(services =>
+        {
+            // Drop the existing IOllamaClient + AddHttpClient registration
+            // so the stub is the only resolution path. Without the
+            // RemoveAll, the typed-client registration from Program.cs
+            // can shadow the stub depending on registration order.
+            services.RemoveAll<IOllamaClient>();
+            services.AddSingleton<IOllamaClient, StubLlmClient>();
         });
     }
 }
