@@ -319,6 +319,200 @@ public sealed class AssistantAgentExecutorTests : IClassFixture<PostgresFixture>
             "even on cancellation, the terminal write must succeed — the run record reflects reality");
     }
 
+    // ---------------- Phase 3.A.2: RunForConversationAsync ----------------
+
+    [SkippableFact]
+    public async Task RunForConversationAsync_NoToolCalls_ReturnsConversationAgentResultWithFinalText()
+    {
+        // Phase 3.A.2 entry point: orchestrator-supplied messages, model
+        // emits no tool_calls, returns ConversationAgentResult with the
+        // final assistant text + empty tool dispatches.
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        var llm = new StubAgentLlmClient()
+            .EnqueueAssistantText("conversation answer", tokensUsed: 50);
+        var executor = NewExecutor(llm);
+
+        var messages = new List<ChatMessage>
+        {
+            new() { Role = ChatRole.User, Content = "what's the capital?" },
+        };
+        var result = await executor.RunForConversationAsync(
+            orgId: TestOrgId,
+            assistantTurnId: null,
+            userPrompt: "what's the capital?",
+            messages: messages,
+            availableTools: new[] { new EchoTool().Descriptor },
+            budgetOverrides: null);
+
+        result.AgentRun.Status.Should().Be(AgentRunStatus.Succeeded);
+        result.AgentRun.TokensUsed.Should().Be(50);
+        result.FinalAssistantText.Should().Be("conversation answer");
+        result.ToolDispatches.Should().BeEmpty();
+    }
+
+    [SkippableFact]
+    public async Task RunForConversationAsync_OneToolCall_CapturesToolDispatchSummary()
+    {
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        var llm = new StubAgentLlmClient()
+            .EnqueueToolCall("echo", """{"text":"agent dispatch"}""")
+            .EnqueueAssistantText("done");
+        var executor = NewExecutor(llm);
+
+        var messages = new List<ChatMessage>
+        {
+            new() { Role = ChatRole.User, Content = "echo agent dispatch" },
+        };
+        var result = await executor.RunForConversationAsync(
+            orgId: TestOrgId,
+            assistantTurnId: null,
+            userPrompt: "echo agent dispatch",
+            messages: messages,
+            availableTools: new[] { new EchoTool().Descriptor },
+            budgetOverrides: null);
+
+        result.AgentRun.Status.Should().Be(AgentRunStatus.Succeeded);
+        result.FinalAssistantText.Should().Be("done");
+        result.ToolDispatches.Should().HaveCount(1);
+        result.ToolDispatches[0].ToolName.Should().Be("echo");
+        result.ToolDispatches[0].ToolCallId.Should().NotBeNullOrEmpty();
+        result.ToolDispatches[0].ToolCallId.Length.Should().Be(26,
+            "ToolCallId is the Ulid-stringified AgentStep.Id (26-char base32)");
+        result.ToolDispatches[0].ResultContent.Should().Contain("agent dispatch",
+            "tool result content carries the dispatched tool's output JSON");
+    }
+
+    [SkippableFact]
+    public async Task RunForConversationAsync_ToolFailed_ResultContentIsErrorEnvelope()
+    {
+        // Mutation pin: when a tool dispatch returns Success=false, the
+        // ConversationAgentToolDispatch.ResultContent carries a
+        // JSON-serialized error envelope, NOT the tool's null
+        // ResultJson. The orchestrator persists this verbatim as the
+        // Tool turn's content; clients see the failure inline in
+        // history.
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        // Echo with empty text returns Success=false.
+        var llm = new StubAgentLlmClient()
+            .EnqueueToolCall("echo", """{"text":""}""")
+            .EnqueueAssistantText("recovered");
+        var executor = NewExecutor(llm);
+
+        var messages = new List<ChatMessage>
+        {
+            new() { Role = ChatRole.User, Content = "test failure path" },
+        };
+        var result = await executor.RunForConversationAsync(
+            orgId: TestOrgId,
+            assistantTurnId: null,
+            userPrompt: "test failure path",
+            messages: messages,
+            availableTools: new[] { new EchoTool().Descriptor },
+            budgetOverrides: null);
+
+        result.ToolDispatches.Should().HaveCount(1);
+        result.ToolDispatches[0].ResultContent.Should().Contain("error",
+            "failed dispatches carry a JSON-serialized error envelope so clients see structured failure inline");
+    }
+
+    [SkippableFact]
+    public async Task RunForConversationAsync_BudgetCapHit_ReturnsCapReached_FinalTextEmpty()
+    {
+        // Pin: when the budget gate halts the run, FinalAssistantText
+        // is empty (no model-emitted final text) and the orchestrator
+        // is responsible for synthesizing a placeholder assistant
+        // turn (which the orchestrator does — verified at the endpoint
+        // layer).
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        var llm = new StubAgentLlmClient()
+            .EnqueueToolCall("echo", """{"text":"loop 0"}""")
+            .EnqueueToolCall("echo", """{"text":"loop 1"}""")
+            .EnqueueToolCall("echo", """{"text":"loop 2"}""");
+        var executor = NewExecutor(llm);
+
+        var messages = new List<ChatMessage>
+        {
+            new() { Role = ChatRole.User, Content = "loop a bit" },
+        };
+        var result = await executor.RunForConversationAsync(
+            orgId: TestOrgId,
+            assistantTurnId: null,
+            userPrompt: "loop a bit",
+            messages: messages,
+            availableTools: new[] { new EchoTool().Descriptor },
+            budgetOverrides: new AgentBudgetOverrides { MaxSteps = 2 });
+
+        result.AgentRun.Status.Should().Be(AgentRunStatus.CapReached);
+        result.FinalAssistantText.Should().BeEmpty(
+            "budget halt before final assistant text → FinalAssistantText is empty; orchestrator synthesizes placeholder");
+        result.ToolDispatches.Should().HaveCount(2,
+            "exactly 2 dispatches before the gate halted (CompletedStepCount==MaxSteps)");
+    }
+
+    [SkippableFact]
+    public async Task RunForConversationAsync_ZeroOrgId_Throws()
+    {
+        // Defensive pin: Guid.Empty for OrgId triggers the same
+        // ArgumentException as IAgentExecutor.RunAsync via
+        // AgentRunRequest.Create. RunForConversationAsync mirrors that
+        // contract.
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        var executor = NewExecutor(new StubAgentLlmClient());
+        var messages = new List<ChatMessage>
+        {
+            new() { Role = ChatRole.User, Content = "x" },
+        };
+        var act = () => executor.RunForConversationAsync(
+            orgId: Guid.Empty,
+            assistantTurnId: null,
+            userPrompt: "x",
+            messages: messages,
+            availableTools: Array.Empty<AgentToolDescriptor>(),
+            budgetOverrides: null);
+        await act.Should().ThrowAsync<ArgumentException>()
+            .WithMessage("*OrgId*non-empty*");
+    }
+
+    [SkippableFact]
+    public async Task RunForConversationAsync_NullAssistantTurnId_PersistsAgentRunWithNull()
+    {
+        // Phase 3.A.2's orchestrator currently passes assistantTurnId=null
+        // (turn ids are generated by the store under the advisory lock
+        // AFTER the executor returns; orchestrator can't pre-allocate).
+        // Pin that null flows through cleanly to the persisted AgentRun
+        // — the FK with ON DELETE SET NULL accepts null.
+        //
+        // (A propagation pin for the non-null case would require pre-
+        // creating a real turn row to satisfy the FK; deferred until
+        // a Phase 3.A.3+ pre-allocation flow makes it relevant.)
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        var llm = new StubAgentLlmClient().EnqueueAssistantText("done");
+        var executor = NewExecutor(llm);
+
+        var messages = new List<ChatMessage>
+        {
+            new() { Role = ChatRole.User, Content = "test" },
+        };
+        var result = await executor.RunForConversationAsync(
+            orgId: TestOrgId,
+            assistantTurnId: null,
+            userPrompt: "test",
+            messages: messages,
+            availableTools: Array.Empty<AgentToolDescriptor>(),
+            budgetOverrides: null);
+
+        result.AgentRun.AssistantTurnId.Should().BeNull(
+            "null assistantTurnId persists as null — Phase 3.A.2 orchestrator's current pattern");
+    }
+
+    // ---------------- Phase 3.A.1 (existing — preserved post-refactor) ----------------
+
     [SkippableFact]
     public async Task PersistedSteps_StepIndex_AssignedSequentiallyFromZero()
     {

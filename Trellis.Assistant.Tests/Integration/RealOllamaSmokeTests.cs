@@ -209,6 +209,88 @@ public sealed class RealOllamaSmokeTests : IClassFixture<PostgresFixture>, IAsyn
     }
 
     [SkippableFact]
+    public async Task PostTurns_AgentPath_WithEchoTool_PersistsToolTurnAndAssistantReply()
+    {
+        // Phase 3.A.2 conversation-integrated agent-path real-LLM smoke.
+        // Gated on OLLAMA_BASE_URL + OLLAMA_TEST_MODEL (defaults to
+        // qwen2.5:72b — known tool-supporting model on GB10 per
+        // Phase 3.A C3). Verifies the full conversation→executor→
+        // tool dispatch→tool turn persistence→final assistant turn flow
+        // end-to-end against a real LLM.
+        //
+        // Mutation pin per Phase 3.A.2 non-negotiables: tool turn
+        // appears inline in the conversation Turns array on GET
+        // (Option A wire shape) when the agent path runs.
+        var ollamaBaseUrl = Environment.GetEnvironmentVariable("OLLAMA_BASE_URL");
+        Skip.If(string.IsNullOrWhiteSpace(ollamaBaseUrl),
+            "OLLAMA_BASE_URL not set; real-Ollama agent-path conversation smoke skipped.");
+        Skip.IfNot(_pg.IsAvailable,
+            "Docker not available; Testcontainers integration test skipped.");
+
+        var agentModel = Environment.GetEnvironmentVariable("OLLAMA_TEST_MODEL")
+            ?? "qwen2.5:72b";
+
+        await using var factory = new RealOllamaWebApplicationFactory(
+            _pg.ConnectionString,
+            ollamaBaseUrl,
+            agentModel: agentModel);
+        using var client = factory.CreateClient();
+        client.DefaultRequestHeaders.Add(TenantHeadersMiddleware.TenantHeaderName, TestTenants.TenantRealLlm);
+        client.DefaultRequestHeaders.Add(TenantHeadersMiddleware.UserHeaderName, TestTenants.UserRealLlm);
+
+        // Create the conversation. Phase 2's per-conversation Model
+        // is set; the agent path uses Assistant:Agent:Model (overridden
+        // to OLLAMA_TEST_MODEL above) for the tool-using LLM call.
+        var convResp = await client.PostAsJsonAsync("/api/conversations",
+            new ConversationEndpoints.CreateConversationRequest(Channel: "api"));
+        var conv = await convResp.Content.ReadFromJsonAsync<ConversationEndpoints.CreateConversationResponse>();
+        conv!.Id.Should().NotBeNullOrEmpty();
+
+        // POST /turns with Tools field — routes through the executor.
+        // Prompt nudges tool use but allows model latitude (LLMs are
+        // non-deterministic).
+        var sw = Stopwatch.StartNew();
+        var turnResp = await client.PostAsJsonAsync(
+            $"/api/conversations/{conv.Id}/turns",
+            new ConversationEndpoints.AppendTurnRequest(
+                "Use the echo tool to repeat the word 'pong' back, then confirm in a final assistant message.")
+            {
+                Tools = new[] { "echo" },
+            });
+        sw.Stop();
+
+        sw.Elapsed.Should().BeLessThan(TimeSpan.FromSeconds(240),
+            $"real-LLM agent-path smoke must complete within 240s; actual was {sw.Elapsed.TotalSeconds:0.0}s");
+        turnResp.StatusCode.Should().Be(HttpStatusCode.OK);
+
+        var turnBody = await turnResp.Content.ReadFromJsonAsync<ConversationEndpoints.AppendTurnResponse>();
+        turnBody!.UserTurn.Role.Should().Be("user");
+        turnBody.AssistantTurn.Role.Should().Be("assistant");
+        turnBody.AssistantTurn.Content.Should().NotBeNullOrEmpty();
+
+        // Acceptable: ToolTurns null (model decided not to use the tool;
+        // also valid agent-path outcome) OR populated (model used echo
+        // at least once). If populated, each tool turn must have
+        // role=tool + ToolCallId + ToolName.
+        if (turnBody.ToolTurns is { Count: > 0 } toolTurns)
+        {
+            foreach (var tt in toolTurns)
+            {
+                tt.Role.Should().Be("tool");
+                tt.ToolCallId.Should().NotBeNullOrEmpty();
+                tt.ToolName.Should().NotBeNullOrEmpty();
+            }
+
+            // GET pin: full chain inline (Option A).
+            var getResp = await client.GetAsync($"/api/conversations/{conv.Id}");
+            var getBody = await getResp.Content.ReadFromJsonAsync<ConversationEndpoints.GetConversationResponse>();
+            var roles = getBody!.Turns.Select(t => t.Role).ToList();
+            roles.Should().Contain("tool",
+                "Option A wire shape: tool turns appear inline in GET conversation Turns array when agent path ran");
+        }
+    }
+
+    [SkippableFact]
     public async Task PostTurns_WithInvalidModel_ReturnsUpstream502()
     {
         // Phase 2 ships no allowlist on the model parameter. An invalid

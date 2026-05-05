@@ -82,6 +82,12 @@ public sealed class AssistantDbContext : DbContext
         // column is opaque text from the DB's perspective.
         turn.Property(t => t.Role).HasColumnName("role").HasMaxLength(32).IsRequired();
         turn.Property(t => t.Content).HasColumnName("content").IsRequired();
+        // Phase 3.A.2: nullable varchar(64) tool-turn metadata. Both null
+        // on user/assistant/system turns; populated on Tool=3 turns to
+        // pair the tool result with its dispatching assistant turn (per
+        // OpenAI/Ollama function-calling wire shape).
+        turn.Property(t => t.ToolCallId).HasColumnName("tool_call_id").HasMaxLength(64);
+        turn.Property(t => t.ToolName).HasColumnName("tool_name").HasMaxLength(64);
         turn.Property(t => t.CreatedAt).HasColumnName("created_at").IsRequired();
 
         // FK with ON DELETE CASCADE — deleting a conversation drops its
@@ -192,6 +198,8 @@ public sealed class TurnEntity
     public int Position { get; set; }
     public string Role { get; set; } = "";
     public string Content { get; set; } = "";
+    public string? ToolCallId { get; set; }
+    public string? ToolName { get; set; }
     public DateTime CreatedAt { get; set; }
 }
 

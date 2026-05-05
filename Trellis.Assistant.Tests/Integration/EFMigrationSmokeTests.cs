@@ -66,6 +66,10 @@ public sealed class EFMigrationSmokeTests : IClassFixture<PostgresFixture>
             new ColumnShape("position", "integer", IsNullable: false, ColumnDefault: null),
             new ColumnShape("role", "character varying", IsNullable: false, ColumnDefault: null),
             new ColumnShape("content", "text", IsNullable: false, ColumnDefault: null),
+            // Phase 3.A.2: nullable tool-turn metadata. Both null on
+            // user/assistant/system turns; populated on Tool turns.
+            new ColumnShape("tool_call_id", "character varying", IsNullable: true, ColumnDefault: null),
+            new ColumnShape("tool_name", "character varying", IsNullable: true, ColumnDefault: null),
             new ColumnShape("created_at", "timestamp with time zone", IsNullable: false, ColumnDefault: null),
         }, opts => opts.WithoutStrictOrdering());
 
@@ -200,6 +204,75 @@ public sealed class EFMigrationSmokeTests : IClassFixture<PostgresFixture>
         var uniqueIndexes = await ReadUniqueIndexesAsync(conn);
         uniqueIndexes.Should().Contain("ux_agent_steps_run_step",
             "(agent_run_id, step_index) unique pin guards against the executor double-dispatching at the same index");
+    }
+
+    [SkippableFact]
+    public async Task Migration_ToolCallIdAndToolName_BackwardsCompatWithExistingRows()
+    {
+        // Phase 3.A.2 strict-additive migration: existing user/assistant
+        // turn rows from Phase 1+2 load with NULL for both tool_call_id +
+        // tool_name. This pin guards against a future migration accidentally
+        // making the columns NOT NULL or adding a default value, either
+        // of which would break backwards-compat for the Phase 1+2 row
+        // population.
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        await using var db = NewContext();
+        await db.Database.MigrateAsync();
+
+        // Insert a Phase-1+2-shaped row without specifying tool_call_id /
+        // tool_name. The migration's nullable columns mean no DEFAULT to
+        // apply; both should land as NULL.
+        var conv = new ConversationEntity
+        {
+            Id = Guid.NewGuid(),
+            TenantId = TestTenants.TenantRaw,
+            UserId = TestTenants.UserRaw,
+            Channel = "api",
+            Model = "mistral-small:24b",
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow,
+        };
+        db.Conversations.Add(conv);
+        var legacyTurn = new TurnEntity
+        {
+            Id = Guid.NewGuid(),
+            ConversationId = conv.Id,
+            Position = 0,
+            Role = "user",
+            Content = "phase 1+2 user turn",
+            CreatedAt = DateTime.UtcNow,
+            // Intentionally NOT setting ToolCallId / ToolName — Phase 1+2
+            // rows would have neither.
+        };
+        db.Turns.Add(legacyTurn);
+        await db.SaveChangesAsync();
+
+        var reloaded = await db.Turns.AsNoTracking().SingleAsync(t => t.Id == legacyTurn.Id);
+        reloaded.ToolCallId.Should().BeNull(
+            "Phase 3.A.2 migration adds tool_call_id as nullable; Phase 1+2 rows persist without a value");
+        reloaded.ToolName.Should().BeNull(
+            "Phase 3.A.2 migration adds tool_name as nullable; Phase 1+2 rows persist without a value");
+
+        // And a Phase 3.A.2 Tool turn DOES populate both. Round-trip pin.
+        var toolTurn = new TurnEntity
+        {
+            Id = Guid.NewGuid(),
+            ConversationId = conv.Id,
+            Position = 1,
+            Role = "tool",
+            Content = "{\"output\":\"hi\"}",
+            ToolCallId = "call_abc",
+            ToolName = "echo",
+            CreatedAt = DateTime.UtcNow,
+        };
+        db.Turns.Add(toolTurn);
+        await db.SaveChangesAsync();
+
+        var reloadedTool = await db.Turns.AsNoTracking().SingleAsync(t => t.Id == toolTurn.Id);
+        reloadedTool.Role.Should().Be("tool");
+        reloadedTool.ToolCallId.Should().Be("call_abc");
+        reloadedTool.ToolName.Should().Be("echo");
     }
 
     [SkippableFact]

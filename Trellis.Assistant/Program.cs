@@ -159,7 +159,15 @@ builder.Services.AddHttpClient<IAgentLlmClient>()
 builder.Services.AddSingleton<IAgentTool, EchoTool>();
 builder.Services.AddSingleton<IToolRegistry, ToolRegistry>();
 builder.Services.AddSingleton<IAgentBudgetGate, AssistantBudgetGate>();
-builder.Services.AddScoped<IAgentExecutor, AssistantAgentExecutor>();
+// Register the concrete class + alias the interface to the same scope.
+// Phase 3.A.2's ConversationOrchestrator depends on the concrete
+// AssistantAgentExecutor for the RunForConversationAsync method (not on
+// IAgentExecutor — that interface is the standalone POST /api/agent-runs
+// surface, returns just AgentRun). Two registrations, one instance per
+// scope; same lifetime semantics as the prior single-line interface
+// registration.
+builder.Services.AddScoped<AssistantAgentExecutor>();
+builder.Services.AddScoped<IAgentExecutor>(sp => sp.GetRequiredService<AssistantAgentExecutor>());
 
 var app = builder.Build();
 

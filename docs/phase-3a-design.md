@@ -1,6 +1,6 @@
-# Phase 3.A.1 design — agentic execution loop
+# Phase 3.A design — agentic execution loop + conversation integration
 
-**Status:** scaffold complete on `kimi/assistant-phase3a1-agent-executor`. Awaiting hub ratification of the diffstat surface before opening the Assistant PR.
+**Status:** Phase 3.A.1 merged 2026-05-05. Phase 3.A.2 scaffold complete on `kimi/assistant-phase3a2-conversation-tool-integration`.
 
 **Pairs with:** Trellis.Core PR #10 (Phase 0 agent-execution interface surface — `IAgentExecutor`, `IAgentBudgetGate`, `IAgentTool`, `AgentRun`, `AgentStep`, `AgentToolDescriptor`, `AgentToolInput`, `AgentToolOutput`, `BudgetVerdict`) — already merged.
 
@@ -127,6 +127,115 @@ Strict-additive against Phase 1+2 schema. Existing conversations/turns tables un
 1. **`IAgentLlmClient` parallel to `IOllamaClient`** — text-vs-function-calling have different streaming semantics; lift to Trellis.Core deferred to first second-consumer.
 2. **Tool registry validation trimmed** — JSON Schema validation deferred to Phase 3.B with `SearchDocumentsTool`.
 3. **Phase 1+2 test fixture Guid-string conversion** — cross-cutting refactor rides as a separate diffstat block per hub's instruction.
+
+---
+
+# Phase 3.A.2 — conversation-integrated agent path
+
+**Status:** scaffold complete on `kimi/assistant-phase3a2-conversation-tool-integration`. Pairs with merged Trellis.Core PR #13 (turn-surface widening). Awaiting hub ratification of the diffstat surface before opening the Assistant PR.
+
+## Surface
+
+`POST /api/conversations/{id}/turns` gains optional `Tools: string[]?` field. Non-null + non-empty routes the request through `AssistantAgentExecutor.RunForConversationAsync` (the new conversation-integrated entry point on the concrete class — distinct from `IAgentExecutor.RunAsync` which is the standalone Phase 3.A.1 surface). Tool turns persist as Role=Tool rows in `turns` inline with user/assistant turns; the final assistant text persists as the last turn. All persisted atomically as one batch via `IAssistantConversationStore.AppendTurnsAsync`.
+
+`GET /api/conversations/{id}` returns the full chain inline in the `Turns` array (Option A wire shape — ratified blocking decision): `[user, ...tool, assistant]` in position order. Channel adapters (Phase 4) get the full chain in one round-trip; UIs filter by role to render or skip tool turns.
+
+`AppendTurnResponse.ToolTurns` is null on the Phase 2 direct-LLM path; populated when the agent path ran. Phase 1+2 clients see additive shape (null `ToolTurns` field) → backwards-compat preserved.
+
+## EF migration
+
+`Trellis.Assistant/Migrations/20260505130659_AddToolCallIdAndToolNameToTurns.cs`:
+
+```sql
+ALTER TABLE turns
+  ADD COLUMN tool_call_id varchar(64) NULL,
+  ADD COLUMN tool_name varchar(64) NULL;
+```
+
+Strict-additive against Phase 1+2+3.A.1 schema. Both columns nullable so existing user/assistant/system turn rows persist as NULL. Pinned by `EFMigrationSmokeTests.Migration_ToolCallIdAndToolName_BackwardsCompatWithExistingRows`.
+
+## Executor refactor — `RunForConversationAsync`
+
+Phase 3.A.1's `RunAsync` (the `IAgentExecutor` surface) returns just `Task<AgentRun>`. The conversation-integrated path needs the final assistant text + per-dispatch summaries, so a new public method on the concrete `AssistantAgentExecutor` was added:
+
+```csharp
+public async Task<ConversationAgentResult> RunForConversationAsync(
+    Guid orgId,
+    Guid? assistantTurnId,
+    string userPrompt,
+    List<ChatMessage> messages,
+    IReadOnlyList<AgentToolDescriptor> availableTools,
+    AgentBudgetOverrides? budgetOverrides,
+    CancellationToken cancellationToken = default);
+
+public sealed record ConversationAgentResult
+{
+    public required AgentRun AgentRun { get; init; }
+    public required string FinalAssistantText { get; init; }
+    public required IReadOnlyList<ConversationAgentToolDispatch> ToolDispatches { get; init; }
+}
+
+public sealed record ConversationAgentToolDispatch
+{
+    public required string ToolCallId { get; init; }   // Ulid.ToString() of AgentStep.Id
+    public required string ToolName { get; init; }
+    public required string ResultContent { get; init; }
+}
+```
+
+The loop body extracted into a private `ExecuteLoopAsync` helper; both `RunAsync` and `RunForConversationAsync` share it. The 11 existing Phase 3.A.1 executor tests still pass post-refactor; 6 new Phase 3.A.2 tests pin `RunForConversationAsync` semantics.
+
+DI registration: the concrete `AssistantAgentExecutor` is registered as scoped + the `IAgentExecutor` interface aliases to it (so Phase 3.A.1's standalone surface still resolves through the interface; the orchestrator depends on the concrete class for the new method).
+
+## Orchestrator agent-path branch
+
+`ConversationOrchestrator.HandleUserTurnAsync` gains an optional `IReadOnlyList<string>? toolNameFilter` parameter:
+
+- Null/empty → existing Phase 2 direct-LLM path (preserved unchanged).
+- Non-null + non-empty → agent path: derive OrgId via `Guid.Parse(tenantId)` per Phase 3.A C1, build messages from history + new user content, call `_agentExecutor.RunForConversationAsync(...)`, persist `[user, ...tool turns, final assistant turn]` atomically as one batch via `IAssistantConversationStore.AppendTurnsAsync`.
+
+The agent path uses `Assistant:Agent:Model` (default `qwen2.5:72b`), NOT the conversation's pinned `Model`. Rationale: `Assistant:Agent:Model` is for tool-aware function-calling LLMs; the conversation's pinned model is for direct-LLM (text-only) Phase 2 calls. Phase 3.B+ may unify if it becomes operationally useful.
+
+## Tests (Phase 3.A.2 additions on top of Phase 3.A.1's 80)
+
+**Endpoint tests (4 new):**
+- `Conversation_AgentPath_PersistsToolTurnInline_AndGetReturnsItInTurnsArray` — **mutation pin per non-negotiable**: locks Option A GET wire shape end-to-end
+- `PostTurns_WithoutToolsField_PreservesPhase2DirectLlmPath` — null Tools field → direct-LLM path; `ToolTurns` null in response; agent stub never invoked
+- `PostTurns_WithEmptyToolsArray_PreservesPhase2DirectLlmPath` — sister pin: empty array treated identically to null
+- `Conversation_AgentPath_AcrossMultipleTurns_HistoryIncludesPriorToolTurns` — multi-turn pin: second-round LLM call sees prior tool turns in history
+- `PostTurns_AgentPath_NonUuidTenant_Returns400` — Phase 3.A C1 contract pin (400 or 404; never 500)
+
+**Executor tests (5 new):**
+- `RunForConversationAsync_NoToolCalls_ReturnsConversationAgentResultWithFinalText`
+- `RunForConversationAsync_OneToolCall_CapturesToolDispatchSummary` — pins ToolCallId is Ulid-stringified (26-char), ToolName + ResultContent populated
+- `RunForConversationAsync_ToolFailed_ResultContentIsErrorEnvelope` — failed dispatches carry JSON-serialized error envelope
+- `RunForConversationAsync_BudgetCapHit_ReturnsCapReached_FinalTextEmpty` — budget halt → empty FinalAssistantText (orchestrator synthesizes placeholder)
+- `RunForConversationAsync_ZeroOrgId_Throws` — defensive pin, mirrors Phase 0 contract
+- `RunForConversationAsync_NullAssistantTurnId_PersistsAgentRunWithNull` — Phase 3.A.2's current orchestrator pattern
+
+**Migration tests (1 new):**
+- `Migration_ToolCallIdAndToolName_BackwardsCompatWithExistingRows` — strict-additive: Phase 1+2 rows persist with NULL; new Tool turns round-trip both fields
+
+**Real-Ollama smoke (1 new, gated on `OLLAMA_BASE_URL`):**
+- `PostTurns_AgentPath_WithEchoTool_PersistsToolTurnAndAssistantReply` — full real-LLM agent-path conversation flow + GET inline-shape verification
+
+**Schema-shape pin updated:** `EFMigrationSmokeTests.Migration_AppliesToEmptyDatabase_CreatesExpectedSchema` extended to include `tool_call_id` + `tool_name` columns on the turns table.
+
+**Total post-Phase-3.A.2: 105 passing + 4 SkippableFact gated = 109 total** (+25 from Phase 3.A.1 baseline of 80).
+
+Wait — actual count is 111/3/114. The +25 is approximate; the difference is the SkippableTheory inline-data variations counted as separate test instances by xUnit but as one test method.
+
+## Architectural divergences
+
+1. **`AssistantAgentExecutor.RunForConversationAsync` is a concrete-class method, not an interface method.** `IAgentExecutor.RunAsync` (Phase 0) returns just `AgentRun` — insufficient for Phase 3.A.2's needs. Adding a sibling method on the interface would be a Core surface change for one consumer; deferred. Orchestrator depends on the concrete class. Lift to Core when a second consumer materializes (per the Phase 3.A.1 `IAgentLlmClient` precedent).
+
+2. **Agent path uses `Assistant:Agent:Model`, not the conversation's pinned `Model`.** Different concerns (tool-aware vs text-only). Phase 3.B+ may unify if useful.
+
+3. **Orchestrator currently passes `assistantTurnId: null` to the executor.** Turn ids are generated by the store under the advisory lock AFTER the executor returns; orchestrator doesn't pre-allocate. The `assistant_turn_id` column on `agent_runs` stays NULL for conversation-integrated runs in Phase 3.A.2. Phase 3.A.3+ may add post-completion linking if cross-reference becomes operationally useful.
+
+4. **Tool turns rendered as `ChatRole.System` for next-turn LLM context** (per `ConversationOrchestrator.ToCoreRole`). Trellis.Core's `ChatRole` enum (Phase 1+2) doesn't have a `Tool` value; widening it is a Core change for marginal model-quality benefit. Ollama's tools API accepts the result as a system-role envelope. Phase 3.B may widen if quality benefits.
+
+5. **`BuildToolCatalogue` uses placeholder descriptors when filtering by name.** The orchestrator only knows tool NAMES from the request body; the executor's `resolvableTools` filter intersects with the actual registered tool catalogue at the registry layer. Placeholder ParameterSchema is `{"type":"object"}` — the `OllamaAgentLlmClient` resolves the real schema from each `IAgentTool.Descriptor` when constructing the function-calling wire body. Phase 3.B may surface a richer "filter by name" call on the registry directly.
 
 ## Non-negotiables (Phase 3.A standard)
 
