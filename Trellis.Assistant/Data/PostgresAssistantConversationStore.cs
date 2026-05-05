@@ -215,6 +215,11 @@ public sealed class PostgresAssistantConversationStore : IAssistantConversationS
                 Position = nextPosition + i,
                 Role = ToRoleString(nt.Role),
                 Content = nt.Content,
+                // Phase 3.A.2: propagate tool-turn metadata. Both null on
+                // user/assistant/system turns; populated on Tool turns
+                // by the conversation-integrated agent path.
+                ToolCallId = nt.ToolCallId,
+                ToolName = nt.ToolName,
                 CreatedAt = now,
             });
         }
@@ -266,13 +271,17 @@ public sealed class PostgresAssistantConversationStore : IAssistantConversationS
         Position: e.Position,
         Role: ToRoleEnum(e.Role),
         Content: e.Content,
+        ToolCallId: e.ToolCallId,
+        ToolName: e.ToolName,
         CreatedAt: e.CreatedAt);
 
     // ---- role string <-> enum ----
     //
-    // The DB stores lowercase wire strings ("user", "assistant", "system").
-    // Phase 3 adds "tool" without a schema change — new enum value lands
-    // alongside in Trellis.Core, the parser picks it up automatically.
+    // The DB stores lowercase wire strings ("user", "assistant", "system",
+    // "tool"). Phase 3.A.2 adds "tool" — pre-Phase-3.A.2 rows in the turns
+    // table never carried this value (only user/assistant/system turns
+    // existed); post-Phase-3.A.2, Tool=3 turns are valid + carry the
+    // conversation-integrated agent path's tool-result rows.
     // Unknown strings throw at the boundary so a typo'd row doesn't
     // silently render as the default enum value (which would be User and
     // very wrong from an audit perspective).
@@ -281,6 +290,7 @@ public sealed class PostgresAssistantConversationStore : IAssistantConversationS
         AssistantTurnRole.User => "user",
         AssistantTurnRole.Assistant => "assistant",
         AssistantTurnRole.System => "system",
+        AssistantTurnRole.Tool => "tool",
         _ => throw new ArgumentOutOfRangeException(nameof(role), role, "Unknown role"),
     };
 
@@ -289,6 +299,7 @@ public sealed class PostgresAssistantConversationStore : IAssistantConversationS
         "user" => AssistantTurnRole.User,
         "assistant" => AssistantTurnRole.Assistant,
         "system" => AssistantTurnRole.System,
+        "tool" => AssistantTurnRole.Tool,
         _ => throw new InvalidOperationException(
             $"Unrecognized role string '{role}' in turns table — schema migration may be needed."),
     };

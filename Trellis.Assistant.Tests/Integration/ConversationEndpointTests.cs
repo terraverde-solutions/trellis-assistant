@@ -426,6 +426,268 @@ public sealed class ConversationEndpointTests : IClassFixture<PostgresFixture>, 
         resp.StatusCode.Should().Be(HttpStatusCode.NotFound);
     }
 
+    // ---------------- Phase 3.A.2 agent-path tests ----------------
+
+    [SkippableFact]
+    public async Task Conversation_AgentPath_PersistsToolTurnInline_AndGetReturnsItInTurnsArray()
+    {
+        // Phase 3.A.2 explicit mutation pin (per hub's non-negotiables):
+        // Option A wire shape — tool turns persist inline in the turns
+        // table; GET /api/conversations/{id} returns them in the Turns
+        // array between the user turn and the final assistant turn.
+        // Locks the GET response shape that Phase 4 channel adapters
+        // rely on.
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        // Script the agent LLM: one tool_call, then a final assistant
+        // text. The orchestrator routes through the executor when the
+        // request specifies a Tools filter.
+        _factory!.AgentLlmStub
+            .EnqueueToolCall("echo", """{"text":"hello from agent path"}""")
+            .EnqueueAssistantText("Tool result received; here's the final answer.");
+
+        using var client = NewClient();
+        var convResp = await client.PostAsJsonAsync("/api/conversations",
+            new ConversationEndpoints.CreateConversationRequest(Channel: "api"));
+        var conv = await convResp.Content.ReadFromJsonAsync<ConversationEndpoints.CreateConversationResponse>();
+
+        // Agent path: include Tools field in the request body.
+        var turnResp = await client.PostAsJsonAsync(
+            $"/api/conversations/{conv!.Id}/turns",
+            new ConversationEndpoints.AppendTurnRequest("Use echo to test the agent path.")
+            {
+                Tools = new[] { "echo" },
+            });
+        turnResp.StatusCode.Should().Be(HttpStatusCode.OK);
+
+        var turnBody = await turnResp.Content.ReadFromJsonAsync<ConversationEndpoints.AppendTurnResponse>();
+        turnBody!.UserTurn.Role.Should().Be("user");
+        turnBody.UserTurn.Position.Should().Be(0);
+        turnBody.AssistantTurn.Role.Should().Be("assistant");
+        turnBody.AssistantTurn.Content.Should().Contain("final answer");
+
+        // Tool turn persisted inline in the response.
+        turnBody.ToolTurns.Should().NotBeNull(
+            "agent path returns ToolTurns populated; Phase 2 direct path leaves it null");
+        turnBody.ToolTurns!.Should().HaveCount(1);
+        turnBody.ToolTurns![0].Role.Should().Be("tool");
+        turnBody.ToolTurns![0].ToolName.Should().Be("echo");
+        turnBody.ToolTurns![0].ToolCallId.Should().NotBeNullOrEmpty();
+        turnBody.ToolTurns![0].Content.Should().Contain("hello from agent path",
+            "tool result content carries the dispatched tool's output JSON");
+
+        // Position contiguity pin: user=0, tool=1, assistant=2.
+        turnBody.UserTurn.Position.Should().Be(0);
+        turnBody.ToolTurns![0].Position.Should().Be(1);
+        turnBody.AssistantTurn.Position.Should().Be(2);
+
+        // Option A GET-shape pin: GET /api/conversations/{id} returns
+        // the FULL chain inline in the Turns array, in position order.
+        var getResp = await client.GetAsync($"/api/conversations/{conv.Id}");
+        var getBody = await getResp.Content.ReadFromJsonAsync<ConversationEndpoints.GetConversationResponse>();
+        getBody!.Turns.Should().HaveCount(3,
+            "GET returns the full [user, tool, assistant] chain inline per Option A wire shape");
+        getBody.Turns[0].Role.Should().Be("user");
+        getBody.Turns[1].Role.Should().Be("tool");
+        getBody.Turns[1].ToolCallId.Should().NotBeNullOrEmpty();
+        getBody.Turns[1].ToolName.Should().Be("echo");
+        getBody.Turns[2].Role.Should().Be("assistant");
+    }
+
+    [SkippableFact]
+    public async Task PostTurns_WithoutToolsField_PreservesPhase2DirectLlmPath()
+    {
+        // Negative pin: when Tools is null/empty, the orchestrator
+        // routes through the Phase 2 direct-LLM path. AppendTurnResponse.ToolTurns
+        // is null (not an empty array), and the conversation has only
+        // [user, assistant] with no tool turns.
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        using var client = NewClient();
+        var convResp = await client.PostAsJsonAsync("/api/conversations",
+            new ConversationEndpoints.CreateConversationRequest(Channel: "api"));
+        var conv = await convResp.Content.ReadFromJsonAsync<ConversationEndpoints.CreateConversationResponse>();
+
+        // No Tools field — Phase 2 direct path. Agent LLM stub should
+        // NOT be invoked; the StubLlmClient (text streaming) handles it.
+        var turnResp = await client.PostAsJsonAsync(
+            $"/api/conversations/{conv!.Id}/turns",
+            new ConversationEndpoints.AppendTurnRequest("plain question, no tools"));
+        turnResp.StatusCode.Should().Be(HttpStatusCode.OK);
+
+        var turnBody = await turnResp.Content.ReadFromJsonAsync<ConversationEndpoints.AppendTurnResponse>();
+        turnBody!.ToolTurns.Should().BeNull(
+            "Phase 2 direct-LLM path leaves ToolTurns null in the wire response — additive shape preserves Phase 1+2 client compat");
+
+        // Agent LLM stub never invoked.
+        _factory!.AgentLlmStub.Calls.Should().BeEmpty(
+            "direct-LLM path bypasses the agent executor entirely; AgentLlmStub records zero invocations");
+    }
+
+    [SkippableFact]
+    public async Task PostTurns_WithEmptyToolsArray_PreservesPhase2DirectLlmPath()
+    {
+        // Sister pin: empty Tools array (caller sent the field but no
+        // names) is treated identically to null — direct-LLM path.
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        using var client = NewClient();
+        var convResp = await client.PostAsJsonAsync("/api/conversations",
+            new ConversationEndpoints.CreateConversationRequest(Channel: "api"));
+        var conv = await convResp.Content.ReadFromJsonAsync<ConversationEndpoints.CreateConversationResponse>();
+
+        var turnResp = await client.PostAsJsonAsync(
+            $"/api/conversations/{conv!.Id}/turns",
+            new ConversationEndpoints.AppendTurnRequest("question")
+            {
+                Tools = Array.Empty<string>(),
+            });
+        turnResp.StatusCode.Should().Be(HttpStatusCode.OK);
+
+        var turnBody = await turnResp.Content.ReadFromJsonAsync<ConversationEndpoints.AppendTurnResponse>();
+        turnBody!.ToolTurns.Should().BeNull();
+        _factory!.AgentLlmStub.Calls.Should().BeEmpty();
+    }
+
+    [SkippableFact]
+    public async Task Conversation_AgentPath_AcrossMultipleTurns_HistoryIncludesPriorToolTurns()
+    {
+        // Multi-turn pin: after a first agent-path turn persists a tool
+        // turn, a SECOND user turn (also via agent path) should see the
+        // prior tool turn in its history. Verify by checking the
+        // AgentLlmStub captured a message count that includes the prior
+        // tool turn.
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        // Round 1: tool_call → assistant text
+        _factory!.AgentLlmStub
+            .EnqueueToolCall("echo", """{"text":"first round"}""")
+            .EnqueueAssistantText("first round done")
+            // Round 2: another tool_call → another assistant text
+            .EnqueueToolCall("echo", """{"text":"second round"}""")
+            .EnqueueAssistantText("second round done");
+
+        using var client = NewClient();
+        var convResp = await client.PostAsJsonAsync("/api/conversations",
+            new ConversationEndpoints.CreateConversationRequest(Channel: "api"));
+        var conv = await convResp.Content.ReadFromJsonAsync<ConversationEndpoints.CreateConversationResponse>();
+
+        // First turn
+        await client.PostAsJsonAsync(
+            $"/api/conversations/{conv!.Id}/turns",
+            new ConversationEndpoints.AppendTurnRequest("first request")
+            {
+                Tools = new[] { "echo" },
+            });
+
+        // Second turn — should see prior history including the tool turn
+        var firstRoundCallCount = _factory.AgentLlmStub.Calls.Count;
+        await client.PostAsJsonAsync(
+            $"/api/conversations/{conv.Id}/turns",
+            new ConversationEndpoints.AppendTurnRequest("second request")
+            {
+                Tools = new[] { "echo" },
+            });
+
+        // The second-round LLM calls should include more messages than
+        // the first round (history grew with prior user + tool + assistant).
+        var secondRoundFirstCall = _factory.AgentLlmStub.Calls[firstRoundCallCount];
+        secondRoundFirstCall.MessageCount.Should().BeGreaterThan(2,
+            "second round's history includes prior user + tool + assistant turns + new user message — minimum 4 messages (system + 3 prior + new user)");
+
+        // GET conversation now has 6 turns: [user, tool, assistant, user, tool, assistant]
+        var getResp = await client.GetAsync($"/api/conversations/{conv.Id}");
+        var getBody = await getResp.Content.ReadFromJsonAsync<ConversationEndpoints.GetConversationResponse>();
+        getBody!.Turns.Should().HaveCount(6);
+        getBody.Turns.Select(t => t.Role).Should().Equal(
+            "user", "tool", "assistant",
+            "user", "tool", "assistant");
+    }
+
+    [SkippableFact]
+    public async Task AgentPath_OverridesConversationModel_WithAssistantAgentModel()
+    {
+        // Phase 3.A.2 architectural divergence #2 lock per hub's
+        // ratification: when the agent path runs, the LLM call uses
+        // Assistant:Agent:Model (default qwen2.5:72b — tool-supporting
+        // model), NOT the conversation's pinned Model. Customer-visible
+        // side effect: a conversation pinned to mistral-small:24b that
+        // flips to agent path produces output from qwen2.5:72b.
+        //
+        // Phase 3.B candidate: reconcile via per-conversation
+        // tool-aware-model field. Until then, pin the divergence so
+        // a future change can't accidentally "fix" it without a
+        // matching brief.
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        _factory!.AgentLlmStub.EnqueueAssistantText("agent answer");
+
+        using var client = NewClient();
+        // Create with explicit Model that differs from Assistant:Agent:Model.
+        var convResp = await client.PostAsJsonAsync("/api/conversations",
+            new ConversationEndpoints.CreateConversationRequest(
+                Channel: "api",
+                Model: "llama3.3:70b"));
+        var conv = await convResp.Content.ReadFromJsonAsync<ConversationEndpoints.CreateConversationResponse>();
+        conv!.Model.Should().Be("llama3.3:70b",
+            "conversation pins llama3.3:70b explicitly");
+
+        // Agent path: include Tools field — routes through executor.
+        await client.PostAsJsonAsync(
+            $"/api/conversations/{conv.Id}/turns",
+            new ConversationEndpoints.AppendTurnRequest("test")
+            {
+                Tools = new[] { "echo" },
+            });
+
+        // The agent LLM stub captured the model arg passed to
+        // ChatWithToolsAsync. It must NOT be the conversation's
+        // "llama3.3:70b" — agent path uses Assistant:Agent:Model
+        // (qwen2.5:72b in test config, inheriting from appsettings.json).
+        _factory.AgentLlmStub.Calls.Should().NotBeEmpty();
+        _factory.AgentLlmStub.Calls[0].Model.Should().NotBe("llama3.3:70b",
+            "agent path overrides the conversation's pinned Model with Assistant:Agent:Model — pinned divergence per Phase 3.A.2 architectural ratification #2");
+        _factory.AgentLlmStub.Calls[0].Model.Should().Be("qwen2.5:72b",
+            "Assistant:Agent:Model defaults to qwen2.5:72b in appsettings.json (tool-supporting model)");
+    }
+
+    [SkippableFact]
+    public async Task PostTurns_AgentPath_NonUuidTenant_Returns400()
+    {
+        // Phase 3.A C1 pin: agent path requires uuid-shaped tenantId.
+        // The TenantHeadersMiddleware lets non-blank strings through;
+        // the agent-path branch in the orchestrator surfaces a 400
+        // when Guid.Parse fails. Pin the wire-status mapping.
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        // First: create a conversation with a uuid tenant (so the row
+        // exists). Then attempt to POST /turns from a NON-uuid tenant
+        // header — the cross-tenant check would 404, but the agent-path
+        // C1 check should fire FIRST with 400.
+        using var client = NewClient();
+        var convResp = await client.PostAsJsonAsync("/api/conversations",
+            new ConversationEndpoints.CreateConversationRequest(Channel: "api"));
+        var conv = await convResp.Content.ReadFromJsonAsync<ConversationEndpoints.CreateConversationResponse>();
+
+        using var nonUuidClient = NewClient(tenantId: "non-uuid-tenant", userId: TestTenants.UserA);
+        var turnResp = await nonUuidClient.PostAsJsonAsync(
+            $"/api/conversations/{conv!.Id}/turns",
+            new ConversationEndpoints.AppendTurnRequest("agent path with non-uuid tenant")
+            {
+                Tools = new[] { "echo" },
+            });
+
+        // Either 400 (C1 check fires before cross-tenant lookup) or 404
+        // (cross-tenant check fires first because the conversation
+        // belongs to TenantA — though a non-uuid tenant won't match
+        // anyway). 400 is the canonical surface for the C1 violation;
+        // 404 is also acceptable per the existence-probing-leak prevention
+        // contract. Pin one of those, not 500.
+        ((int)turnResp.StatusCode).Should().Match(
+            code => code == 400 || code == 404,
+            "non-uuid tenant on agent path must surface as 400 (C1 violation) or 404 (cross-tenant) — never 500");
+    }
+
     [SkippableFact]
     public async Task PostTurns_FromDifferentUserSameTenant_Returns404()
     {

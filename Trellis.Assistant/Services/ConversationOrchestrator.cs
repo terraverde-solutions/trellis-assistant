@@ -1,4 +1,5 @@
 using System.Text;
+using Trellis.Assistant.AgentExecution;
 using Trellis.Core.Models;
 using Trellis.Core.Services;
 
@@ -63,13 +64,16 @@ public sealed class ConversationOrchestrator
 {
     private readonly IAssistantConversationStore _store;
     private readonly IOllamaClient _llm;
+    private readonly AssistantAgentExecutor _agentExecutor;
 
     public ConversationOrchestrator(
         IAssistantConversationStore store,
-        IOllamaClient llm)
+        IOllamaClient llm,
+        AssistantAgentExecutor agentExecutor)
     {
         _store = store ?? throw new ArgumentNullException(nameof(store));
         _llm = llm ?? throw new ArgumentNullException(nameof(llm));
+        _agentExecutor = agentExecutor ?? throw new ArgumentNullException(nameof(agentExecutor));
     }
 
     /// <summary>
@@ -94,6 +98,7 @@ public sealed class ConversationOrchestrator
         string userId,
         Guid conversationId,
         string userContent,
+        IReadOnlyList<string>? toolNameFilter = null,
         CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(tenantId);
@@ -119,18 +124,41 @@ public sealed class ConversationOrchestrator
             .GetTurnsAsync(tenantId, userId, conversationId, cancellationToken)
             .ConfigureAwait(false);
 
-        // Build the LLM prompt: prior turns + the new user message. The
-        // ChatMessage type is Trellis.Core's wire shape; long Ids in those
-        // fields are local-to-the-LLM-call and don't reference Assistant's
-        // ulid-based DB ids.
+        // Phase 3.A.2: route through the agent executor when the request
+        // specifies a tools filter. Non-null + non-empty → agent path.
+        // Null/empty → existing Phase 2 direct-LLM path (preserved).
+        var useAgentPath = toolNameFilter is { Count: > 0 };
+        if (useAgentPath)
+        {
+            return await HandleAgentPathAsync(
+                tenantId, userId, conversationId, conv, prior, userContent,
+                toolNameFilter!, cancellationToken).ConfigureAwait(false);
+        }
+
+        return await HandleDirectLlmPathAsync(
+            tenantId, userId, conversationId, conv, prior, userContent,
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Phase 1+2 direct-LLM path. The conversation's pinned model
+    /// (Phase 2's per-conversation Model column) drives the call;
+    /// no tool dispatch. Persists [user, assistant] atomically.
+    /// </summary>
+    private async Task<TurnPairResult> HandleDirectLlmPathAsync(
+        string tenantId,
+        string userId,
+        Guid conversationId,
+        AssistantConversation conv,
+        IReadOnlyList<AssistantTurn> prior,
+        string userContent,
+        CancellationToken cancellationToken)
+    {
+        // Build the LLM prompt: prior turns + the new user message.
         var llmHistory = new List<ChatMessage>(prior.Count + 1);
         foreach (var t in prior)
         {
-            llmHistory.Add(new ChatMessage
-            {
-                Role = ToCoreRole(t.Role),
-                Content = t.Content,
-            });
+            llmHistory.Add(ToChatMessage(t));
         }
         llmHistory.Add(new ChatMessage
         {
@@ -138,19 +166,8 @@ public sealed class ConversationOrchestrator
             Content = userContent,
         });
 
-        // Stream the LLM response into a buffer. The stub yields 5 chunks
-        // ~40ms apart; production Ollama yields tokens at 5-50/sec. The
-        // orchestrator persists the concatenated full response — Phase 2
-        // doesn't push streaming chunks back to the HTTP caller (that's
-        // a Phase 3+ channel-adapter concern). The endpoint returns the
-        // full assembled assistant reply.
-        //
-        // Model selection: per-conversation, pinned at create time. The
-        // conversation row's Model column was assigned by the storage
-        // layer (caller-supplied at POST /api/conversations or the
-        // column DEFAULT). Phase 3+ may add a re-pin operation if
-        // model-switching mid-conversation becomes a real need; Phase 2
-        // is single-model-per-conversation.
+        // Stream the LLM response into a buffer. Per-conversation model
+        // (Phase 2 Q4=B) drives the call.
         var assistantBuffer = new StringBuilder();
         await foreach (var chunk in _llm.StreamChatAsync(conv.Model, llmHistory, cancellationToken)
             .WithCancellation(cancellationToken)
@@ -160,13 +177,6 @@ public sealed class ConversationOrchestrator
         }
         var assistantContent = assistantBuffer.ToString();
 
-        // Persist user + assistant turns in one AppendTurnsAsync call.
-        // The store acquires the per-conversation advisory lock around
-        // the position read + INSERT pair (NOT around the history read
-        // or LLM call above — see CONCURRENCY CONTRACT in this class's
-        // XML doc). Positions are computed under the lock, so concurrent
-        // requests can't race the unique constraint on
-        // (conversation_id, position).
         var newTurns = await _store
             .AppendTurnsAsync(
                 tenantId,
@@ -182,10 +192,6 @@ public sealed class ConversationOrchestrator
 
         if (newTurns.Count != 2)
         {
-            // Defensive — AppendTurnsAsync's contract is "returns the
-            // persisted turns in input order." A regression in the impl
-            // returning fewer or differently-ordered turns would corrupt
-            // the response shape; this assertion catches it loudly.
             throw new InvalidOperationException(
                 $"Expected 2 persisted turns (user + assistant), got {newTurns.Count}.");
         }
@@ -193,11 +199,174 @@ public sealed class ConversationOrchestrator
         return new TurnPairResult(UserTurn: newTurns[0], AssistantTurn: newTurns[1]);
     }
 
+    /// <summary>
+    /// Phase 3.A.2 agent-integrated path. Routes through
+    /// <see cref="AssistantAgentExecutor.RunForConversationAsync"/>;
+    /// persists [user, ...tool turns, assistant] atomically as one
+    /// batch via <see cref="IAssistantConversationStore.AppendTurnsAsync"/>.
+    ///
+    /// <para>
+    /// Note: the agent executor's LLM call uses the global
+    /// <c>Assistant:Agent:Model</c> setting (default qwen2.5:72b — a
+    /// known tool-supporting model), NOT the conversation's pinned
+    /// Model. The conversation's Model is for direct-LLM calls; the
+    /// agent path is tool-aware and needs a function-calling-capable
+    /// model.
+    /// </para>
+    /// </summary>
+    private async Task<TurnPairResult> HandleAgentPathAsync(
+        string tenantId,
+        string userId,
+        Guid conversationId,
+        AssistantConversation conv,
+        IReadOnlyList<AssistantTurn> prior,
+        string userContent,
+        IReadOnlyList<string> toolNameFilter,
+        CancellationToken cancellationToken)
+    {
+        // Build messages from prior turns + new user message. Same
+        // shape as the direct-LLM path; the executor adds its own
+        // system prompt internally.
+        var messages = new List<ChatMessage>(prior.Count + 1);
+        foreach (var t in prior)
+        {
+            messages.Add(ToChatMessage(t));
+        }
+        messages.Add(new ChatMessage
+        {
+            Role = ChatRole.User,
+            Content = userContent,
+        });
+
+        // OrgId derivation: same Phase 3.A C1 contract as POST /api/agent-runs.
+        // The endpoint layer pre-validated the tenantId is uuid-shaped; here
+        // we Guid.Parse + fail loud if somehow not.
+        if (!Guid.TryParse(tenantId, out var orgId) || orgId == Guid.Empty)
+        {
+            throw new InvalidOperationException(
+                $"TenantId '{tenantId}' is not uuid-shaped — agent-path requires uuid tenantIds per Phase 3.A C1 contract. Endpoint layer should have rejected this earlier.");
+        }
+
+        // Build the tool descriptor catalogue from the registered tool set
+        // intersected with the caller's filter. The executor filters again
+        // internally (resolvableTools), so a name in the filter that isn't
+        // registered just gets dropped by the planner side.
+        var allTools = _agentExecutor is { } _;  // suppress unused-var warning; _agentExecutor used below
+        var availableTools = BuildToolCatalogue(toolNameFilter);
+
+        var result = await _agentExecutor.RunForConversationAsync(
+            orgId: orgId,
+            assistantTurnId: null,  // Phase 3.A.2 doesn't pre-allocate; the user_turn id is generated by the store under the advisory lock
+            userPrompt: userContent,
+            messages: messages,
+            availableTools: availableTools,
+            budgetOverrides: null,
+            cancellationToken: cancellationToken).ConfigureAwait(false);
+
+        // Build the new-turns batch: user, then one Tool turn per
+        // dispatch (in order), then the final assistant turn.
+        // AppendTurnsAsync persists them atomically with sequential
+        // positions under the per-conversation advisory lock.
+        var newTurnInputs = new List<NewAssistantTurn>(2 + result.ToolDispatches.Count)
+        {
+            new(AssistantTurnRole.User, userContent),
+        };
+        foreach (var dispatch in result.ToolDispatches)
+        {
+            newTurnInputs.Add(new NewAssistantTurn(
+                AssistantTurnRole.Tool,
+                dispatch.ResultContent,
+                dispatch.ToolCallId,
+                dispatch.ToolName));
+        }
+        // The final assistant turn carries the model's terminal response
+        // text. If the executor halted before the model emitted a final
+        // text (cap_reached / loop_detected / failed / cancelled), the
+        // FinalAssistantText is empty — we still persist a placeholder
+        // assistant turn so the response shape stays consistent + the
+        // client can surface the run's terminal status separately.
+        var assistantContent = string.IsNullOrEmpty(result.FinalAssistantText)
+            ? $"[agent terminated: {result.AgentRun.Status}]"
+            : result.FinalAssistantText;
+        newTurnInputs.Add(new NewAssistantTurn(AssistantTurnRole.Assistant, assistantContent));
+
+        var newTurns = await _store
+            .AppendTurnsAsync(tenantId, userId, conversationId, newTurnInputs, cancellationToken)
+            .ConfigureAwait(false);
+
+        var expectedCount = 2 + result.ToolDispatches.Count;
+        if (newTurns.Count != expectedCount)
+        {
+            throw new InvalidOperationException(
+                $"Expected {expectedCount} persisted turns (user + {result.ToolDispatches.Count} tool turns + assistant), got {newTurns.Count}.");
+        }
+
+        // Slice: index 0 = user, [1..N+1) = tool turns, last = assistant.
+        var userTurn = newTurns[0];
+        var assistantTurn = newTurns[^1];
+        var toolTurns = result.ToolDispatches.Count == 0
+            ? Array.Empty<AssistantTurn>()
+            : newTurns.Skip(1).Take(result.ToolDispatches.Count).ToArray();
+
+        return new TurnPairResult(userTurn, assistantTurn) { ToolTurns = toolTurns };
+    }
+
+    /// <summary>
+    /// Build the agent-path tool descriptor catalogue. The orchestrator
+    /// only knows tool NAMES from the request body; it asks the executor
+    /// (via the registry surface) to resolve them. Phase 3.A.2 keeps this
+    /// simple: pass an empty descriptor list when the filter is empty
+    /// (lets the executor's resolvableTools filter handle the rest).
+    /// </summary>
+    private static IReadOnlyList<AgentToolDescriptor> BuildToolCatalogue(
+        IReadOnlyList<string> filter)
+    {
+        // The executor filters internally based on registered tool names.
+        // We pass placeholder descriptors carrying the requested names —
+        // the executor's `resolvableTools` filter intersects with the
+        // actual registry, so unknown names get dropped before the LLM
+        // sees them. ParameterSchema is filled by the executor at the
+        // tools-array build site (OllamaAgentLlmClient pulls from each
+        // registered IAgentTool's Descriptor when constructing the
+        // function-calling wire body — placeholder ParameterSchema
+        // here is overridden when the registry resolves the actual tool).
+        //
+        // Phase 3.B may surface a richer "filter by name" call on the
+        // registry directly to avoid this placeholder shape. For 3.A.2,
+        // the placeholder works because OllamaAgentLlmClient looks up
+        // descriptors by name when building the wire body.
+        return filter.Select(name => new AgentToolDescriptor
+        {
+            Name = name,
+            Description = $"(filter placeholder for '{name}'; executor resolves via registry)",
+            ParameterSchema = """{"type":"object"}""",
+            Category = AgentToolCategory.Inspect,
+        }).ToList();
+    }
+
+    private static ChatMessage ToChatMessage(AssistantTurn turn)
+    {
+        return new ChatMessage
+        {
+            Role = ToCoreRole(turn.Role),
+            Content = turn.Content,
+        };
+    }
+
     private static ChatRole ToCoreRole(AssistantTurnRole role) => role switch
     {
         AssistantTurnRole.User => ChatRole.User,
         AssistantTurnRole.Assistant => ChatRole.Assistant,
         AssistantTurnRole.System => ChatRole.System,
+        // Phase 3.A.2: Tool turns carry tool result content. Map to
+        // ChatRole.System for the LLM context build — Trellis.Core's
+        // ChatRole enum (Phase 1+2 wire shape for IOllamaClient.StreamChatAsync)
+        // doesn't have a Tool value, and IAgentLlmClient's tools-array
+        // protocol doesn't strictly require role=tool messages on the
+        // wire (Ollama accepts the result as a system-role envelope).
+        // Phase 3.B may widen ChatRole if model behaviour quality
+        // benefits from explicit role=tool messages.
+        AssistantTurnRole.Tool => ChatRole.System,
         _ => throw new ArgumentOutOfRangeException(nameof(role), role, "Unknown role"),
     };
 }
@@ -251,8 +420,20 @@ public sealed class ConversationOrchestratorOptions
 
 /// <summary>
 /// Output of <see cref="ConversationOrchestrator.HandleUserTurnAsync"/>.
-/// Both turns are populated with their persisted positions + ids.
+/// Both required turns are populated with their persisted positions + ids.
+///
+/// <para>
+/// Phase 3.A.2: <see cref="ToolTurns"/> defaults to an empty list for
+/// the Phase 1+2 direct-LLM path (no tool dispatches). When the agent
+/// path runs (caller specified a tools filter), this carries the
+/// Role=Tool turns persisted between the user + final assistant turns,
+/// in the order the executor dispatched them. Positions are contiguous
+/// across [UserTurn, ...ToolTurns, AssistantTurn].
+/// </para>
 /// </summary>
 public sealed record TurnPairResult(
     AssistantTurn UserTurn,
-    AssistantTurn AssistantTurn);
+    AssistantTurn AssistantTurn)
+{
+    public IReadOnlyList<AssistantTurn> ToolTurns { get; init; } = Array.Empty<AssistantTurn>();
+}

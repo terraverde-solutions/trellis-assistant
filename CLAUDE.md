@@ -23,7 +23,7 @@ phase + guard-rails for what NOT to do yet.
 
 ## Status
 
-**Phase 3.A.1 — agentic execution loop landed.** What exists:
+**Phase 3.A.2 — conversation-integrated agent path landed.** What exists:
 
 - ASP.NET Core net10.0 minimal-API project (`Microsoft.NET.Sdk.Web`)
 - Three conversation endpoints under `/api/conversations`:
@@ -45,12 +45,19 @@ phase + guard-rails for what NOT to do yet.
   - `AssistantBudgetGate` — placeholder pure-logic budget gate (max-steps default 25, max-run-duration 600s, loop detection 3+ identical consecutive). Retrofit-to-Core when qwen's Phase A merges `DefaultBudgetGate`
   - `agent_runs` + `agent_steps` tables (EF migration `20260505103509_AddAgentRunsAndAgentStepsTables`); composite `ix_agent_runs_org_id_started_at` index per the dominant query pattern; `tokens_used` is `bigint` for long-run safety
   - 502 mapping for upstream Ollama errors on tool-using paths (HttpRequestException → 502 Bad Gateway with detail)
-- 80-test suite (3 + 17 + 7 + 7 + 11 + 11 + 6 + 12 + 2 + 4 SkippableFact gated on `OLLAMA_BASE_URL` — see `docs/phase-3a-design.md` for the X1 split)
+- **Phase 3.A.2 surface (this layer):**
+  - `POST /api/conversations/{id}/turns` accepts optional `Tools: string[]?` field. Non-null + non-empty routes through `AssistantAgentExecutor.RunForConversationAsync`; tool turns persist as `Role=Tool` rows in `turns` inline with user/assistant turns; final assistant text persists as the last turn. All persisted atomically as one batch via `AppendTurnsAsync`.
+  - `GET /api/conversations/{id}` returns the full chain inline in the `Turns` array per Option A wire shape (Phase 3.A.2 ratification): `[user, ...tool, assistant]` in position order.
+  - `AppendTurnResponse` gains optional `ToolTurns` field — null on Phase 2 direct-LLM path, populated when the agent path ran.
+  - `TurnDto` gains nullable `ToolCallId` + `ToolName` — both null on user/assistant/system turns; populated on Tool turns.
+  - EF migration `AddToolCallIdAndToolNameToTurns` — strict-additive nullable varchar(64). Existing user/assistant rows persist as NULL.
+  - `AssistantAgentExecutor.RunForConversationAsync` — new public method on the concrete class (NOT on `IAgentExecutor`) that orchestrators use to drive the loop with pre-built messages + return `ConversationAgentResult` carrying final text + per-dispatch summaries.
+  - `IAssistantConversationStore.AppendTurnsAsync` consumes the widened `NewAssistantTurn` shape from Trellis.Core PR #13 (Tool=3 enum + nullable `ToolCallId`/`ToolName` fields).
+- Phase 3.A.1's standalone `POST /api/agent-runs` remains — both endpoints coexist (standalone is one-shot agentic without conversation context; conversation-integrated threads tool history).
+- 105-test suite — see test breakdown in `docs/phase-3a-design.md` § Phase 3.A.2.
 
-What does NOT exist (Phase 3.A.2+):
+What does NOT exist (Phase 3.B+):
 
-- Conversation turn schema widening for tool turns (Phase 3.A.2 — sibling Trellis.Core PR for `IAssistantConversationStore` + `Role=3 (Tool)` + nullable `tool_call_id` / `tool_name` columns)
-- ConversationOrchestrator integration with the executor (Phase 3.A.2 — `POST /api/conversations/{id}/turns` optionally takes the agent path)
 - Real `search_documents` tool → Trainer integration (Phase 3.B — needs Trainer-side surface scoping)
 - DefaultBudgetGate retrofit (1-PR follow-up after qwen's Phase A merges `Trellis.Core.Services.DefaultBudgetGate`)
 - Tool-result streaming to channel adapters (Phase 4)

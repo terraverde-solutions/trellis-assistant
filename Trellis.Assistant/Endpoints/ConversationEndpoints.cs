@@ -116,7 +116,14 @@ public static class ConversationEndpoints
         int Position,
         string Role,
         string Content,
-        DateTime CreatedAt);
+        DateTime CreatedAt)
+    {
+        // Phase 3.A.2: tool-turn metadata. Both null on user/assistant/
+        // system turns; populated on Tool turns to identify which
+        // dispatch the row carries the result of.
+        public string? ToolCallId { get; init; }
+        public string? ToolName { get; init; }
+    }
 
     private static async Task<IResult> GetConversationAsync(
         string id,
@@ -156,11 +163,36 @@ public static class ConversationEndpoints
 
     // ---------------- POST /api/conversations/{id}/turns ----------------
 
-    public sealed record AppendTurnRequest(string Content);
+    public sealed record AppendTurnRequest(string Content)
+    {
+        /// <summary>
+        /// Phase 3.A.2: optional tool-name filter. Non-null + non-empty
+        /// routes the request through <see cref="AssistantAgentExecutor"/>
+        /// (the agent path: model can emit tool_calls; tool turns
+        /// persist inline as Role=Tool rows). Null/empty preserves the
+        /// Phase 2 direct-LLM path. The filter is intersected with the
+        /// host's registered tool catalogue — names not in the registry
+        /// are silently dropped. v0 ships only EchoTool; Phase 3.B adds
+        /// SearchDocumentsTool.
+        /// </summary>
+        public IReadOnlyList<string>? Tools { get; init; }
+    }
 
     public sealed record AppendTurnResponse(
         TurnDto UserTurn,
-        TurnDto AssistantTurn);
+        TurnDto AssistantTurn)
+    {
+        /// <summary>
+        /// Phase 3.A.2: tool turns persisted inline between
+        /// <see cref="UserTurn"/> and <see cref="AssistantTurn"/> when
+        /// the agent path ran. Empty list for direct-LLM path
+        /// (Phase 1+2 contract). The full chain
+        /// <c>[UserTurn, ...ToolTurns, AssistantTurn]</c> is contiguous
+        /// in position order; channel adapters that need the chain
+        /// reconstruct it from these fields without a separate read.
+        /// </summary>
+        public IReadOnlyList<TurnDto>? ToolTurns { get; init; }
+    }
 
     private static async Task<IResult> AppendTurnAsync(
         string id,
@@ -202,12 +234,34 @@ public static class ConversationEndpoints
         try
         {
             var result = await orchestrator
-                .HandleUserTurnAsync(tenantId, userId, conversationId, request.Content, timeoutCts.Token)
+                .HandleUserTurnAsync(
+                    tenantId, userId, conversationId, request.Content,
+                    toolNameFilter: request.Tools,
+                    cancellationToken: timeoutCts.Token)
                 .ConfigureAwait(false);
 
+            // Phase 3.A.2: ToolTurns is empty for the Phase 2 direct-LLM
+            // path (request.Tools null/empty); populated when the agent
+            // path ran. Wire shape stays additive — Phase 1+2 clients
+            // that don't expect ToolTurns just see null in the JSON
+            // body.
             return Results.Ok(new AppendTurnResponse(
                 UserTurn: ToTurnDto(result.UserTurn),
-                AssistantTurn: ToTurnDto(result.AssistantTurn)));
+                AssistantTurn: ToTurnDto(result.AssistantTurn))
+            {
+                ToolTurns = result.ToolTurns.Count == 0
+                    ? null
+                    : result.ToolTurns.Select(ToTurnDto).ToList(),
+            });
+        }
+        catch (InvalidOperationException ex) when (ex.Message.Contains("not uuid-shaped"))
+        {
+            // Phase 3.A.2: agent path requires uuid-shaped tenantId per
+            // C1 contract. Surface as 400 (same shape as POST /api/agent-runs).
+            return Results.BadRequest(new
+            {
+                error = "tenant_id is not a valid uuid; agent-path conversations require uuid-shaped tenant identifiers per Phase 3.A C1 contract",
+            });
         }
         catch (OperationCanceledException) when (
             timeoutCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
@@ -266,5 +320,9 @@ public static class ConversationEndpoints
         Position: t.Position,
         Role: t.Role.ToString().ToLowerInvariant(),
         Content: t.Content,
-        CreatedAt: t.CreatedAt);
+        CreatedAt: t.CreatedAt)
+    {
+        ToolCallId = t.ToolCallId,
+        ToolName = t.ToolName,
+    };
 }
