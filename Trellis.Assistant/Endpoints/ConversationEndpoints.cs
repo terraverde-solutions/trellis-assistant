@@ -229,6 +229,21 @@ public static class ConversationEndpoints
             // has the single error path here.
             return Results.NotFound(new { error = "conversation not found" });
         }
+        catch (HttpRequestException ex)
+        {
+            // Phase 2: no model allowlist at create time, so an invalid
+            // model tag (or transient Ollama outage, or unreachable
+            // base URL) surfaces here when OllamaClient.StreamChatAsync
+            // calls EnsureSuccessStatusCode on a 4xx/5xx upstream
+            // response. 502 maps cleanly — it's the canonical
+            // "upstream gateway returned an error" status. The body
+            // includes the upstream message so operators can pattern-
+            // match the failure (model-not-found, connection-refused,
+            // etc.) in journalctl without having to dig.
+            return Results.Problem(
+                statusCode: StatusCodes.Status502BadGateway,
+                detail: $"upstream Ollama call failed: {ex.Message}");
+        }
     }
 
     // ---------------- Helpers: Ulid <-> Guid wire converters ----------------

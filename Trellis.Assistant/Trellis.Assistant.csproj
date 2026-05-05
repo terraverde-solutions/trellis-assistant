@@ -6,7 +6,11 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <RootNamespace>Trellis.Assistant</RootNamespace>
     <AssemblyName>Trellis.Assistant</AssemblyName>
-    <Description>Always-on personal AI surface for the TerraVerde Trellis system. Voice-first multi-channel presence; MCP-based tool dispatch; cross-surface memory. Phase 0 scaffold — orchestrator + channel adapters + tool dispatch + voice land in Phase 1+.</Description>
+    <!-- Phase 2 non-negotiable: warnings fail the build. Catches accidental
+         API drift (e.g. obsoleted EF/Npgsql signatures, unused awaits) at
+         compile time rather than letting them slip into a deploy. -->
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <Description>Always-on personal AI surface for the TerraVerde Trellis system. Voice-first multi-channel presence; MCP-based tool dispatch; cross-surface memory.</Description>
     <Authors>Terraverde Solutions LLC</Authors>
     <Company>Terraverde Solutions LLC</Company>
   </PropertyGroup>

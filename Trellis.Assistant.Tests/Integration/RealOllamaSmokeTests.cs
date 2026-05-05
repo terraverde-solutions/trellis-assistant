@@ -131,4 +131,54 @@ public sealed class RealOllamaSmokeTests : IClassFixture<PostgresFixture>, IAsyn
         getBody!.Turns.Should().HaveCount(2);
         getBody.Model.Should().Be(testModel);
     }
+
+    [SkippableFact]
+    public async Task PostTurns_WithInvalidModel_ReturnsUpstream502()
+    {
+        // Phase 2 ships no allowlist on the model parameter. An invalid
+        // model tag (one Ollama doesn't have loaded) surfaces as a
+        // 4xx/5xx from Ollama on the first turn — OllamaClient's
+        // EnsureSuccessStatusCode throws HttpRequestException; the
+        // endpoint catches that and maps to 502 Bad Gateway with the
+        // upstream message in the problem detail body.
+        //
+        // The 502 mapping is the "upstream gateway returned an error"
+        // contract — operators pattern-match journalctl on it to
+        // distinguish "Ollama said no" from "Assistant crashed."
+        // Without this catch, the failure would leak as a 500 + a
+        // stack trace, which is both noisier + harder to diagnose.
+        var ollamaBaseUrl = Environment.GetEnvironmentVariable("OLLAMA_BASE_URL");
+        Skip.If(string.IsNullOrWhiteSpace(ollamaBaseUrl),
+            "OLLAMA_BASE_URL not set; real-Ollama upstream-502 pin skipped.");
+        Skip.IfNot(_pg.IsAvailable,
+            "Docker not available; Testcontainers integration test skipped.");
+
+        // Intentionally bogus model tag — guaranteed to not be loaded
+        // on any reasonable Ollama setup. Ollama returns 404 for
+        // unknown model tags on /api/chat.
+        const string invalidModel = "nonexistent-model:phase2-pin-9999";
+
+        using var client = _factory!.CreateClient();
+        client.DefaultRequestHeaders.Add(TenantHeadersMiddleware.TenantHeaderName, "tenant-bad-model");
+        client.DefaultRequestHeaders.Add(TenantHeadersMiddleware.UserHeaderName, "user-bad-model");
+
+        var convResp = await client.PostAsJsonAsync("/api/conversations",
+            new ConversationEndpoints.CreateConversationRequest(Channel: "api", Model: invalidModel));
+        // Conversation create succeeds — no allowlist at create time
+        // is the v0 design. The 502 surfaces only when the orchestrator
+        // tries to call StreamChatAsync with the invalid tag on the
+        // first turn.
+        convResp.StatusCode.Should().Be(HttpStatusCode.Created,
+            "Phase 2 ships no model allowlist at create time; the bogus model tag is accepted here and only fails on the first turn");
+
+        var conv = await convResp.Content.ReadFromJsonAsync<ConversationEndpoints.CreateConversationResponse>();
+        conv!.Model.Should().Be(invalidModel);
+
+        var turnResp = await client.PostAsJsonAsync(
+            $"/api/conversations/{conv.Id}/turns",
+            new ConversationEndpoints.AppendTurnRequest(Content: "this should fail"));
+
+        ((int)turnResp.StatusCode).Should().Be(502,
+            "invalid model tag → Ollama returns 4xx → OllamaClient.EnsureSuccessStatusCode throws HttpRequestException → endpoint catches + maps to 502 Bad Gateway");
+    }
 }
