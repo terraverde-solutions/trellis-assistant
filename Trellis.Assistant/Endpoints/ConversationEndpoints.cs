@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Options;
 using Trellis.Assistant.Middleware;
 using Trellis.Assistant.Services;
 using Trellis.Core.Services;
@@ -35,15 +36,6 @@ namespace Trellis.Assistant.Endpoints;
 /// </summary>
 public static class ConversationEndpoints
 {
-    /// <summary>
-    /// Phase 1 wall-clock per-request timeout for POST /turns. Phase 2
-    /// raises to 180s for real Ollama (cold-loading nomic-embed-text
-    /// or a 70B chat model on first call after restart routinely
-    /// exceeds 60s). Stub LLM yields 5 chunks at 40ms apart =
-    /// ~200 ms total — 60s is a 300x safety margin for Phase 1.
-    /// </summary>
-    public static readonly TimeSpan TurnRequestTimeout = TimeSpan.FromSeconds(60);
-
     public static void MapConversationEndpoints(this IEndpointRouteBuilder app)
     {
         var group = app.MapGroup("/api/conversations");
@@ -55,11 +47,12 @@ public static class ConversationEndpoints
 
     // ---------------- POST /api/conversations ----------------
 
-    public sealed record CreateConversationRequest(string? Channel);
+    public sealed record CreateConversationRequest(string? Channel, string? Model = null);
 
     public sealed record CreateConversationResponse(
         string Id,
         string Channel,
+        string Model,
         DateTime CreatedAt,
         DateTime UpdatedAt);
 
@@ -78,7 +71,13 @@ public static class ConversationEndpoints
         // blank rather than omit it.
         var channel = string.IsNullOrWhiteSpace(request?.Channel) ? "api" : request.Channel;
 
-        var newId = await store.CreateConversationAsync(tenantId, userId, channel, cancellationToken)
+        // Model is per-conversation, pinned at create time. Pass null/
+        // whitespace through unchanged — the store applies the column
+        // DEFAULT (matches the EF migration) so the resolved value is
+        // visible in the read-back below.
+        var model = string.IsNullOrWhiteSpace(request?.Model) ? null : request.Model;
+
+        var newId = await store.CreateConversationAsync(tenantId, userId, channel, model, cancellationToken)
             .ConfigureAwait(false);
         var conv = await store.GetConversationAsync(tenantId, userId, newId, cancellationToken)
             .ConfigureAwait(false);
@@ -97,6 +96,7 @@ public static class ConversationEndpoints
             new CreateConversationResponse(
                 Id: GuidToUlidString(conv.Id),
                 Channel: conv.Channel,
+                Model: conv.Model,
                 CreatedAt: conv.CreatedAt,
                 UpdatedAt: conv.UpdatedAt));
     }
@@ -106,6 +106,7 @@ public static class ConversationEndpoints
     public sealed record GetConversationResponse(
         string Id,
         string Channel,
+        string Model,
         DateTime CreatedAt,
         DateTime UpdatedAt,
         IReadOnlyList<TurnDto> Turns);
@@ -147,6 +148,7 @@ public static class ConversationEndpoints
         return Results.Ok(new GetConversationResponse(
             Id: GuidToUlidString(conv.Id),
             Channel: conv.Channel,
+            Model: conv.Model,
             CreatedAt: conv.CreatedAt,
             UpdatedAt: conv.UpdatedAt,
             Turns: turns.Select(ToTurnDto).ToList()));
@@ -165,6 +167,7 @@ public static class ConversationEndpoints
         AppendTurnRequest request,
         HttpContext context,
         ConversationOrchestrator orchestrator,
+        IOptions<ConversationOrchestratorOptions> options,
         CancellationToken cancellationToken)
     {
         var tenantId = (string)context.Items[TenantHeadersMiddleware.TenantIdKey]!;
@@ -179,14 +182,22 @@ public static class ConversationEndpoints
             return Results.BadRequest(new { error = "content is required" });
         }
 
-        // Link the request CT with a 60s budget. Without this, a stuck
-        // LLM call (Phase 2 worst case: cold-loading a 70B model) holds
-        // the per-conversation advisory lock indefinitely + every other
-        // concurrent POST /turns to the same conversation queues forever.
-        // The lock + the timeout are NOT separable concerns — see
-        // ConversationOrchestrator class doc.
+        // Read as int seconds at startup; converted to TimeSpan once.
+        // Cultures vary on TimeSpan format strings, so we don't trust
+        // IConfiguration.Get<TimeSpan>(); explicit int conversion is
+        // unambiguous. Phase 1 hardcoded 60s; Phase 2 reads from
+        // Assistant:TurnRequestTimeoutSeconds (default 180 — sized for
+        // cold 70B model load + token-heavy responses).
+        var turnTimeout = TimeSpan.FromSeconds(options.Value.TurnRequestTimeoutSeconds);
+
+        // Link the request CT with the configured budget. Without this, a
+        // stuck LLM call (cold-loading a 70B model is the realistic
+        // worst case) holds the per-conversation advisory lock
+        // indefinitely + every other concurrent POST /turns to the same
+        // conversation queues forever. The lock + the timeout are NOT
+        // separable concerns — see ConversationOrchestrator class doc.
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeoutCts.CancelAfter(TurnRequestTimeout);
+        timeoutCts.CancelAfter(turnTimeout);
 
         try
         {
@@ -201,20 +212,21 @@ public static class ConversationEndpoints
         catch (OperationCanceledException) when (
             timeoutCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
         {
-            // Distinguish "we hit the 60s budget" from "client disconnected
-            // mid-request." 504 = our timeout fired; client-side aborts
-            // don't generate a status code at all (the connection is gone).
+            // Distinguish "we hit the configured budget" from "client
+            // disconnected mid-request." 504 = our timeout fired;
+            // client-side aborts don't generate a status code at all
+            // (the connection is gone).
             return Results.Problem(
                 statusCode: StatusCodes.Status504GatewayTimeout,
-                detail: $"orchestrator exceeded {TurnRequestTimeout.TotalSeconds:0}s wall-clock budget; the per-conversation lock has been released.");
+                detail: $"orchestrator exceeded {turnTimeout.TotalSeconds:0}s wall-clock budget; the per-conversation lock has been released.");
         }
         catch (InvalidOperationException ex) when (ex.Message.Contains("not found"))
         {
             // The orchestrator + store both surface "conversation missing"
             // as InvalidOperationException with that substring. 404 maps
             // cleanly. A future tighter exception type (NotFoundException,
-            // etc.) would be cleaner; punted to v1 since Phase 1 has the
-            // single error path here.
+            // etc.) would be cleaner; punted to v1 since Phase 2 still
+            // has the single error path here.
             return Results.NotFound(new { error = "conversation not found" });
         }
     }

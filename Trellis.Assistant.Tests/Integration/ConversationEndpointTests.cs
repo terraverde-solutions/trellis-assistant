@@ -107,6 +107,47 @@ public sealed class ConversationEndpointTests : IClassFixture<PostgresFixture>, 
             "channel defaults to 'api' when omitted (matches the schema's DEFAULT 'api')");
     }
 
+    [SkippableFact]
+    public async Task PostConversations_WithoutModelInBody_DefaultsToMistralSmall()
+    {
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        using var client = NewClient();
+        var resp = await client.PostAsJsonAsync("/api/conversations",
+            new ConversationEndpoints.CreateConversationRequest(Channel: "api"));
+        resp.StatusCode.Should().Be(HttpStatusCode.Created);
+
+        var body = await resp.Content.ReadFromJsonAsync<ConversationEndpoints.CreateConversationResponse>();
+        body!.Model.Should().Be("mistral-small:24b",
+            "model defaults to 'mistral-small:24b' when omitted — matches the schema column DEFAULT and the C#-side fallback in PostgresAssistantConversationStore");
+
+        // GET reads back the same model — the column persists, not just
+        // the response shape.
+        var getResp = await client.GetAsync($"/api/conversations/{body.Id}");
+        var getBody = await getResp.Content.ReadFromJsonAsync<ConversationEndpoints.GetConversationResponse>();
+        getBody!.Model.Should().Be("mistral-small:24b");
+    }
+
+    [SkippableFact]
+    public async Task PostConversations_WithModelInBody_PinsThatModel()
+    {
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        using var client = NewClient();
+        var resp = await client.PostAsJsonAsync("/api/conversations",
+            new ConversationEndpoints.CreateConversationRequest(Channel: "api", Model: "llama3.3:70b"));
+        resp.StatusCode.Should().Be(HttpStatusCode.Created);
+
+        var body = await resp.Content.ReadFromJsonAsync<ConversationEndpoints.CreateConversationResponse>();
+        body!.Model.Should().Be("llama3.3:70b",
+            "caller-supplied model overrides the column DEFAULT");
+
+        var getResp = await client.GetAsync($"/api/conversations/{body.Id}");
+        var getBody = await getResp.Content.ReadFromJsonAsync<ConversationEndpoints.GetConversationResponse>();
+        getBody!.Model.Should().Be("llama3.3:70b",
+            "GET returns the pinned model — model is per-conversation + immutable for Phase 2");
+    }
+
     // ---------------- Test #2 ----------------
 
     [SkippableFact]

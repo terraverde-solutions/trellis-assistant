@@ -75,18 +75,45 @@ builder.Services.AddDbContext<AssistantDbContext>((sp, opts) =>
 // ---------------- Domain services ----------------
 //
 // IAssistantConversationStore: scoped, lifecycle-bound to the AssistantDbContext.
-// IOllamaClient (Phase 1 stub): singleton — no per-request state. Phase 2
-//   swaps the registration to Trellis.Core.Services.OllamaClient backed by
-//   a named HttpClient; that swap is Phase 2's only DI change.
-// ConversationOrchestrator: scoped; depends on the scoped store + the
-//   singleton LLM. The advisory lock + the per-request timeout are spelled
-//   out in the orchestrator's class doc.
+// IOllamaClient: typed HttpClientFactory client (Phase 2). The HttpClient
+//   lifetime is managed by IHttpClientFactory; the OllamaClient instance
+//   itself is transient (one per resolution). The Func<Uri> base-URL provider
+//   honors the same late-resolution rule as the connection string above —
+//   it reads IConfiguration inside the lambda at request time, so test-side
+//   ConfigureAppConfiguration overlays + future runtime config changes are
+//   visible without restarting the host.
+//
+// Phase 1 registered AddSingleton<IOllamaClient, StubLlmClient>; the swap to
+// the real client is the only DI change Phase 2 brings to the LLM seam. The
+// stub still ships in the binary for unit tests that don't have an Ollama
+// server reachable; the swap to the typed client wins at runtime.
 builder.Services.AddScoped<IAssistantConversationStore, PostgresAssistantConversationStore>();
-builder.Services.AddSingleton<IOllamaClient, StubLlmClient>();
-builder.Services.AddScoped<ConversationOrchestrator>(sp => new ConversationOrchestrator(
-    sp.GetRequiredService<IAssistantConversationStore>(),
-    sp.GetRequiredService<IOllamaClient>(),
-    sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<ConversationOrchestratorOptions>>().Value));
+builder.Services.AddHttpClient<IOllamaClient>()
+    .AddTypedClient<IOllamaClient>((http, sp) =>
+    {
+        var config = sp.GetRequiredService<IConfiguration>();
+        return new OllamaClient(
+            http,
+            () => new Uri(config["Ollama:BaseUrl"]
+                ?? throw new InvalidOperationException(
+                    "Ollama:BaseUrl is not configured. Set it in appsettings.user.json (Dev) or /etc/trellis-assistant-qa.env (QA).")));
+    });
+builder.Services.AddScoped<ConversationOrchestrator>();
+
+// ---------------- Readiness + warm-up ----------------
+//
+// Liveness vs readiness split — Kubernetes-style. /healthz reports
+// process liveness (always 200 once Kestrel is listening); /readyz
+// reports whether the LLM warm-up has succeeded. Operators wait on
+// /readyz before declaring "deploy live"; users transparently get
+// cold-load on first request if warm-up never succeeds (lazy fallback).
+//
+// The warm-up service is a BackgroundService — the host's
+// ApplicationStopping CT cancels in-flight Ollama calls cleanly on
+// systemctl restart. See OllamaWarmupHostedService class doc for the
+// backoff schedule + per-attempt cap reasoning.
+builder.Services.AddSingleton<OllamaReadinessState>();
+builder.Services.AddHostedService<OllamaWarmupHostedService>();
 
 var app = builder.Build();
 
@@ -125,6 +152,17 @@ app.UseMiddleware<TenantHeadersMiddleware>();
 // load-bearing for the deploy-script smoke wrapper that hits
 // 127.0.0.1:5117/healthz after `systemctl start`.
 app.MapGet("/healthz", () => Results.Ok(new { status = "ok" }));
+
+// Phase 2 surface: /readyz. 200 once Ollama warm-up has completed at
+// least once; 503 until then. Hub-side Deploy-Assistant-Standalone.ps1
+// extension polls /readyz with a 120s budget after `systemctl restart`
+// before declaring the deploy live (lands as a sibling deploy PR).
+app.MapGet("/readyz", (OllamaReadinessState state) =>
+    state.IsReady
+        ? Results.Ok(new { status = "ready" })
+        : Results.Json(
+            new { status = "warming-up" },
+            statusCode: StatusCodes.Status503ServiceUnavailable));
 
 // Phase 1 surface: conversations.
 app.MapConversationEndpoints();
