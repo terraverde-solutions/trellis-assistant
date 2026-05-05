@@ -51,7 +51,7 @@ public sealed class ConversationEndpointTests : IClassFixture<PostgresFixture>, 
         }
     }
 
-    private HttpClient NewClient(string? tenantId = "tenant-a", string? userId = "user-a")
+    private HttpClient NewClient(string? tenantId = TestTenants.TenantA, string? userId = TestTenants.UserA)
     {
         var client = _factory!.CreateClient();
         if (tenantId is not null)
@@ -296,7 +296,7 @@ public sealed class ConversationEndpointTests : IClassFixture<PostgresFixture>, 
     {
         Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
 
-        using var client = NewClient(tenantId: null, userId: "user-a");
+        using var client = NewClient(tenantId: null, userId: TestTenants.UserA);
         var resp = await client.PostAsJsonAsync("/api/conversations",
             new ConversationEndpoints.CreateConversationRequest(Channel: "api"));
         resp.StatusCode.Should().Be(HttpStatusCode.Unauthorized);
@@ -307,7 +307,7 @@ public sealed class ConversationEndpointTests : IClassFixture<PostgresFixture>, 
     {
         Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
 
-        using var client = NewClient(tenantId: "tenant-a", userId: null);
+        using var client = NewClient(tenantId: TestTenants.TenantA, userId: null);
         var resp = await client.PostAsJsonAsync("/api/conversations",
             new ConversationEndpoints.CreateConversationRequest(Channel: "api"));
         resp.StatusCode.Should().Be(HttpStatusCode.Unauthorized);
@@ -410,18 +410,18 @@ public sealed class ConversationEndpointTests : IClassFixture<PostgresFixture>, 
     {
         Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
 
-        using var creator = NewClient(tenantId: "tenant-a", userId: "user-a");
+        using var creator = NewClient(tenantId: TestTenants.TenantA, userId: TestTenants.UserA);
         var convResp = await creator.PostAsJsonAsync("/api/conversations",
             new ConversationEndpoints.CreateConversationRequest(Channel: "api"));
         var conv = await convResp.Content.ReadFromJsonAsync<ConversationEndpoints.CreateConversationResponse>();
 
-        // Different tenant attempts to read tenant-a's conversation.
+        // Different tenant attempts to read TenantA's conversation.
         // 404 = "not found OR not visible" — the IAssistantConversationStore
         // chokepoint applies WHERE tenant_id = $1 + WHERE user_id = $1 on
         // every query, so cross-tenant reads simply find nothing. The
         // 404 + the not-distinguishable contract prevent existence-
         // probing leaks across tenants.
-        using var attacker = NewClient(tenantId: "tenant-b", userId: "user-a");
+        using var attacker = NewClient(tenantId: TestTenants.TenantB, userId: TestTenants.UserA);
         var resp = await attacker.GetAsync($"/api/conversations/{conv!.Id}");
         resp.StatusCode.Should().Be(HttpStatusCode.NotFound);
     }
@@ -431,15 +431,15 @@ public sealed class ConversationEndpointTests : IClassFixture<PostgresFixture>, 
     {
         Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
 
-        using var creator = NewClient(tenantId: "tenant-a", userId: "user-a");
+        using var creator = NewClient(tenantId: TestTenants.TenantA, userId: TestTenants.UserA);
         var convResp = await creator.PostAsJsonAsync("/api/conversations",
             new ConversationEndpoints.CreateConversationRequest(Channel: "api"));
         var conv = await convResp.Content.ReadFromJsonAsync<ConversationEndpoints.CreateConversationResponse>();
 
         // Same tenant, different user — ownership is (tenant, user), NOT
-        // just tenant. user-b should not be able to append to user-a's
+        // just tenant. UserB should not be able to append to UserA's
         // conversation even within the same tenant.
-        using var sibling = NewClient(tenantId: "tenant-a", userId: "user-b");
+        using var sibling = NewClient(tenantId: TestTenants.TenantA, userId: TestTenants.UserB);
         var resp = await sibling.PostAsJsonAsync(
             $"/api/conversations/{conv!.Id}/turns",
             new ConversationEndpoints.AppendTurnRequest(Content: "intruding"));

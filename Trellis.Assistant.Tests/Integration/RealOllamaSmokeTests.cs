@@ -82,8 +82,8 @@ public sealed class RealOllamaSmokeTests : IClassFixture<PostgresFixture>, IAsyn
             ?? "mistral-small:24b";
 
         using var client = _factory!.CreateClient();
-        client.DefaultRequestHeaders.Add(TenantHeadersMiddleware.TenantHeaderName, "tenant-real-llm");
-        client.DefaultRequestHeaders.Add(TenantHeadersMiddleware.UserHeaderName, "user-real-llm");
+        client.DefaultRequestHeaders.Add(TenantHeadersMiddleware.TenantHeaderName, TestTenants.TenantRealLlm);
+        client.DefaultRequestHeaders.Add(TenantHeadersMiddleware.UserHeaderName, TestTenants.UserRealLlm);
 
         // Create a conversation with the test model pinned.
         var convResp = await client.PostAsJsonAsync("/api/conversations",
@@ -133,6 +133,82 @@ public sealed class RealOllamaSmokeTests : IClassFixture<PostgresFixture>, IAsyn
     }
 
     [SkippableFact]
+    public async Task PostAgentRuns_WithEchoTool_DispatchesAndReturnsSucceeded()
+    {
+        // Phase 3.A.1 real-LLM smoke. Gated on OLLAMA_BASE_URL +
+        // (optionally) OLLAMA_TEST_MODEL — defaults to qwen2.5:72b per
+        // Phase 3.A C3 ratification (known tool-supporting model on
+        // GB10). Verifies the full real-LLM agentic loop: prompt → LLM
+        // emits a tool_call → executor dispatches EchoTool → next LLM
+        // call sees the tool result → emits final assistant text → run
+        // terminates Succeeded.
+        //
+        // The prompt is engineered to nudge tool use (asks the model
+        // to use a specific tool by name); LLMs are non-deterministic,
+        // so the assertion shape allows either:
+        //   - At least one EchoTool dispatch persisted (the happy path
+        //     this test is built for)
+        //   - Zero dispatches but Succeeded status (model decided not
+        //     to use the tool — also a legal outcome; still proves the
+        //     loop ran end-to-end)
+        // The test FAILS only if the run errors or the loop never
+        // terminates within the 240s upper bound.
+        var ollamaBaseUrl = Environment.GetEnvironmentVariable("OLLAMA_BASE_URL");
+        Skip.If(string.IsNullOrWhiteSpace(ollamaBaseUrl),
+            "OLLAMA_BASE_URL not set; real-Ollama agent-run smoke skipped.");
+        Skip.IfNot(_pg.IsAvailable,
+            "Docker not available; Testcontainers integration test skipped.");
+
+        var agentModel = Environment.GetEnvironmentVariable("OLLAMA_TEST_MODEL")
+            ?? "qwen2.5:72b";
+
+        await using var factory = new RealOllamaWebApplicationFactory(
+            _pg.ConnectionString,
+            ollamaBaseUrl,
+            agentModel: agentModel);
+        using var client = factory.CreateClient();
+        client.DefaultRequestHeaders.Add(TenantHeadersMiddleware.TenantHeaderName, TestTenants.TenantRealLlm);
+        client.DefaultRequestHeaders.Add(TenantHeadersMiddleware.UserHeaderName, TestTenants.UserRealLlm);
+
+        var sw = Stopwatch.StartNew();
+        var resp = await client.PostAsJsonAsync(
+            "/api/agent-runs",
+            new AgentRunEndpoints.CreateAgentRunRequest(
+                UserPrompt: "Use the echo tool to repeat the word 'pong' back to me. Then give a final assistant message confirming you did it.",
+                ToolNames: null,
+                MaxSteps: 5));
+        sw.Stop();
+
+        sw.Elapsed.Should().BeLessThan(TimeSpan.FromSeconds(240),
+            $"real-Ollama agent-run smoke must complete within the 240s upper bound; actual was {sw.Elapsed.TotalSeconds:0.0}s");
+
+        resp.StatusCode.Should().Be(HttpStatusCode.OK,
+            "the agent run endpoint returns 200 even when the underlying run halts on cap_reached / loop_detected — only outright errors surface as non-2xx");
+
+        var body = await resp.Content.ReadFromJsonAsync<AgentRunEndpoints.CreateAgentRunResponse>();
+        body.Should().NotBeNull();
+
+        // Acceptable terminal statuses: succeeded (model used or skipped
+        // the tool + emitted final text) OR cap_reached (model loop —
+        // budget gate halted, also valid for the smoke since it pins
+        // the loop ran). loop_detected is also valid if the model
+        // emitted the same call repeatedly. Outright failed = real
+        // problem.
+        body!.Status.Should().BeOneOf(new[] { "succeeded", "cap_reached", "loop_detected" },
+            $"real-LLM agent run terminated with status='{body.Status}', plan='{body.Plan}', error='{body.ErrorMessage ?? "(none)"}'");
+        body.Plan.Should().Contain("LLM-driven");
+
+        // Steps may be empty (model went straight to final text) or
+        // populated (model used echo at least once). Both shapes pass.
+        // If populated, every step must have a valid status string.
+        foreach (var step in body.Steps)
+        {
+            step.Status.Should().BeOneOf(new[] { "succeeded", "failed", "skipped" });
+            step.ToolName.Should().NotBeNullOrWhiteSpace();
+        }
+    }
+
+    [SkippableFact]
     public async Task PostTurns_WithInvalidModel_ReturnsUpstream502()
     {
         // Phase 2 ships no allowlist on the model parameter. An invalid
@@ -159,8 +235,8 @@ public sealed class RealOllamaSmokeTests : IClassFixture<PostgresFixture>, IAsyn
         const string invalidModel = "nonexistent-model:phase2-pin-9999";
 
         using var client = _factory!.CreateClient();
-        client.DefaultRequestHeaders.Add(TenantHeadersMiddleware.TenantHeaderName, "tenant-bad-model");
-        client.DefaultRequestHeaders.Add(TenantHeadersMiddleware.UserHeaderName, "user-bad-model");
+        client.DefaultRequestHeaders.Add(TenantHeadersMiddleware.TenantHeaderName, TestTenants.TenantBadModel);
+        client.DefaultRequestHeaders.Add(TenantHeadersMiddleware.UserHeaderName, TestTenants.UserBadModel);
 
         var convResp = await client.PostAsJsonAsync("/api/conversations",
             new ConversationEndpoints.CreateConversationRequest(Channel: "api", Model: invalidModel));

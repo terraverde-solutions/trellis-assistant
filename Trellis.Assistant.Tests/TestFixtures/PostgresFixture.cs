@@ -78,6 +78,18 @@ public sealed class PostgresFixture : IAsyncLifetime
     /// Cheap probe for Docker availability. Avoids a full container start
     /// when Docker isn't running — the container start would hang ~30s
     /// before failing.
+    ///
+    /// <para>
+    /// 10-second timeout on <c>docker info</c>: the metadata call is
+    /// usually sub-second, but when many test classes are concurrently
+    /// spinning + tearing down containers, the daemon can briefly serialize
+    /// requests. The original Phase 1/2 budget of 2s was sufficient for
+    /// the smaller test surface but proved non-deterministic under Phase
+    /// 3.A.1's 83-test load (the third concurrent test class's probe
+    /// would intermittently timeout while two prior containers were still
+    /// reporting cleanup state). 10s is the comfortable ceiling — still
+    /// fast-fail when Docker truly isn't running.
+    /// </para>
     /// </summary>
     public static bool IsDockerAvailable()
     {
@@ -93,7 +105,7 @@ public sealed class PostgresFixture : IAsyncLifetime
                 CreateNoWindow = true,
             });
             if (p is null) return false;
-            p.WaitForExit(2000);
+            p.WaitForExit(10000);
             return p.HasExited && p.ExitCode == 0;
         }
         catch
