@@ -1,4 +1,5 @@
 using Microsoft.EntityFrameworkCore;
+using Trellis.Assistant.AgentExecution;
 using Trellis.Assistant.Data;
 using Trellis.Assistant.Endpoints;
 using Trellis.Assistant.Middleware;
@@ -11,6 +12,15 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services
     .AddOptions<ConversationOrchestratorOptions>()
     .Bind(builder.Configuration.GetSection(ConversationOrchestratorOptions.SectionName))
+    .ValidateDataAnnotations();
+
+// Phase 3.A.1: agent executor options. Bound from "Assistant:Agent"
+// (Model, SystemPrompt). Distinct from ConversationOrchestratorOptions
+// (TurnRequestTimeoutSeconds, WarmupModel, AutoMigrate); the agent
+// surface lives next to but separate from the conversation surface.
+builder.Services
+    .AddOptions<AssistantAgentExecutorOptions>()
+    .Bind(builder.Configuration.GetSection(AssistantAgentExecutorOptions.SectionName))
     .ValidateDataAnnotations();
 
 // ---------------- Postgres + EF Core ----------------
@@ -115,6 +125,42 @@ builder.Services.AddScoped<ConversationOrchestrator>();
 builder.Services.AddSingleton<OllamaReadinessState>();
 builder.Services.AddHostedService<OllamaWarmupHostedService>();
 
+// ---------------- Phase 3.A.1: agent execution surface ----------------
+//
+// IAgentRunStore: scoped, lifecycle-bound to the AssistantDbContext.
+// IAgentLlmClient: typed HttpClientFactory client (parallel to
+//   IOllamaClient — text-vs-function-calling have different streaming
+//   semantics; lift to Trellis.Core deferred to first second-consumer
+//   per Phase 3.A architectural ratification).
+// IToolRegistry: singleton — populated once at construction by scanning
+//   all registered IAgentTool services. Validation throws at host
+//   startup on collision / empty descriptor / etc., so misconfigured
+//   tool registrations crash the host before accepting traffic.
+// EchoTool: registered as IAgentTool; the singleton-of-many pattern
+//   lets future tools (Phase 3.B's SearchDocumentsTool, Phase 4's
+//   send_message tools) drop in via a single AddSingleton<IAgentTool, ...>
+//   line without touching the registry's wiring.
+// IAgentBudgetGate: singleton placeholder. Retrofit-to-Core when qwen's
+//   Phase A merges DefaultBudgetGate (1-PR follow-up: replace this
+//   registration with the Core impl + delete AssistantBudgetGate).
+// IAgentExecutor: scoped — depends on the scoped store + transient
+//   typed-client + singleton registry/gate/options.
+builder.Services.AddScoped<IAgentRunStore, PostgresAgentRunStore>();
+builder.Services.AddHttpClient<IAgentLlmClient>()
+    .AddTypedClient<IAgentLlmClient>((http, sp) =>
+    {
+        var config = sp.GetRequiredService<IConfiguration>();
+        return new OllamaAgentLlmClient(
+            http,
+            () => new Uri(config["Ollama:BaseUrl"]
+                ?? throw new InvalidOperationException(
+                    "Ollama:BaseUrl is not configured. Set it in appsettings.user.json (Dev) or /etc/trellis-assistant-qa.env (QA).")));
+    });
+builder.Services.AddSingleton<IAgentTool, EchoTool>();
+builder.Services.AddSingleton<IToolRegistry, ToolRegistry>();
+builder.Services.AddSingleton<IAgentBudgetGate, AssistantBudgetGate>();
+builder.Services.AddScoped<IAgentExecutor, AssistantAgentExecutor>();
+
 var app = builder.Build();
 
 // ---------------- Auto-migrate on startup ----------------
@@ -138,6 +184,29 @@ if (autoMigrate)
         app.Logger.LogCritical(ex, "EF migration on startup failed; refusing to serve traffic against a half-migrated schema.");
         throw;
     }
+}
+
+// ---------------- Phase 3.A.1: tool registry startup validation ----------------
+//
+// Resolve IToolRegistry once at startup to trigger the ToolRegistry
+// constructor's eager validation (name uniqueness, non-empty descriptor
+// fields). On validation failure, the ctor throws → host crashes here
+// → no traffic accepted. The alternative — lazy first-resolution at
+// the executor's first dispatch — would let a misconfigured tool
+// registration lurk until a real user request triggers a host-internal
+// failure that surfaces as a 500.
+//
+// JSON Schema validation of the descriptor's ParameterSchema is
+// deferred to Phase 3.B (with SearchDocumentsTool's non-trivial arg
+// shape).
+try
+{
+    _ = app.Services.GetRequiredService<IToolRegistry>();
+}
+catch (Exception ex)
+{
+    app.Logger.LogCritical(ex, "Tool registry startup validation failed; refusing to serve traffic against a misconfigured tool catalogue.");
+    throw;
 }
 
 // ---------------- Pipeline ----------------
@@ -166,6 +235,12 @@ app.MapGet("/readyz", (OllamaReadinessState state) =>
 
 // Phase 1 surface: conversations.
 app.MapConversationEndpoints();
+
+// Phase 3.A.1 surface: standalone agentic runs. Agent runs are
+// independent of the conversation flow — Phase 3.A.2 wires the
+// executor into POST /api/conversations/{id}/turns; this endpoint
+// remains as the standalone surface for Phase 4 channel adapters.
+app.MapAgentRunEndpoints();
 
 app.Run();
 

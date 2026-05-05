@@ -94,8 +94,8 @@ public sealed class EFMigrationSmokeTests : IClassFixture<PostgresFixture>
         var conv = new ConversationEntity
         {
             Id = Guid.NewGuid(),
-            TenantId = "t1",
-            UserId = "u1",
+            TenantId = TestTenants.TenantRaw,
+            UserId = TestTenants.UserRaw,
             Channel = "api",
             CreatedAt = DateTime.UtcNow,
             UpdatedAt = DateTime.UtcNow,
@@ -134,13 +134,173 @@ public sealed class EFMigrationSmokeTests : IClassFixture<PostgresFixture>
         var id = Guid.NewGuid();
         await db.Database.ExecuteSqlInterpolatedAsync($@"
             INSERT INTO conversations (id, tenant_id, user_id, created_at, updated_at)
-            VALUES ({id}, 't1', 'u1', NOW(), NOW())");
+            VALUES ({id}, {TestTenants.TenantRaw}, {TestTenants.UserRaw}, NOW(), NOW())");
 
         var inserted = await db.Conversations
             .AsNoTracking()
             .SingleAsync(c => c.Id == id);
         inserted.Channel.Should().Be("api",
             "DEFAULT 'api' on the channel column applies to inserts that don't specify channel");
+    }
+
+    [SkippableFact]
+    public async Task Migration_AddsAgentRunsAndAgentStepsTables_WithExpectedColumnShape()
+    {
+        // Phase 3.A.1 migration adds agent_runs + agent_steps. Pin the
+        // column shape via information_schema so a future ModelSnapshot
+        // drift surfaces here loud, not at first agent-run dispatch.
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        await using var db = NewContext();
+        await db.Database.MigrateAsync();
+
+        await using var conn = new NpgsqlConnection(_pg.ConnectionString);
+        await conn.OpenAsync();
+
+        var agentRunsCols = await ReadColumnsAsync(conn, "agent_runs");
+        agentRunsCols.Should().BeEquivalentTo(new[]
+        {
+            new ColumnShape("id", "uuid", IsNullable: false, ColumnDefault: null),
+            new ColumnShape("org_id", "uuid", IsNullable: false, ColumnDefault: null),
+            new ColumnShape("assistant_turn_id", "uuid", IsNullable: true, ColumnDefault: null),
+            new ColumnShape("plan", "text", IsNullable: false, ColumnDefault: null),
+            new ColumnShape("status", "character varying", IsNullable: false, ColumnDefault: null),
+            new ColumnShape("started_at", "timestamp with time zone", IsNullable: false, ColumnDefault: null),
+            new ColumnShape("completed_at", "timestamp with time zone", IsNullable: true, ColumnDefault: null),
+            new ColumnShape("archived_at", "timestamp with time zone", IsNullable: true, ColumnDefault: null),
+            new ColumnShape("tokens_used", "bigint", IsNullable: false, ColumnDefault: "0"),
+            new ColumnShape("error_message", "text", IsNullable: true, ColumnDefault: null),
+        }, opts => opts.WithoutStrictOrdering(),
+        "agent_runs table must carry exactly these columns + types + nullability + defaults");
+
+        var agentStepsCols = await ReadColumnsAsync(conn, "agent_steps");
+        agentStepsCols.Should().BeEquivalentTo(new[]
+        {
+            new ColumnShape("id", "uuid", IsNullable: false, ColumnDefault: null),
+            new ColumnShape("agent_run_id", "uuid", IsNullable: false, ColumnDefault: null),
+            new ColumnShape("step_index", "integer", IsNullable: false, ColumnDefault: null),
+            new ColumnShape("tool_name", "character varying", IsNullable: false, ColumnDefault: null),
+            new ColumnShape("tool_input_json", "text", IsNullable: false, ColumnDefault: null),
+            new ColumnShape("tool_output_json", "text", IsNullable: true, ColumnDefault: null),
+            new ColumnShape("status", "character varying", IsNullable: false, ColumnDefault: null),
+            new ColumnShape("started_at", "timestamp with time zone", IsNullable: false, ColumnDefault: null),
+            new ColumnShape("completed_at", "timestamp with time zone", IsNullable: true, ColumnDefault: null),
+            new ColumnShape("error_message", "text", IsNullable: true, ColumnDefault: null),
+            new ColumnShape("duration_ms", "bigint", IsNullable: false, ColumnDefault: "0"),
+        }, opts => opts.WithoutStrictOrdering());
+
+        // Indexes from the Phase 3.A migration:
+        // - ix_agent_runs_org_id_started_at (composite per hub's ratification)
+        // - ux_agent_steps_run_step (unique)
+        var indexes = await ReadIndexesAsync(conn);
+        indexes.Should().Contain("ix_agent_runs_org_id_started_at",
+            "composite (org_id, started_at) per Phase 3.A index ratification — dominant query pattern");
+        indexes.Should().Contain("ux_agent_steps_run_step");
+
+        var uniqueIndexes = await ReadUniqueIndexesAsync(conn);
+        uniqueIndexes.Should().Contain("ux_agent_steps_run_step",
+            "(agent_run_id, step_index) unique pin guards against the executor double-dispatching at the same index");
+    }
+
+    [SkippableFact]
+    public async Task Migration_AgentSteps_FkCascade_DeletesStepsWithRun()
+    {
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        await using var db = NewContext();
+        await db.Database.MigrateAsync();
+
+        var run = new AgentRunEntity
+        {
+            Id = Guid.NewGuid(),
+            OrgId = Guid.Parse(TestTenants.TenantA),
+            AssistantTurnId = null,
+            Plan = "test",
+            Status = "running",
+            StartedAt = DateTime.UtcNow,
+            TokensUsed = 0,
+        };
+        db.AgentRuns.Add(run);
+        db.AgentSteps.Add(new AgentStepEntity
+        {
+            Id = Guid.NewGuid(),
+            AgentRunId = run.Id,
+            StepIndex = 0,
+            ToolName = "echo",
+            ToolInputJson = "{}",
+            Status = "succeeded",
+            StartedAt = DateTime.UtcNow,
+            CompletedAt = DateTime.UtcNow,
+            DurationMs = 5,
+        });
+        await db.SaveChangesAsync();
+
+        db.AgentRuns.Remove(run);
+        await db.SaveChangesAsync();
+
+        var orphanCount = await db.AgentSteps.CountAsync(s => s.AgentRunId == run.Id);
+        orphanCount.Should().Be(0,
+            "FK with ON DELETE CASCADE drops agent_steps when their parent agent_run is deleted");
+    }
+
+    [SkippableFact]
+    public async Task Migration_AgentRuns_FkSetNull_PreservesRunWhenAssistantTurnDeleted()
+    {
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        await using var db = NewContext();
+        await db.Database.MigrateAsync();
+
+        // Build a conversation + turn first; agent_run.assistant_turn_id
+        // points at it.
+        var conv = new ConversationEntity
+        {
+            Id = Guid.NewGuid(),
+            TenantId = TestTenants.TenantRaw,
+            UserId = TestTenants.UserRaw,
+            Channel = "api",
+            Model = "mistral-small:24b",
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow,
+        };
+        db.Conversations.Add(conv);
+        var turn = new TurnEntity
+        {
+            Id = Guid.NewGuid(),
+            ConversationId = conv.Id,
+            Position = 0,
+            Role = "assistant",
+            Content = "agent reply",
+            CreatedAt = DateTime.UtcNow,
+        };
+        db.Turns.Add(turn);
+        await db.SaveChangesAsync();
+
+        var run = new AgentRunEntity
+        {
+            Id = Guid.NewGuid(),
+            OrgId = Guid.Parse(TestTenants.TenantA),
+            AssistantTurnId = turn.Id,
+            Plan = "linked-to-turn",
+            Status = "succeeded",
+            StartedAt = DateTime.UtcNow,
+            CompletedAt = DateTime.UtcNow,
+            TokensUsed = 0,
+        };
+        db.AgentRuns.Add(run);
+        await db.SaveChangesAsync();
+
+        // Delete the parent conversation → cascades to the turn (existing
+        // FK) → SET NULL on agent_runs.assistant_turn_id (Phase 3.A FK).
+        db.Conversations.Remove(conv);
+        await db.SaveChangesAsync();
+
+        // Re-read the run; turn id is now NULL but the run survives.
+        var reloaded = await db.AgentRuns.AsNoTracking().SingleAsync(r => r.Id == run.Id);
+        reloaded.AssistantTurnId.Should().BeNull(
+            "FK with ON DELETE SET NULL clears the reference when the linked turn is removed");
+        reloaded.Plan.Should().Be("linked-to-turn",
+            "the agent run's audit history must outlive its linked conversation turn");
     }
 
     [SkippableFact]
@@ -160,7 +320,7 @@ public sealed class EFMigrationSmokeTests : IClassFixture<PostgresFixture>
         var id = Guid.NewGuid();
         await db.Database.ExecuteSqlInterpolatedAsync($@"
             INSERT INTO conversations (id, tenant_id, user_id, created_at, updated_at)
-            VALUES ({id}, 't1', 'u1', NOW(), NOW())");
+            VALUES ({id}, {TestTenants.TenantRaw}, {TestTenants.UserRaw}, NOW(), NOW())");
 
         var inserted = await db.Conversations
             .AsNoTracking()

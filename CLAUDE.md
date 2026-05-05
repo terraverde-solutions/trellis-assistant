@@ -9,6 +9,7 @@ Read first:
 - [`MarkdownFiles/59-trellis-assistant.md`](https://github.com/terraverde-solutions/trellis-docs/blob/main/MarkdownFiles/59-trellis-assistant.md) — Assistant design (the source of truth)
 - [`MarkdownFiles/56-project-structure.md`](https://github.com/terraverde-solutions/trellis-docs/blob/main/MarkdownFiles/56-project-structure.md) — repo layout + sibling-repo project-reference convention
 - [`docs/phase-2-design.md`](docs/phase-2-design.md) — Phase 2 design rationale (Q1–Q5 ratifications, worker concerns, scope deltas from Phase 1)
+- [`docs/phase-3a-design.md`](docs/phase-3a-design.md) — Phase 3.A.1 design rationale (Q1–Q11 + 7 worker concerns, OrgId↔TenantId bridge, X1 stub-vs-real test split, Phase 3.A.2 forward plan)
 
 ## What this component is
 
@@ -22,7 +23,7 @@ phase + guard-rails for what NOT to do yet.
 
 ## Status
 
-**Phase 2 — real Ollama wiring landed.** What exists:
+**Phase 3.A.1 — agentic execution loop landed.** What exists:
 
 - ASP.NET Core net10.0 minimal-API project (`Microsoft.NET.Sdk.Web`)
 - Three conversation endpoints under `/api/conversations`:
@@ -36,16 +37,26 @@ phase + guard-rails for what NOT to do yet.
 - Postgres-backed `IAssistantConversationStore` impl with per-conversation advisory lock around position assignment + INSERT pair
 - Real `Trellis.Core.Services.OllamaClient` wired via `IHttpClientFactory` (Phase 1's stub still in the binary for tests)
 - Per-conversation model selection: `conversations.model varchar(64) NOT NULL DEFAULT 'mistral-small:24b'`; pinned at create time, immutable for Phase 2
-- 31-test suite (3 + 19 + 5 + 1 SkippableFact + 2 + 1 in `RealOllamaSmokeTests`) — see test breakdown in README
+- **Phase 3.A.1 surface (this layer):**
+  - `POST /api/agent-runs` — standalone agentic surface; caller supplies `userPrompt` + (optionally) `toolNames` filter + `maxSteps` override; returns terminal `AgentRun` with full step history
+  - `AssistantAgentExecutor : IAgentExecutor` — LLM-driven plan-then-execute loop. Implements Trellis.Core's interface from Phase 0 PR #10
+  - `IAgentLlmClient` + `OllamaAgentLlmClient` — function-calling LLM surface, parallel to `IOllamaClient` (text-vs-function-calling have different streaming semantics; lift to Trellis.Core deferred to first second-consumer)
+  - `IToolRegistry` + `ToolRegistry` + `EchoTool` — tool catalogue with startup validation (name uniqueness, non-empty descriptor fields). JSON Schema validation deferred to Phase 3.B
+  - `AssistantBudgetGate` — placeholder pure-logic budget gate (max-steps default 25, max-run-duration 600s, loop detection 3+ identical consecutive). Retrofit-to-Core when qwen's Phase A merges `DefaultBudgetGate`
+  - `agent_runs` + `agent_steps` tables (EF migration `20260505103509_AddAgentRunsAndAgentStepsTables`); composite `ix_agent_runs_org_id_started_at` index per the dominant query pattern; `tokens_used` is `bigint` for long-run safety
+  - 502 mapping for upstream Ollama errors on tool-using paths (HttpRequestException → 502 Bad Gateway with detail)
+- 80-test suite (3 + 17 + 7 + 7 + 11 + 11 + 6 + 12 + 2 + 4 SkippableFact gated on `OLLAMA_BASE_URL` — see `docs/phase-3a-design.md` for the X1 split)
 
-What does NOT exist (Phase 3+):
+What does NOT exist (Phase 3.A.2+):
 
-- First tool: `search_documents` → Trainer integration (Phase 3)
-- Streaming responses to the HTTP caller via SSE (Phase 3+)
+- Conversation turn schema widening for tool turns (Phase 3.A.2 — sibling Trellis.Core PR for `IAssistantConversationStore` + `Role=3 (Tool)` + nullable `tool_call_id` / `tool_name` columns)
+- ConversationOrchestrator integration with the executor (Phase 3.A.2 — `POST /api/conversations/{id}/turns` optionally takes the agent path)
+- Real `search_documents` tool → Trainer integration (Phase 3.B — needs Trainer-side surface scoping)
+- DefaultBudgetGate retrofit (1-PR follow-up after qwen's Phase A merges `Trellis.Core.Services.DefaultBudgetGate`)
+- Tool-result streaming to channel adapters (Phase 4)
+- Tool-allowlist per-model (Phase 3.C)
 - Channel adapters (Slack / WhatsApp / Telegram webhook handlers — Phase 4)
-- Tool dispatch (MCP client, `send_message`, etc.)
 - Voice (TTS / STT, push-to-talk, wake word)
-- Cross-surface memory + `IConversationStore` integration
 - Identity / sandboxing / DM allowlist (Phase 5)
 - Production deploy (Hetzner)
 
@@ -198,16 +209,21 @@ Steady-state QA redeploys: `trellis-deploy/scripts/qa/Deploy-Assistant-Standalon
 - Auth: shared `trellisqa` HTTP Basic credential at the Hetzner edge (same as web-qa + trainer-qa); GB10-side nginx is auth-free
 - Bootstrap walkthrough: `trellis-deploy/scripts/qa/bootstrap-assistant.md`
 
-## Don't (Phase 2)
+## Don't (Phase 3.A.1)
 
-- **Don't add an SSE / streaming response surface.** Phase 1's POST /turns contract (buffer + return one JSON object) is preserved through Phase 2. SSE lands in Phase 3+ when there's a concrete streaming consumer (Slack/WhatsApp/Telegram inherently buffer; web/desktop/chat connect to the gateway, not the Assistant).
+- **Don't add an SSE / streaming response surface.** Phase 1's POST /turns contract (buffer + return one JSON object) is preserved through Phase 3.A. SSE lands in Phase 3.B+ when there's a concrete streaming consumer (Slack/WhatsApp/Telegram inherently buffer; web/desktop/chat connect to the gateway, not the Assistant).
 - **Don't add channel adapters.** Phase 4 owns that surface.
-- **Don't add tool dispatch / MCP plumbing.** Phase 3 owns the first tool (`search_documents` → Trainer); broader MCP plumbing follows.
+- **Don't lift `IAgentLlmClient` to Trellis.Core.** Phase 3.A.1 ships it parallel to `IOllamaClient` because text-vs-function-calling have different streaming semantics + only one consumer needs it. Lift happens when a SECOND consumer surfaces (qwen's Phase B if/when they need tool-aware LLM).
+- **Don't add JSON Schema validation to the tool registry.** Phase 3.A.1's trimmed validation (name uniqueness + non-empty descriptor fields) is intentional. JSON Schema validation lands in Phase 3.B with `SearchDocumentsTool`'s non-trivial multi-property arg shape.
+- **Don't widen the executor to support multiple tool calls per step.** Core's v0 contract is "1 tool call per step" (61-doc § 5). Multiple tool_calls emitted by the model split into sequential AgentSteps; the per-step `MaxToolCalls=1` cap is pinned by `BudgetGate_PerStepToolCallCap`.
+- **Don't replace `AssistantBudgetGate` proactively.** It's a placeholder by design; the retrofit-to-`DefaultBudgetGate` is a 1-PR follow-up after qwen's Phase A merges Core's impl. Premature replacement would mean diverging from whatever signature qwen lands.
+- **Don't add tool dispatch / MCP plumbing beyond Phase 3.A.1's tool registry surface.** Phase 3.B owns the first real tool (`search_documents` → Trainer); broader MCP plumbing follows.
 - **Don't add voice surface.** TTS / STT / push-to-talk / wake-word — all post-tool-dispatch.
 - **Don't add `appsettings.user.json` to the repo.** Gitignored; canonical csproj `<None Remove>` + `<Content Remove>` rules ensure it never rides into a publish bundle.
 - **Don't pin a top-level `"Urls"` key in `appsettings.json`.** Defense-in-depth against the trainer-qa bootstrap-day port-binding bug. Pinned by `AppsettingsConventionsTests`.
-- **Don't add a model allowlist** at conversation create time. Phase 2 ships free-text varchar(64); invalid tags surface as a 502 from Ollama on first turn. Phase 3+ tool registry adds an allowlist when `search_documents` needs model-aware embedding selection.
-- **Don't add a re-pin operation for `Model`.** Per-conversation model is immutable in Phase 2. Phase 3+ may add re-pin if model-switching mid-conversation becomes a real need.
+- **Don't add a model allowlist** at conversation create time OR at agent-run create time. Phase 2/3.A ship free-text varchar(64); invalid tags surface as a 502 from Ollama on first call. Phase 3.C tool registry adds an allowlist when `search_documents` needs model-aware embedding selection.
+- **Don't add a re-pin operation for `Model`** on conversations OR for agent runs. Per-conversation model is immutable in Phase 2. Per-agent-run model selection comes from `Assistant:Agent:Model` config (default `qwen2.5:72b` per Phase 3.A C3); Phase 3.A.2 may surface an explicit per-run override path if hub asks for it.
+- **Don't use non-uuid tenantIds in tests.** Phase 3.A C1 contract: production tenantIds are uuid-shaped (gateway issues uuid-shaped tenants per JWT `tenant_id` claim). The agent-execution surface relies on `Guid.Parse(tenantId)` for OrgId derivation. All tests use `TestTenants.TenantA` / `TenantB` / etc. constants — Guid-shaped strings of the form `00000000-0000-0000-0000-00000000000a`. Non-uuid tenant slipping through `TenantHeadersMiddleware` surfaces as 400 Bad Request at `POST /api/agent-runs` rather than silently mis-mapping.
 - **Don't capture `Ollama:BaseUrl` or the connection string eagerly at builder time.** The late-resolution rule in `Program.cs` is load-bearing for `WebApplicationFactory<Program>` test overlays + future runtime config changes. Phase 5's JWT swap follows the same pattern.
 - **Don't merge the stub-driven endpoint tests with the real-Ollama smoke.** X1 split: stub-driven verifies orchestrator/store/lock invariants; OLLAMA_BASE_URL-gated verifies the real-LLM path. 5-parallel against real Ollama on a single GPU would spend ~5 minutes serializing — keep the test surfaces split.
 - **Don't fork wire types or auth handlers from `Trellis.Core`.** Use `IAssistantConversationStore` + `IOllamaClient` + `ChatMessage` + `ChatRole` directly.

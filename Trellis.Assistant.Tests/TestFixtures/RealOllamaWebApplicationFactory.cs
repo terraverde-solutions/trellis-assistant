@@ -34,18 +34,20 @@ public sealed class RealOllamaWebApplicationFactory : WebApplicationFactory<Prog
 {
     private readonly string _connectionString;
     private readonly string _ollamaBaseUrl;
+    private readonly string? _agentModel;
 
-    public RealOllamaWebApplicationFactory(string connectionString, string ollamaBaseUrl)
+    public RealOllamaWebApplicationFactory(string connectionString, string ollamaBaseUrl, string? agentModel = null)
     {
         _connectionString = connectionString;
         _ollamaBaseUrl = ollamaBaseUrl;
+        _agentModel = agentModel;
     }
 
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
         builder.ConfigureAppConfiguration((_, config) =>
         {
-            config.AddInMemoryCollection(new Dictionary<string, string?>
+            var settings = new Dictionary<string, string?>
             {
                 ["ConnectionStrings:Postgres"] = _connectionString,
                 ["Assistant:AutoMigrate"] = "true",
@@ -56,10 +58,20 @@ public sealed class RealOllamaWebApplicationFactory : WebApplicationFactory<Prog
                 // genuinely-stuck Ollama.
                 ["Assistant:TurnRequestTimeoutSeconds"] = "180",
                 ["Ollama:BaseUrl"] = _ollamaBaseUrl,
-            });
+            };
+            // Phase 3.A.1: override the agent-execution model when the
+            // test caller supplies one (typically from the OLLAMA_TEST_MODEL
+            // env var in RealOllamaSmokeTests). Default falls through
+            // to the appsettings.json value (qwen2.5:72b — the
+            // tool-supporting GB10 default per Phase 3.A C3).
+            if (!string.IsNullOrWhiteSpace(_agentModel))
+            {
+                settings["Assistant:Agent:Model"] = _agentModel;
+            }
+            config.AddInMemoryCollection(settings);
         });
 
         // No ConfigureTestServices override — production OllamaClient
-        // stays. That's the point of this factory.
+        // + OllamaAgentLlmClient stay. That's the point of this factory.
     }
 }

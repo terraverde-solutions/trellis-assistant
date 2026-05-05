@@ -4,6 +4,7 @@ using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Trellis.Assistant.AgentExecution;
 using Trellis.Assistant.Services;
 using Trellis.Core.Services;
 
@@ -36,6 +37,16 @@ namespace Trellis.Assistant.Tests.TestFixtures;
 public sealed class AssistantWebApplicationFactory : WebApplicationFactory<Program>
 {
     private readonly string _connectionString;
+    private readonly StubAgentLlmClient _agentLlmStub = new();
+
+    /// <summary>
+    /// Test-controlled stub for the agent-execution LLM. Tests use the
+    /// public <see cref="StubAgentLlmClient.EnqueueAssistantText"/> /
+    /// <see cref="StubAgentLlmClient.EnqueueToolCall"/> helpers to script
+    /// the LLM's response sequence per test, then assert on
+    /// <see cref="StubAgentLlmClient.Calls"/>.
+    /// </summary>
+    public StubAgentLlmClient AgentLlmStub => _agentLlmStub;
 
     public AssistantWebApplicationFactory(string connectionString)
     {
@@ -73,17 +84,21 @@ public sealed class AssistantWebApplicationFactory : WebApplicationFactory<Progr
             });
         });
 
-        // Replace the production OllamaClient registration with the
-        // stub. ConfigureTestServices runs AFTER the production
-        // ConfigureServices, so the last registration wins.
+        // Replace the production OllamaClient + OllamaAgentLlmClient
+        // registrations with the stubs. ConfigureTestServices runs AFTER
+        // the production ConfigureServices, so the last registration
+        // wins. The X1 split: stub-driven tests verify orchestrator/
+        // store/lock/executor/registry/gate invariants; OLLAMA_BASE_URL-
+        // gated tests (RealOllamaSmokeTests) verify the real-LLM paths.
         builder.ConfigureTestServices(services =>
         {
-            // Drop the existing IOllamaClient + AddHttpClient registration
-            // so the stub is the only resolution path. Without the
-            // RemoveAll, the typed-client registration from Program.cs
-            // can shadow the stub depending on registration order.
             services.RemoveAll<IOllamaClient>();
             services.AddSingleton<IOllamaClient, StubLlmClient>();
+
+            // Phase 3.A.1: parallel agent-execution LLM client. Same
+            // RemoveAll-then-AddSingleton pattern as IOllamaClient.
+            services.RemoveAll<IAgentLlmClient>();
+            services.AddSingleton<IAgentLlmClient>(_agentLlmStub);
         });
     }
 }
