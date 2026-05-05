@@ -11,7 +11,13 @@ namespace Trellis.Assistant.AgentExecution;
 /// Phase 3.A.1 LLM-driven plan-then-execute loop. Implements
 /// <see cref="IAgentExecutor"/> from Trellis.Core (Phase 0 PR #10).
 /// Phase 3.A.2 adds <see cref="RunForConversationAsync"/> for the
-/// conversation-integrated agent path.
+/// conversation-integrated agent path. The DefaultBudgetGate retrofit
+/// (post-Phase-3.A.2) replaced the placeholder <c>AssistantBudgetGate</c>
+/// with <c>Trellis.Core.Services.DefaultBudgetGate</c> from qwen's
+/// Phase A merge; the executor now injects Assistant's documented
+/// <see cref="AssistantDefaultMaxSteps"/> default when callers don't
+/// supply <see cref="AgentBudgetOverrides"/>, since DefaultBudgetGate's
+/// own default is 1000 (Workflow's value, not Assistant's 25).
 ///
 /// <para>
 /// Two entry points:
@@ -76,6 +82,18 @@ public sealed class AssistantAgentExecutor : IAgentExecutor
     public const string MalformedPlanFallbackText =
         "I couldn't reason through that — please rephrase.";
 
+    /// <summary>
+    /// Assistant's documented MaxSteps default (Phase 0 PR #10's
+    /// docstring + Phase 3.A C4 ratification). Distinct from
+    /// <see cref="DefaultBudgetGate.DefaultMaxSteps"/> (1000 — Workflow's
+    /// for-each default). The executor injects this value when callers
+    /// pass <c>BudgetOverrides=null</c>, satisfying Core's "callers
+    /// override via AgentBudgetOverrides.MaxSteps" contract — the
+    /// Assistant executor IS that consumer for all Assistant paths.
+    /// Pinned by <c>Executor_BudgetOverridesNull_InjectsAssistantDefault25</c>.
+    /// </summary>
+    public const int AssistantDefaultMaxSteps = 25;
+
     private readonly IAgentRunStore _store;
     private readonly IAgentLlmClient _llm;
     private readonly IToolRegistry _tools;
@@ -110,7 +128,8 @@ public sealed class AssistantAgentExecutor : IAgentExecutor
         ArgumentNullException.ThrowIfNull(request);
 
         var startedAt = DateTime.UtcNow;
-        var maxSteps = request.BudgetOverrides?.MaxSteps ?? AssistantBudgetGate.DefaultMaxSteps;
+        var effectiveOverrides = WithAssistantDefaults(request.BudgetOverrides);
+        var maxSteps = effectiveOverrides.MaxSteps ?? AssistantDefaultMaxSteps;
 
         // Filter the request's tool catalogue to those we actually have
         // registered. The planner sees only resolvable tools; an emitted
@@ -132,10 +151,34 @@ public sealed class AssistantAgentExecutor : IAgentExecutor
 
         var loopResult = await ExecuteLoopAsync(
             runId, request.OrgId, startedAt, messages, resolvableTools,
-            request.BudgetOverrides, cancellationToken).ConfigureAwait(false);
+            effectiveOverrides, cancellationToken).ConfigureAwait(false);
 
         return await PersistTerminalStateAsync(
             request.OrgId, runId, loopResult).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Inject Assistant's documented defaults onto a caller-supplied
+    /// (or null) <see cref="AgentBudgetOverrides"/>. Single source of
+    /// truth for the per-surface defaults the Core docstring on
+    /// <see cref="AgentBudgetOverrides"/> says callers should provide
+    /// (Assistant 25 / Workflow 1000). The Workflow surface injects
+    /// 1000 elsewhere (their own executor); this method covers all
+    /// Assistant entry points.
+    ///
+    /// <para>
+    /// When the caller supplies a non-null overrides record, only fill
+    /// in MaxSteps if it's null on the caller's record. Caller's
+    /// MaxRunDuration override (if any) propagates verbatim.
+    /// </para>
+    /// </summary>
+    private static AgentBudgetOverrides WithAssistantDefaults(AgentBudgetOverrides? caller)
+    {
+        return new AgentBudgetOverrides
+        {
+            MaxSteps = caller?.MaxSteps ?? AssistantDefaultMaxSteps,
+            MaxRunDuration = caller?.MaxRunDuration,  // null → DefaultBudgetGate uses its 10-min default
+        };
     }
 
     // ---------------- Conversation-integrated surface (Phase 3.A.2) ----------------
@@ -203,7 +246,8 @@ public sealed class AssistantAgentExecutor : IAgentExecutor
         ArgumentNullException.ThrowIfNull(availableTools);
 
         var startedAt = DateTime.UtcNow;
-        var maxSteps = budgetOverrides?.MaxSteps ?? AssistantBudgetGate.DefaultMaxSteps;
+        var effectiveOverrides = WithAssistantDefaults(budgetOverrides);
+        var maxSteps = effectiveOverrides.MaxSteps ?? AssistantDefaultMaxSteps;
 
         var resolvableTools = availableTools
             .Where(d => _tools.GetTool(d.Name) is not null)
@@ -215,7 +259,7 @@ public sealed class AssistantAgentExecutor : IAgentExecutor
 
         var loopResult = await ExecuteLoopAsync(
             runId, orgId, startedAt, messages, resolvableTools,
-            budgetOverrides, cancellationToken).ConfigureAwait(false);
+            effectiveOverrides, cancellationToken).ConfigureAwait(false);
 
         var completedRun = await PersistTerminalStateAsync(
             orgId, runId, loopResult).ConfigureAwait(false);

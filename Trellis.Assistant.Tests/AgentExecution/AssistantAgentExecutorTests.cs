@@ -511,6 +511,114 @@ public sealed class AssistantAgentExecutorTests : IClassFixture<PostgresFixture>
             "null assistantTurnId persists as null — Phase 3.A.2 orchestrator's current pattern");
     }
 
+    // ---------------- Post-Phase-3.A.2 retrofit: Assistant defaults injection ----------------
+
+    [SkippableFact]
+    public async Task Executor_BudgetOverridesNull_InjectsAssistantDefault25()
+    {
+        // Phase 3.A retrofit D1 mutation pin: when the caller passes
+        // BudgetOverrides=null, the executor must inject Assistant's
+        // documented MaxSteps=25 default before delegating to the gate.
+        // DefaultBudgetGate's own default is 1000 (Workflow's value);
+        // without injection, an Assistant agent run would silently allow
+        // 1000 steps before halting — divergence from Phase 0 PR #10's
+        // documented "Assistant 25" default.
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        var capturedState = new CaptureBudgetGate();
+        var llm = new StubAgentLlmClient().EnqueueAssistantText("done");
+        var executor = NewExecutor(llm, customGate: capturedState);
+
+        await executor.RunAsync(AgentRunRequest.Create(
+            orgId: TestOrgId,
+            userPrompt: "test",
+            availableTools: new List<AgentToolDescriptor> { new EchoTool().Descriptor },
+            budgetOverrides: null));  // <-- caller passes null
+
+        capturedState.FirstCallState.Should().NotBeNull(
+            "the executor must call the gate at least once before deciding to terminate");
+        capturedState.FirstCallState!.Overrides.Should().NotBeNull(
+            "executor injected AgentBudgetOverrides for the gate even though caller passed null");
+        capturedState.FirstCallState!.Overrides!.MaxSteps.Should().Be(
+            AssistantAgentExecutor.AssistantDefaultMaxSteps,
+            "Assistant default MaxSteps=25 must be injected when caller passes null — Phase 0 PR #10 contract");
+    }
+
+    [SkippableFact]
+    public async Task Executor_BudgetOverridesNotNull_RespectsCallerValue()
+    {
+        // Sister mutation pin: when the caller DID supply a MaxSteps
+        // override, the executor must preserve it — NOT silently
+        // overwrite with the Assistant default. A regression that
+        // always-injects-25 would cap a long-running batch run at 25
+        // even when the caller asked for more (or less).
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        var capturedState = new CaptureBudgetGate();
+        var llm = new StubAgentLlmClient().EnqueueAssistantText("done");
+        var executor = NewExecutor(llm, customGate: capturedState);
+
+        await executor.RunAsync(AgentRunRequest.Create(
+            orgId: TestOrgId,
+            userPrompt: "test",
+            availableTools: new List<AgentToolDescriptor> { new EchoTool().Descriptor },
+            budgetOverrides: new AgentBudgetOverrides { MaxSteps = 42 }));
+
+        capturedState.FirstCallState!.Overrides!.MaxSteps.Should().Be(42,
+            "caller-supplied MaxSteps=42 must propagate verbatim to the gate; injecting the Assistant default would silently override caller intent");
+    }
+
+    [SkippableFact]
+    public async Task RunForConversationAsync_BudgetOverridesNull_InjectsAssistantDefault25()
+    {
+        // Same injection contract for the Phase 3.A.2 entry point —
+        // both Assistant paths share the WithAssistantDefaults helper.
+        // Pinned here separately since RunForConversationAsync's
+        // budgetOverrides parameter is its own argument (not via
+        // AgentRunRequest).
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        var capturedState = new CaptureBudgetGate();
+        var llm = new StubAgentLlmClient().EnqueueAssistantText("done");
+        var executor = NewExecutor(llm, customGate: capturedState);
+
+        var messages = new List<ChatMessage>
+        {
+            new() { Role = ChatRole.User, Content = "test" },
+        };
+        await executor.RunForConversationAsync(
+            orgId: TestOrgId,
+            assistantTurnId: null,
+            userPrompt: "test",
+            messages: messages,
+            availableTools: Array.Empty<AgentToolDescriptor>(),
+            budgetOverrides: null);
+
+        capturedState.FirstCallState!.Overrides!.MaxSteps.Should().Be(
+            AssistantAgentExecutor.AssistantDefaultMaxSteps,
+            "RunForConversationAsync must inject the same Assistant MaxSteps=25 default as RunAsync — both paths share WithAssistantDefaults");
+    }
+
+    /// <summary>
+    /// Test gate that captures the first <see cref="AgentRunState"/>
+    /// passed in + then halts the loop with StepCapReached so the
+    /// executor exits quickly. Used by the injection-contract pins.
+    /// </summary>
+    private sealed class CaptureBudgetGate : IAgentBudgetGate
+    {
+        public AgentRunState? FirstCallState { get; private set; }
+
+        public Task<BudgetVerdict> ShouldContinueAsync(AgentRunState state, CancellationToken cancellationToken = default)
+        {
+            FirstCallState ??= state;
+            return Task.FromResult(new BudgetVerdict
+            {
+                Decision = BudgetDecision.StepCapReached,
+                HumanReadableReason = "stub-halt",
+            });
+        }
+    }
+
     // ---------------- Phase 3.A.1 (existing — preserved post-refactor) ----------------
 
     [SkippableFact]
@@ -538,7 +646,8 @@ public sealed class AssistantAgentExecutorTests : IClassFixture<PostgresFixture>
 
     private AssistantAgentExecutor NewExecutor(
         IAgentLlmClient llm,
-        IEnumerable<IAgentTool>? extraTools = null)
+        IEnumerable<IAgentTool>? extraTools = null,
+        IAgentBudgetGate? customGate = null)
     {
         var allTools = new List<IAgentTool> { new EchoTool() };
         if (extraTools is not null)
@@ -546,7 +655,11 @@ public sealed class AssistantAgentExecutorTests : IClassFixture<PostgresFixture>
             allTools.AddRange(extraTools);
         }
         var registry = new ToolRegistry(allTools);
-        var gate = new AssistantBudgetGate();
+        // Post-Phase-3.A.2 retrofit: default to Trellis.Core's
+        // DefaultBudgetGate. Tests that need to capture the executor's
+        // call-time AgentRunState pass a custom gate (used by the
+        // injection-contract pins).
+        var gate = customGate ?? new DefaultBudgetGate();
         var store = new PostgresAgentRunStore(_db!);
         var options = Options.Create(new AssistantAgentExecutorOptions
         {
