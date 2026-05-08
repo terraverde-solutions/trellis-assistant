@@ -53,6 +53,7 @@ phase + guard-rails for what NOT to do yet.
   - EF migration `AddToolCallIdAndToolNameToTurns` — strict-additive nullable varchar(64). Existing user/assistant rows persist as NULL.
   - `AssistantAgentExecutor.RunForConversationAsync` — new public method on the concrete class (NOT on `IAgentExecutor`) that orchestrators use to drive the loop with pre-built messages + return `ConversationAgentResult` carrying final text + per-dispatch summaries.
   - `IAssistantConversationStore.AppendTurnsAsync` consumes the widened `NewAssistantTurn` shape from Trellis.Core PR #13 (Tool=3 enum + nullable `ToolCallId`/`ToolName` fields).
+  - **Tool turns flow through to the LLM as canonical `ChatRole.Tool`** (post-3.A.2-bridge per Trellis.Core PR #15). The `ConversationOrchestrator.ToCoreRole` mapping flipped from `AssistantTurnRole.Tool → ChatRole.System` (workaround) to `→ ChatRole.Tool` (canonical) — model's tool-trained head sees the proper role label when reconstructing history. Resolves Phase 3.A.2 architectural divergence #4. Pinned by `ToCoreRole_ToolTurn_MapsToChatRoleTool`.
 - Phase 3.A.1's standalone `POST /api/agent-runs` remains — both endpoints coexist (standalone is one-shot agentic without conversation context; conversation-integrated threads tool history).
 - 105-test suite — see test breakdown in `docs/phase-3a-design.md` § Phase 3.A.2.
 

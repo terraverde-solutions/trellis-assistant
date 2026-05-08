@@ -358,15 +358,15 @@ public sealed class ConversationOrchestrator
         AssistantTurnRole.User => ChatRole.User,
         AssistantTurnRole.Assistant => ChatRole.Assistant,
         AssistantTurnRole.System => ChatRole.System,
-        // Phase 3.A.2: Tool turns carry tool result content. Map to
-        // ChatRole.System for the LLM context build — Trellis.Core's
-        // ChatRole enum (Phase 1+2 wire shape for IOllamaClient.StreamChatAsync)
-        // doesn't have a Tool value, and IAgentLlmClient's tools-array
-        // protocol doesn't strictly require role=tool messages on the
-        // wire (Ollama accepts the result as a system-role envelope).
-        // Phase 3.B may widen ChatRole if model behaviour quality
-        // benefits from explicit role=tool messages.
-        AssistantTurnRole.Tool => ChatRole.System,
+        // Phase 3.A.2-bridge: Tool turns map to canonical ChatRole.Tool
+        // (was ChatRole.System pre-bridge; resolves architectural
+        // divergence #4 from the Phase 3.A.2 PR review). Trellis.Core
+        // PR #15 widened ChatRole with Tool=3 + "tool" wire string;
+        // ConversationOrchestrator now emits role=tool on the LLM wire
+        // body so the model's tool-trained head sees the canonical
+        // role label rather than the prior system-role workaround.
+        // Pinned by ToCoreRole_ToolTurn_MapsToChatRoleTool.
+        AssistantTurnRole.Tool => ChatRole.Tool,
         _ => throw new ArgumentOutOfRangeException(nameof(role), role, "Unknown role"),
     };
 }

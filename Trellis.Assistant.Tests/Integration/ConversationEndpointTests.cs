@@ -605,6 +605,67 @@ public sealed class ConversationEndpointTests : IClassFixture<PostgresFixture>, 
     }
 
     [SkippableFact]
+    public async Task ToCoreRole_ToolTurn_MapsToChatRoleTool()
+    {
+        // Phase 3.A.2-bridge mutation pin: prior persisted Role=Tool
+        // turns map to ChatRole.Tool (was ChatRole.System pre-bridge per
+        // architectural divergence #4). Resolves the divergence; the
+        // model's tool-trained head sees the canonical role=tool label
+        // when reconstructing history for the next-turn LLM call,
+        // rather than the prior system-role workaround.
+        //
+        // Pin shape: a regression that flips back to System would
+        // pass the BudgetVerdict.Decision-level contract (the role flow
+        // is invisible to the gate) but degrade tool-call quality
+        // silently. This test catches it via the wire-roles capture on
+        // StubAgentLlmClient.
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        // Round 1: agent path → persists [user, tool, assistant].
+        _factory!.AgentLlmStub
+            .EnqueueToolCall("echo", """{"text":"first round"}""")
+            .EnqueueAssistantText("first round done")
+            // Round 2: another agent-path turn so the LLM sees prior
+            // history including the Round-1 tool turn.
+            .EnqueueAssistantText("second round done");
+
+        using var client = NewClient();
+        var convResp = await client.PostAsJsonAsync("/api/conversations",
+            new ConversationEndpoints.CreateConversationRequest(Channel: "api"));
+        var conv = await convResp.Content.ReadFromJsonAsync<ConversationEndpoints.CreateConversationResponse>();
+
+        // Round 1 — populates the conversation with user + tool + assistant turns.
+        await client.PostAsJsonAsync(
+            $"/api/conversations/{conv!.Id}/turns",
+            new ConversationEndpoints.AppendTurnRequest("first request")
+            {
+                Tools = new[] { "echo" },
+            });
+
+        var firstRoundCallCount = _factory.AgentLlmStub.Calls.Count;
+
+        // Round 2 — orchestrator reads conversation history (now
+        // including the tool turn from round 1) + builds messages list
+        // for the LLM. The mutation pin: the captured MessageRoles must
+        // include ChatRole.Tool (NOT ChatRole.System) for the prior
+        // tool turn.
+        await client.PostAsJsonAsync(
+            $"/api/conversations/{conv.Id}/turns",
+            new ConversationEndpoints.AppendTurnRequest("second request")
+            {
+                Tools = new[] { "echo" },
+            });
+
+        var secondRoundFirstCall = _factory.AgentLlmStub.Calls[firstRoundCallCount];
+        secondRoundFirstCall.MessageRoles.Should().Contain(
+            Trellis.Core.Models.ChatRole.Tool,
+            "round 2's history-to-messages translation must surface the prior persisted Tool turn as ChatRole.Tool — Phase 3.A.2 bridge resolves architectural divergence #4");
+        secondRoundFirstCall.MessageRoles.Should().NotContain(
+            Trellis.Core.Models.ChatRole.System,
+            "round 2's history must NOT carry ChatRole.System for the prior tool turn — that was the pre-bridge workaround we're flipping away from. (System role still appears in messages for genuinely system-role turns; this assertion holds because round 1 had no System turn.)");
+    }
+
+    [SkippableFact]
     public async Task AgentPath_OverridesConversationModel_WithAssistantAgentModel()
     {
         // Phase 3.A.2 architectural divergence #2 lock per hub's

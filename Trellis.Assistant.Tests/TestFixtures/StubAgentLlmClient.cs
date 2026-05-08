@@ -65,10 +65,23 @@ public sealed class StubAgentLlmClient : IAgentLlmClient
             Model: model,
             MessageCount: messages.Count,
             ToolCount: tools.Count,
-            LastMessageContent: messages.Count > 0 ? messages[^1].Content : ""));
+            LastMessageContent: messages.Count > 0 ? messages[^1].Content : "",
+            MessageRoles: messages.Select(m => m.Role).ToList()));
         var response = _scriptedResponses.Count > 0 ? _scriptedResponses.Dequeue() : FallbackResponse;
         return Task.FromResult(response);
     }
 
-    public sealed record RecordedCall(string Model, int MessageCount, int ToolCount, string LastMessageContent);
+    /// <summary>
+    /// One captured invocation. Phase 3.A.2-bridge added
+    /// <see cref="MessageRoles"/> so tests can pin the wire-shape role
+    /// flow (e.g. <c>ToCoreRole_ToolTurn_MapsToChatRoleTool</c> asserts
+    /// prior persisted Role=Tool turns surface as <c>ChatRole.Tool</c>
+    /// in the next-turn LLM context build).
+    /// </summary>
+    public sealed record RecordedCall(
+        string Model,
+        int MessageCount,
+        int ToolCount,
+        string LastMessageContent,
+        IReadOnlyList<ChatRole> MessageRoles);
 }
