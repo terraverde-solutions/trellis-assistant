@@ -7,7 +7,7 @@
 **Sibling work tracked separately:**
 - Phase 3.A.2 — turn schema widening (`Role=3 (Tool)` + nullable `tool_call_id` / `tool_name`) + `IAssistantConversationStore` surface widening (sibling Trellis.Core PR) + executor wired into `POST /api/conversations/{id}/turns`. Out of scope here.
 - Phase 3.B — first real tool (`search_documents` → Trainer integration) + JSON Schema validation in the tool registry. Out of scope.
-- DefaultBudgetGate retrofit — 1-PR follow-up after qwen's Phase A merges `Trellis.Core.Services.DefaultBudgetGate`. Replaces `AssistantBudgetGate` placeholder.
+- DefaultBudgetGate retrofit — **completed** (post-Phase-3.A.2 1-PR follow-up). Trellis.Core's `DefaultBudgetGate` is the canonical impl; the Assistant-side placeholder was deleted; `AssistantAgentExecutor.WithAssistantDefaults` injects the `MaxSteps=25` Assistant default per Phase 0 PR #10's docstring contract.
 
 ## Q1 — `AssistantAgentExecutor` location: **`Trellis.Assistant.AgentExecution`** — ratified
 
@@ -62,9 +62,19 @@ FK choices:
 - `agent_runs.assistant_turn_id → turns.id ON DELETE SET NULL` — agent run audit log outlives a deleted conversation turn.
 - `agent_steps.agent_run_id → agent_runs.id ON DELETE CASCADE` — soft-delete on the parent run cascades cleanup.
 
-## Q8 — Budget gate placeholder: **`AssistantBudgetGate`** with Core defaults — ratified
+## Q8 — Budget gate: **`AssistantBudgetGate` placeholder, retrofitted post-Phase-3.A.2 to `Trellis.Core.Services.DefaultBudgetGate`**
 
-Pure-logic placeholder. Defaults match Core's `AgentBudgetOverrides` docstring:
+Phase 3.A.1 shipped the `AssistantBudgetGate` placeholder. Retrofitted post-Phase-3.A.2 (in a tiny follow-up PR after qwen's Phase A merge): the placeholder was deleted; Trellis.Core's `DefaultBudgetGate` is the canonical impl. Assistant's `MaxSteps=25` default (vs Core's `MaxSteps=1000` Workflow default) is injected by `AssistantAgentExecutor.WithAssistantDefaults` per Core's docstring contract on `AgentBudgetOverrides` ("callers override via AgentBudgetOverrides.MaxSteps"). The Assistant executor IS that consumer for all Assistant paths.
+
+Reason-string substring assertions adapted: Core ships `"max-steps cap"` / `"wall-clock budget"` (lowercase, descriptive) instead of the placeholder's `"MaxSteps"` / `"MaxRunDuration"`. Phase 3.A C5's intent ("distinguishable in the reason string") is preserved.
+
+Pinned by:
+- `Executor_BudgetOverridesNull_InjectsAssistantDefault25` (mutation pin: dropping the injection lets Core's 1000 default fire)
+- `Executor_BudgetOverridesNotNull_RespectsCallerValue` (mutation pin: always-inject-25 would silently override caller intent)
+- `RunForConversationAsync_BudgetOverridesNull_InjectsAssistantDefault25` (Phase 3.A.2 entry point shares the helper)
+- `DefaultBudgetGateAssistantUsageTests` (12 scenarios — same contract Phase 3.A.1 pinned, retargeted at Core's gate)
+
+(Pre-retrofit context — kept for design-trail completeness:) Defaults match Core's `AgentBudgetOverrides` docstring:
 - `MaxSteps = 25` (Assistant default)
 - `MaxRunDuration = 600s = 10 min`
 - Loop detection: 3+ consecutive identical (canonicalized JSON) `(tool_name, args)` dispatches
@@ -107,7 +117,7 @@ Phase 3.A.1 consumes Phase 0 PR #10's already-merged surface; no new Core change
 
 ## X1 — Test split (preserved from Phase 2)
 
-- **Stub-driven** (no Ollama): unit tests on `AssistantBudgetGate` + `ToolRegistry` + `EchoTool` (pure logic); integration tests on `AssistantAgentExecutor` + `AgentRunEndpoints` (real Postgres via Testcontainers, stub `IAgentLlmClient` via `StubAgentLlmClient`). The `AssistantWebApplicationFactory` swaps both `IOllamaClient` and `IAgentLlmClient` to stubs.
+- **Stub-driven** (no Ollama): unit tests on `DefaultBudgetGate` (Assistant-side usage; post-retrofit) + `ToolRegistry` + `EchoTool` (pure logic); integration tests on `AssistantAgentExecutor` + `AgentRunEndpoints` (real Postgres via Testcontainers, stub `IAgentLlmClient` via `StubAgentLlmClient`). The `AssistantWebApplicationFactory` swaps both `IOllamaClient` and `IAgentLlmClient` to stubs.
 - **OLLAMA_BASE_URL-gated** (real LLM): `RealOllamaSmokeTests.PostAgentRuns_WithEchoTool_DispatchesAndReturnsSucceeded` against `qwen2.5:72b` — full real-LLM agentic loop end-to-end, 240s upper bound. Skips cleanly when env var unset.
 
 5-parallel against real Ollama serializes at the GPU layer (~5 min cold-load + serialization) — keep the test surfaces split.

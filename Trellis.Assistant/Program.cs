@@ -140,9 +140,14 @@ builder.Services.AddHostedService<OllamaWarmupHostedService>();
 //   lets future tools (Phase 3.B's SearchDocumentsTool, Phase 4's
 //   send_message tools) drop in via a single AddSingleton<IAgentTool, ...>
 //   line without touching the registry's wiring.
-// IAgentBudgetGate: singleton placeholder. Retrofit-to-Core when qwen's
-//   Phase A merges DefaultBudgetGate (1-PR follow-up: replace this
-//   registration with the Core impl + delete AssistantBudgetGate).
+// IAgentBudgetGate: singleton, consumes Trellis.Core.Services.DefaultBudgetGate
+//   (post-Phase-3.A.2 retrofit per qwen's Phase A merge). Assistant's
+//   documented MaxSteps=25 default is injected by AssistantAgentExecutor
+//   via WithAssistantDefaults — DefaultBudgetGate's own default is 1000
+//   (Workflow's value), and Core's docstring on AgentBudgetOverrides
+//   directs callers to inject per-surface defaults. The Assistant
+//   executor IS that consumer for all Assistant paths; pinned by
+//   Executor_BudgetOverridesNull_InjectsAssistantDefault25.
 // IAgentExecutor: scoped — depends on the scoped store + transient
 //   typed-client + singleton registry/gate/options.
 builder.Services.AddScoped<IAgentRunStore, PostgresAgentRunStore>();
@@ -158,7 +163,7 @@ builder.Services.AddHttpClient<IAgentLlmClient>()
     });
 builder.Services.AddSingleton<IAgentTool, EchoTool>();
 builder.Services.AddSingleton<IToolRegistry, ToolRegistry>();
-builder.Services.AddSingleton<IAgentBudgetGate, AssistantBudgetGate>();
+builder.Services.AddSingleton<IAgentBudgetGate, DefaultBudgetGate>();
 // Register the concrete class + alias the interface to the same scope.
 // Phase 3.A.2's ConversationOrchestrator depends on the concrete
 // AssistantAgentExecutor for the RunForConversationAsync method (not on
