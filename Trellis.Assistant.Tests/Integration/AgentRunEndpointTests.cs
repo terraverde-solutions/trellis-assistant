@@ -53,11 +53,11 @@ public sealed class AgentRunEndpointTests : IClassFixture<PostgresFixture>, IAsy
         var client = _factory!.CreateClient();
         if (tenantId is not null)
         {
-            client.DefaultRequestHeaders.Add(TenantHeadersMiddleware.TenantHeaderName, tenantId);
+            client.DefaultRequestHeaders.Add(TenantClaimsMiddleware.TenantHeaderName, tenantId);
         }
         if (userId is not null)
         {
-            client.DefaultRequestHeaders.Add(TenantHeadersMiddleware.UserHeaderName, userId);
+            client.DefaultRequestHeaders.Add(TenantClaimsMiddleware.UserHeaderName, userId);
         }
         return client;
     }
@@ -171,7 +171,7 @@ public sealed class AgentRunEndpointTests : IClassFixture<PostgresFixture>, IAsy
     public async Task PostAgentRuns_NonUuidTenantId_Returns400()
     {
         // Phase 3.A C1 contract: agent runs require uuid-shaped tenant
-        // identifiers. A non-uuid tenant slipping through TenantHeadersMiddleware
+        // identifiers. A non-uuid tenant slipping through TenantClaimsMiddleware
         // (which only checks non-blank) gets 400 here rather than silently
         // mis-mapping to a random Guid via Guid.Parse failure.
         Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");

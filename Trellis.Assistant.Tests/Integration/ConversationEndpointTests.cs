@@ -56,11 +56,11 @@ public sealed class ConversationEndpointTests : IClassFixture<PostgresFixture>, 
         var client = _factory!.CreateClient();
         if (tenantId is not null)
         {
-            client.DefaultRequestHeaders.Add(TenantHeadersMiddleware.TenantHeaderName, tenantId);
+            client.DefaultRequestHeaders.Add(TenantClaimsMiddleware.TenantHeaderName, tenantId);
         }
         if (userId is not null)
         {
-            client.DefaultRequestHeaders.Add(TenantHeadersMiddleware.UserHeaderName, userId);
+            client.DefaultRequestHeaders.Add(TenantClaimsMiddleware.UserHeaderName, userId);
         }
         return client;
     }
@@ -716,7 +716,7 @@ public sealed class ConversationEndpointTests : IClassFixture<PostgresFixture>, 
     public async Task PostTurns_AgentPath_NonUuidTenant_Returns400()
     {
         // Phase 3.A C1 pin: agent path requires uuid-shaped tenantId.
-        // The TenantHeadersMiddleware lets non-blank strings through;
+        // The TenantClaimsMiddleware lets non-blank strings through;
         // the agent-path branch in the orchestrator surfaces a 400
         // when Guid.Parse fails. Pin the wire-status mapping.
         Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");

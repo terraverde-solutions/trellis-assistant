@@ -82,8 +82,8 @@ public sealed class RealOllamaSmokeTests : IClassFixture<PostgresFixture>, IAsyn
             ?? "mistral-small:24b";
 
         using var client = _factory!.CreateClient();
-        client.DefaultRequestHeaders.Add(TenantHeadersMiddleware.TenantHeaderName, TestTenants.TenantRealLlm);
-        client.DefaultRequestHeaders.Add(TenantHeadersMiddleware.UserHeaderName, TestTenants.UserRealLlm);
+        client.DefaultRequestHeaders.Add(TenantClaimsMiddleware.TenantHeaderName, TestTenants.TenantRealLlm);
+        client.DefaultRequestHeaders.Add(TenantClaimsMiddleware.UserHeaderName, TestTenants.UserRealLlm);
 
         // Create a conversation with the test model pinned.
         var convResp = await client.PostAsJsonAsync("/api/conversations",
@@ -167,8 +167,8 @@ public sealed class RealOllamaSmokeTests : IClassFixture<PostgresFixture>, IAsyn
             ollamaBaseUrl,
             agentModel: agentModel);
         using var client = factory.CreateClient();
-        client.DefaultRequestHeaders.Add(TenantHeadersMiddleware.TenantHeaderName, TestTenants.TenantRealLlm);
-        client.DefaultRequestHeaders.Add(TenantHeadersMiddleware.UserHeaderName, TestTenants.UserRealLlm);
+        client.DefaultRequestHeaders.Add(TenantClaimsMiddleware.TenantHeaderName, TestTenants.TenantRealLlm);
+        client.DefaultRequestHeaders.Add(TenantClaimsMiddleware.UserHeaderName, TestTenants.UserRealLlm);
 
         var sw = Stopwatch.StartNew();
         var resp = await client.PostAsJsonAsync(
@@ -235,8 +235,8 @@ public sealed class RealOllamaSmokeTests : IClassFixture<PostgresFixture>, IAsyn
             ollamaBaseUrl,
             agentModel: agentModel);
         using var client = factory.CreateClient();
-        client.DefaultRequestHeaders.Add(TenantHeadersMiddleware.TenantHeaderName, TestTenants.TenantRealLlm);
-        client.DefaultRequestHeaders.Add(TenantHeadersMiddleware.UserHeaderName, TestTenants.UserRealLlm);
+        client.DefaultRequestHeaders.Add(TenantClaimsMiddleware.TenantHeaderName, TestTenants.TenantRealLlm);
+        client.DefaultRequestHeaders.Add(TenantClaimsMiddleware.UserHeaderName, TestTenants.UserRealLlm);
 
         // Create the conversation. Phase 2's per-conversation Model
         // is set; the agent path uses Assistant:Agent:Model (overridden
@@ -317,8 +317,8 @@ public sealed class RealOllamaSmokeTests : IClassFixture<PostgresFixture>, IAsyn
         const string invalidModel = "nonexistent-model:phase2-pin-9999";
 
         using var client = _factory!.CreateClient();
-        client.DefaultRequestHeaders.Add(TenantHeadersMiddleware.TenantHeaderName, TestTenants.TenantBadModel);
-        client.DefaultRequestHeaders.Add(TenantHeadersMiddleware.UserHeaderName, TestTenants.UserBadModel);
+        client.DefaultRequestHeaders.Add(TenantClaimsMiddleware.TenantHeaderName, TestTenants.TenantBadModel);
+        client.DefaultRequestHeaders.Add(TenantClaimsMiddleware.UserHeaderName, TestTenants.UserBadModel);
 
         var convResp = await client.PostAsJsonAsync("/api/conversations",
             new ConversationEndpoints.CreateConversationRequest(Channel: "api", Model: invalidModel));

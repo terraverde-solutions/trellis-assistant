@@ -1,3 +1,4 @@
+using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
@@ -81,6 +82,15 @@ public sealed class AssistantWebApplicationFactory : WebApplicationFactory<Progr
                 // in Program.cs still resolves at startup. A non-null
                 // value keeps that resolution clean.
                 ["Ollama:BaseUrl"] = "http://test-host-unreachable:11434/",
+                // Macro 3 PR 2: dummy Auth:Authority for the JWT
+                // bearer registration. Tests don't actually validate
+                // bearers — TestAuthenticationHandler synthesizes
+                // claims from headers (see ConfigureTestServices below).
+                // A non-null Authority keeps Program.cs's
+                // AddJwtBearer registration from throwing at startup.
+                ["Auth:Authority"] = "http://test-host-unreachable/",
+                ["Auth:Audience"] = "trellis-assistant-test",
+                ["Auth:RequireHttpsMetadata"] = "false",
             });
         });
 
@@ -99,6 +109,22 @@ public sealed class AssistantWebApplicationFactory : WebApplicationFactory<Progr
             // RemoveAll-then-AddSingleton pattern as IOllamaClient.
             services.RemoveAll<IAgentLlmClient>();
             services.AddSingleton<IAgentLlmClient>(_agentLlmStub);
+
+            // Macro 3 PR 2: replace JWT bearer with the test auth
+            // scheme that synthesizes claims from headers. Existing
+            // tests' header-based fixture pattern continues working;
+            // production validates real bearers, tests skip the JWT
+            // path entirely. The TestAuth scheme is also the new
+            // default scheme — RequireAuthorization on the route
+            // groups validates against it.
+            services.Configure<AuthenticationOptions>(opts =>
+            {
+                opts.DefaultAuthenticateScheme = TestAuthenticationHandler.SchemeName;
+                opts.DefaultChallengeScheme = TestAuthenticationHandler.SchemeName;
+            });
+            services.AddAuthentication()
+                .AddScheme<AuthenticationSchemeOptions, TestAuthenticationHandler>(
+                    TestAuthenticationHandler.SchemeName, _ => { });
         });
     }
 }

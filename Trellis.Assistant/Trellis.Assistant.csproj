@@ -57,6 +57,12 @@
     </PackageReference>
     <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="10.0.1" />
 
+    <!-- Macro 3 PR 2: JWT bearer validation. Microsoft.AspNetCore.Authentication.JwtBearer
+         carries the OIDC discovery + signing-key resolution + token validation surface
+         that AddJwtBearer wires up. Latest stable for net10.0; pin major version to keep
+         OpenID Connect metadata format compatible with the Auth-side issuer. -->
+    <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="10.0.0" />
+
     <!-- Ulid for time-sortable conversation/turn IDs. The .NET-domain type
          is `Ulid`; we convert to/from `Guid` at the EF boundary so the
          Postgres column stays the native `uuid` type. The byte layout

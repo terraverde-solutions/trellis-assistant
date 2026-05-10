@@ -1,6 +1,9 @@
+using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace Trellis.Assistant.Tests.TestFixtures;
 
@@ -58,6 +61,14 @@ public sealed class RealOllamaWebApplicationFactory : WebApplicationFactory<Prog
                 // genuinely-stuck Ollama.
                 ["Assistant:TurnRequestTimeoutSeconds"] = "180",
                 ["Ollama:BaseUrl"] = _ollamaBaseUrl,
+                // Macro 3 PR 2: dummy Auth:Authority for the JWT
+                // bearer registration. The TestAuthenticationHandler
+                // override below synthesizes claims from headers; the
+                // real-LLM smoke uses the same X-Trellis-* header
+                // pattern as other tests (no real bearer minting).
+                ["Auth:Authority"] = "http://test-host-unreachable/",
+                ["Auth:Audience"] = "trellis-assistant-test",
+                ["Auth:RequireHttpsMetadata"] = "false",
             };
             // Phase 3.A.1: override the agent-execution model when the
             // test caller supplies one (typically from the OLLAMA_TEST_MODEL
@@ -71,7 +82,20 @@ public sealed class RealOllamaWebApplicationFactory : WebApplicationFactory<Prog
             config.AddInMemoryCollection(settings);
         });
 
-        // No ConfigureTestServices override — production OllamaClient
-        // + OllamaAgentLlmClient stay. That's the point of this factory.
+        // Macro 3 PR 2: replace JWT bearer with TestAuthenticationHandler
+        // so the real-LLM smoke tests' header-based fixture pattern
+        // continues working. Production OllamaClient +
+        // OllamaAgentLlmClient stay — only the auth scheme is swapped.
+        builder.ConfigureTestServices(services =>
+        {
+            services.Configure<Microsoft.AspNetCore.Authentication.AuthenticationOptions>(opts =>
+            {
+                opts.DefaultAuthenticateScheme = TestAuthenticationHandler.SchemeName;
+                opts.DefaultChallengeScheme = TestAuthenticationHandler.SchemeName;
+            });
+            services.AddAuthentication()
+                .AddScheme<Microsoft.AspNetCore.Authentication.AuthenticationSchemeOptions, TestAuthenticationHandler>(
+                    TestAuthenticationHandler.SchemeName, _ => { });
+        });
     }
 }

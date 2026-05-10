@@ -22,7 +22,7 @@ namespace Trellis.Assistant.Endpoints;
 ///
 /// <para>
 /// OrgId derivation per Phase 3.A C1: <see cref="Guid"/>.Parse the
-/// trusted tenant id from <see cref="TenantHeadersMiddleware"/>. JWT
+/// trusted tenant id from <see cref="TenantClaimsMiddleware"/>. JWT
 /// production tenants are uuid-shaped; non-uuid tenant strings here
 /// fail loud at request time with 400 Bad Request rather than silently
 /// mis-mapping to a random Guid.
@@ -40,7 +40,11 @@ public static class AgentRunEndpoints
 {
     public static void MapAgentRunEndpoints(this IEndpointRouteBuilder app)
     {
-        var group = app.MapGroup("/api/agent-runs");
+        // Macro 3 PR 2: same auth posture as /api/conversations — JWT
+        // bearer canonical, deprecated headers tolerated via
+        // TenantClaimsMiddleware's synthesized principal. See
+        // ConversationEndpoints.MapConversationEndpoints for full notes.
+        var group = app.MapGroup("/api/agent-runs").RequireAuthorization();
         group.MapPost("/", CreateAgentRunAsync);
     }
 
@@ -78,11 +82,11 @@ public static class AgentRunEndpoints
         IToolRegistry tools,
         CancellationToken cancellationToken)
     {
-        var tenantIdString = (string)context.Items[TenantHeadersMiddleware.TenantIdKey]!;
+        var tenantIdString = (string)context.Items[TenantClaimsMiddleware.TenantIdKey]!;
         // userId is read for parity with the conversation surface but
         // currently unused — agent_runs scope by OrgId only. Phase 5+
         // identity work may add per-user agent permissions.
-        _ = (string)context.Items[TenantHeadersMiddleware.UserIdKey]!;
+        _ = (string)context.Items[TenantClaimsMiddleware.UserIdKey]!;
 
         if (request is null || string.IsNullOrWhiteSpace(request.UserPrompt))
         {
@@ -92,7 +96,7 @@ public static class AgentRunEndpoints
         if (!Guid.TryParse(tenantIdString, out var orgId) || orgId == Guid.Empty)
         {
             // Phase 3.A C1 contract: production tenantIds are uuid-shaped.
-            // A non-uuid tenant slipping through TenantHeadersMiddleware
+            // A non-uuid tenant slipping through TenantClaimsMiddleware
             // (which only checks non-blank) means a misconfigured client
             // or a pre-Phase-3 test fixture. 400 surfaces it loud rather
             // than silently mis-scoping the run.

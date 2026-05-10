@@ -121,6 +121,14 @@ public class HealthCheckTests : IClassFixture<HealthCheckTests.LightweightFactor
                     // output.
                     ["Ollama:BaseUrl"] = "http://test-host-unreachable:11434/",
                     ["Assistant:WarmupModel"] = "",
+                    // Macro 3 PR 2: dummy Auth:Authority so the JWT
+                    // bearer registration in Program.cs resolves cleanly
+                    // at startup. /healthz + /readyz are anonymous, so
+                    // tests never exercise the authentication path —
+                    // the dummy values just keep DI from throwing.
+                    ["Auth:Authority"] = "http://test-host-unreachable/",
+                    ["Auth:Audience"] = "trellis-assistant-test",
+                    ["Auth:RequireHttpsMetadata"] = "false",
                 });
             });
         }

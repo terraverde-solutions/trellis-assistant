@@ -33,7 +33,7 @@ phase + guard-rails for what NOT to do yet.
 - Two operational endpoints:
   - `/healthz` — liveness (200 once Kestrel listens)
   - `/readyz` — readiness (200 once `OllamaWarmupHostedService` has succeeded; 503 until then)
-- `TenantHeadersMiddleware` validates `X-Trellis-Tenant-Id` + `X-Trellis-User-Id` for `/api/*`; bypasses `/healthz` + `/readyz`
+- **JWT bearer authentication (Macro 3 PR 2)** — `AddJwtBearer` validates incoming bearers against `Auth:Authority` + `Auth:Audience` (defaults: `trellis-assistant`); `RequireAuthorization` on `/api/conversations/*` + `/api/agent-runs/*`. `/healthz` + `/readyz` stay anonymous (operator probes). `TenantClaimsMiddleware` (renamed from `TenantClaimsMiddleware`) reads `tenant_id` (custom claim) + `sub` (canonical user id) from `HttpContext.User`; falls back to deprecated `X-Trellis-Tenant-Id`/`X-Trellis-User-Id` headers with structured warning + Prometheus counter telemetry per request, so operators can identify legacy callers before the eventual removal PR. Synthesizes a `ClaimsPrincipal` on the header-fallback path so `RequireAuthorization` accepts either auth source.
 - Postgres-backed `IAssistantConversationStore` impl with per-conversation advisory lock around position assignment + INSERT pair
 - Real `Trellis.Core.Services.OllamaClient` wired via `IHttpClientFactory` (Phase 1's stub still in the binary for tests)
 - Per-conversation model selection: `conversations.model varchar(64) NOT NULL DEFAULT 'mistral-small:24b'`; pinned at create time, immutable for Phase 2
@@ -85,7 +85,7 @@ Trellis.Assistant.sln
 │   │                                (Func<Uri> base-URL provider, late-resolution),
 │   │                                OllamaReadinessState singleton + warm-up
 │   │                                hosted service + readiness endpoint,
-│   │                                TenantHeadersMiddleware, conversation
+│   │                                TenantClaimsMiddleware, conversation
 │   │                                endpoints, auto-migrate on startup,
 │   │                                `public partial class Program {}` for
 │   │                                WebApplicationFactory<Program>
@@ -116,9 +116,10 @@ Trellis.Assistant.sln
 │   │                            error (HttpRequestException), 201 on
 │   │                            create
 │   ├── Middleware/
-│   │   └── TenantHeadersMiddleware.cs   Phase-1 stub trust-the-headers
-│   │                            auth; Phase 5 swaps to JWT-claim
-│   │                            extraction. Bypass list: /healthz, /readyz
+│   │   └── TenantClaimsMiddleware.cs   Macro 3 PR 2: JWT-claim
+│   │                            extraction (canonical) + deprecated
+│   │                            header fallback (telemetry-tracked).
+│   │                            Bypass list: /healthz, /readyz
 │   ├── Migrations/
 │   │   ├── 20260504171253_InitialCreate.cs (Phase 1 — conversations + turns)
 │   │   └── 20260504192737_AddModelColumnToConversations.cs (Phase 2)
@@ -231,7 +232,7 @@ Steady-state QA redeploys: `trellis-deploy/scripts/qa/Deploy-Assistant-Standalon
 - **Don't pin a top-level `"Urls"` key in `appsettings.json`.** Defense-in-depth against the trainer-qa bootstrap-day port-binding bug. Pinned by `AppsettingsConventionsTests`.
 - **Don't add a model allowlist** at conversation create time OR at agent-run create time. Phase 2/3.A ship free-text varchar(64); invalid tags surface as a 502 from Ollama on first call. Phase 3.C tool registry adds an allowlist when `search_documents` needs model-aware embedding selection.
 - **Don't add a re-pin operation for `Model`** on conversations OR for agent runs. Per-conversation model is immutable in Phase 2. Per-agent-run model selection comes from `Assistant:Agent:Model` config (default `qwen2.5:72b` per Phase 3.A C3); Phase 3.A.2 may surface an explicit per-run override path if hub asks for it.
-- **Don't use non-uuid tenantIds in tests.** Phase 3.A C1 contract: production tenantIds are uuid-shaped (gateway issues uuid-shaped tenants per JWT `tenant_id` claim). The agent-execution surface relies on `Guid.Parse(tenantId)` for OrgId derivation. All tests use `TestTenants.TenantA` / `TenantB` / etc. constants — Guid-shaped strings of the form `00000000-0000-0000-0000-00000000000a`. Non-uuid tenant slipping through `TenantHeadersMiddleware` surfaces as 400 Bad Request at `POST /api/agent-runs` rather than silently mis-mapping.
+- **Don't use non-uuid tenantIds in tests.** Phase 3.A C1 contract: production tenantIds are uuid-shaped (gateway issues uuid-shaped tenants per JWT `tenant_id` claim). The agent-execution surface relies on `Guid.Parse(tenantId)` for OrgId derivation. All tests use `TestTenants.TenantA` / `TenantB` / etc. constants — Guid-shaped strings of the form `00000000-0000-0000-0000-00000000000a`. Non-uuid tenant slipping through `TenantClaimsMiddleware` surfaces as 400 Bad Request at `POST /api/agent-runs` rather than silently mis-mapping.
 - **Don't capture `Ollama:BaseUrl` or the connection string eagerly at builder time.** The late-resolution rule in `Program.cs` is load-bearing for `WebApplicationFactory<Program>` test overlays + future runtime config changes. Phase 5's JWT swap follows the same pattern.
 - **Don't merge the stub-driven endpoint tests with the real-Ollama smoke.** X1 split: stub-driven verifies orchestrator/store/lock invariants; OLLAMA_BASE_URL-gated verifies the real-LLM path. 5-parallel against real Ollama on a single GPU would spend ~5 minutes serializing — keep the test surfaces split.
 - **Don't fork wire types or auth handlers from `Trellis.Core`.** Use `IAssistantConversationStore` + `IOllamaClient` + `ChatMessage` + `ChatRole` directly.
