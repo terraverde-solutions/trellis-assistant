@@ -21,7 +21,7 @@ namespace Trellis.Assistant.Endpoints;
 /// string preserves the time-sortable byte layout end-to-end.
 ///
 /// Auth: every endpoint here lives under /api/ so the
-/// <see cref="TenantHeadersMiddleware"/> has already validated +
+/// <see cref="TenantClaimsMiddleware"/> has already validated +
 /// stashed the trusted (tenant, user) tuple in
 /// <see cref="HttpContext.Items"/>. The endpoint handlers read those
 /// values; they never read the headers directly. When Phase 5 swaps the
@@ -38,7 +38,14 @@ public static class ConversationEndpoints
 {
     public static void MapConversationEndpoints(this IEndpointRouteBuilder app)
     {
-        var group = app.MapGroup("/api/conversations");
+        // Macro 3 PR 2: every endpoint in the group requires either a
+        // valid JWT bearer (canonical path) or X-Trellis-* headers
+        // (deprecated, telemetry-tracked). TenantClaimsMiddleware
+        // synthesizes a ClaimsPrincipal for the deprecated path so
+        // RequireAuthorization sees an authenticated principal either
+        // way; missing both → ASP.NET Core's authorization middleware
+        // produces 401 before the endpoint is reached.
+        var group = app.MapGroup("/api/conversations").RequireAuthorization();
 
         group.MapPost("/", CreateConversationAsync);
         group.MapGet("/{id}", GetConversationAsync);
@@ -62,8 +69,8 @@ public static class ConversationEndpoints
         IAssistantConversationStore store,
         CancellationToken cancellationToken)
     {
-        var tenantId = (string)context.Items[TenantHeadersMiddleware.TenantIdKey]!;
-        var userId = (string)context.Items[TenantHeadersMiddleware.UserIdKey]!;
+        var tenantId = (string)context.Items[TenantClaimsMiddleware.TenantIdKey]!;
+        var userId = (string)context.Items[TenantClaimsMiddleware.UserIdKey]!;
 
         // Default channel to "api" when omitted — matches the schema's
         // DEFAULT 'api'. Empty string is treated as "use default" too —
@@ -131,8 +138,8 @@ public static class ConversationEndpoints
         IAssistantConversationStore store,
         CancellationToken cancellationToken)
     {
-        var tenantId = (string)context.Items[TenantHeadersMiddleware.TenantIdKey]!;
-        var userId = (string)context.Items[TenantHeadersMiddleware.UserIdKey]!;
+        var tenantId = (string)context.Items[TenantClaimsMiddleware.TenantIdKey]!;
+        var userId = (string)context.Items[TenantClaimsMiddleware.UserIdKey]!;
 
         if (!TryParseUlidToGuid(id, out var conversationId))
         {
@@ -202,8 +209,8 @@ public static class ConversationEndpoints
         IOptions<ConversationOrchestratorOptions> options,
         CancellationToken cancellationToken)
     {
-        var tenantId = (string)context.Items[TenantHeadersMiddleware.TenantIdKey]!;
-        var userId = (string)context.Items[TenantHeadersMiddleware.UserIdKey]!;
+        var tenantId = (string)context.Items[TenantClaimsMiddleware.TenantIdKey]!;
+        var userId = (string)context.Items[TenantClaimsMiddleware.UserIdKey]!;
 
         if (!TryParseUlidToGuid(id, out var conversationId))
         {

@@ -1,3 +1,4 @@
+using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.EntityFrameworkCore;
 using Trellis.Assistant.AgentExecution;
 using Trellis.Assistant.Data;
@@ -73,6 +74,40 @@ builder.Services
 // different DI shape. Tracking memo on hub side captures this as a
 // cross-cutting Trellis pattern that survives Phase 5's middleware
 // swap.
+// ---------------- Macro 3 PR 2: JWT bearer authentication ----------------
+//
+// AddAuthentication + AddJwtBearer with the late-resolution shape per
+// the LATE-RESOLUTION RULE block above. Eager Configure(opts => ...)
+// would capture the appsettings default; the AddOptions<JwtBearerOptions>
+// + Configure<IConfiguration>((opts, cfg) => ...) form pulls IConfiguration
+// from DI at options-binding time, post-WebApplicationFactory-overlay.
+//
+// Auth:Authority, Auth:Audience, Auth:RequireHttpsMetadata are bound
+// from /etc/trellis-assistant-qa.env in QA + appsettings.json defaults
+// for dev. RequireHttpsMetadata=true in production; appsettings.user.json
+// flips to false for loopback dev.
+//
+// Phase 5 directive landed: TenantHeadersMiddleware is now
+// TenantClaimsMiddleware — claims-first (canonical), header fallback
+// (deprecated, structured-warning + counter telemetry).
+builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddJwtBearer();
+builder.Services
+    .AddOptions<JwtBearerOptions>(JwtBearerDefaults.AuthenticationScheme)
+    .Configure<IConfiguration>((opts, cfg) =>
+    {
+        opts.Authority = cfg["Auth:Authority"]
+            ?? throw new InvalidOperationException(
+                "Auth:Authority is not configured. Set it in appsettings.user.json (Dev) or /etc/trellis-assistant-qa.env (QA).");
+        opts.Audience = cfg["Auth:Audience"] ?? "trellis-assistant";
+        opts.RequireHttpsMetadata = cfg.GetValue("Auth:RequireHttpsMetadata", defaultValue: true);
+        // Per Macro 3 PR 2 design: tenant_id is a custom claim; sub is
+        // the canonical user_id. The TokenValidationParameters defaults
+        // are sufficient — the issuer + audience match drive validation;
+        // claim extraction happens in TenantClaimsMiddleware downstream.
+    });
+builder.Services.AddAuthorization();
+
 builder.Services.AddDbContext<AssistantDbContext>((sp, opts) =>
 {
     var config = sp.GetRequiredService<IConfiguration>();
@@ -224,11 +259,21 @@ catch (Exception ex)
 
 // ---------------- Pipeline ----------------
 //
-// Auth header gate first — every /api/* request gets the trusted (tenant,
-// user) tuple stashed in HttpContext.Items before reaching the endpoint
-// handlers. /healthz bypasses the gate entirely (path check inside the
-// middleware).
-app.UseMiddleware<TenantHeadersMiddleware>();
+// Middleware ordering:
+//   1. UseAuthentication — validates JWT bearer if present, populates
+//      HttpContext.User. Anonymous requests pass through with
+//      User.Identity.IsAuthenticated == false.
+//   2. UseAuthorization — enforces [Authorize] attributes on endpoints.
+//      Returns 401 when an authorized endpoint is hit by an anonymous
+//      caller (after route resolution).
+//   3. TenantClaimsMiddleware — reads claims from HttpContext.User
+//      (canonical path) OR falls back to X-Trellis-* headers (deprecated;
+//      structured warning + counter increment). Stashes resolved
+//      (tenantId, userId) in HttpContext.Items for endpoint handlers.
+//      Path-scoped to /api/* — /healthz + /readyz bypass entirely.
+app.UseAuthentication();
+app.UseAuthorization();
+app.UseMiddleware<TenantClaimsMiddleware>();
 
 // Phase 0 surface: /healthz. Same shape as before — this endpoint is
 // load-bearing for the deploy-script smoke wrapper that hits
