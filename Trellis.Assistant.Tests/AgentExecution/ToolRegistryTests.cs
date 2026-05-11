@@ -21,12 +21,14 @@ namespace Trellis.Assistant.Tests.AgentExecution;
 /// </summary>
 public sealed class ToolRegistryTests
 {
+    private readonly JsonSchemaNetValidator _schemaValidator = new();
+
     [Fact]
     public void NameCollision_FailsAtStartup()
     {
         var firstEcho = new EchoTool();
         var collidingEcho = new FakeTool(name: "echo", description: "shouldn't matter");
-        var act = () => new ToolRegistry(new IAgentTool[] { firstEcho, collidingEcho });
+        var act = () => new ToolRegistry(new IAgentTool[] { firstEcho, collidingEcho }, _schemaValidator);
         act.Should().Throw<InvalidOperationException>()
             .WithMessage("*name collision*echo*",
                 "two tools registered with the same Descriptor.Name must crash the host on construction");
@@ -36,7 +38,7 @@ public sealed class ToolRegistryTests
     public void EmptyName_FailsAtStartup()
     {
         var bad = new FakeTool(name: "", description: "valid description");
-        var act = () => new ToolRegistry(new IAgentTool[] { bad });
+        var act = () => new ToolRegistry(new IAgentTool[] { bad }, _schemaValidator);
         act.Should().Throw<InvalidOperationException>()
             .WithMessage("*empty/whitespace Descriptor.Name*");
     }
@@ -45,7 +47,7 @@ public sealed class ToolRegistryTests
     public void WhitespaceName_FailsAtStartup()
     {
         var bad = new FakeTool(name: "   ", description: "valid description");
-        var act = () => new ToolRegistry(new IAgentTool[] { bad });
+        var act = () => new ToolRegistry(new IAgentTool[] { bad }, _schemaValidator);
         act.Should().Throw<InvalidOperationException>()
             .WithMessage("*empty/whitespace Descriptor.Name*",
                 "whitespace-only Name is functionally indistinguishable from empty");
@@ -55,7 +57,7 @@ public sealed class ToolRegistryTests
     public void EmptyDescription_FailsAtStartup()
     {
         var bad = new FakeTool(name: "valid_name", description: "");
-        var act = () => new ToolRegistry(new IAgentTool[] { bad });
+        var act = () => new ToolRegistry(new IAgentTool[] { bad }, _schemaValidator);
         act.Should().Throw<InvalidOperationException>()
             .WithMessage("*empty/whitespace Descriptor.Description*");
     }
@@ -64,7 +66,7 @@ public sealed class ToolRegistryTests
     public void WhitespaceDescription_FailsAtStartup()
     {
         var bad = new FakeTool(name: "valid_name", description: "   ");
-        var act = () => new ToolRegistry(new IAgentTool[] { bad });
+        var act = () => new ToolRegistry(new IAgentTool[] { bad }, _schemaValidator);
         act.Should().Throw<InvalidOperationException>()
             .WithMessage("*empty/whitespace Descriptor.Description*");
     }
@@ -90,7 +92,7 @@ public sealed class ToolRegistryTests
         // descriptor in the registry's dict. Adding the legit tool
         // (same name) triggers the collision detection — same code
         // path that catches name-mismatch drift.
-        var act = () => new ToolRegistry(new IAgentTool[] { slipperyTool, legitTool });
+        var act = () => new ToolRegistry(new IAgentTool[] { slipperyTool, legitTool }, _schemaValidator);
         act.Should().Throw<InvalidOperationException>()
             .WithMessage("*name collision*consistent_name*");
     }
@@ -99,7 +101,7 @@ public sealed class ToolRegistryTests
     public void GetTool_RegisteredName_ReturnsTool()
     {
         var echo = new EchoTool();
-        var registry = new ToolRegistry(new IAgentTool[] { echo });
+        var registry = new ToolRegistry(new IAgentTool[] { echo }, _schemaValidator);
         registry.GetTool("echo").Should().BeSameAs(echo);
     }
 
@@ -107,7 +109,7 @@ public sealed class ToolRegistryTests
     public void GetTool_UnknownName_ReturnsNull()
     {
         var echo = new EchoTool();
-        var registry = new ToolRegistry(new IAgentTool[] { echo });
+        var registry = new ToolRegistry(new IAgentTool[] { echo }, _schemaValidator);
         registry.GetTool("not_registered").Should().BeNull();
     }
 
@@ -115,9 +117,38 @@ public sealed class ToolRegistryTests
     public void GetTool_NullOrEmptyName_ReturnsNull()
     {
         var echo = new EchoTool();
-        var registry = new ToolRegistry(new IAgentTool[] { echo });
+        var registry = new ToolRegistry(new IAgentTool[] { echo }, _schemaValidator);
         registry.GetTool(null!).Should().BeNull();
         registry.GetTool("").Should().BeNull();
+    }
+
+    [Fact]
+    public void MalformedParameterSchema_FailsAtStartup_WithToolIdentifyingMessage()
+    {
+        // Phase 3.B turn-on: JSON Schema validation gates registration.
+        // A tool registered with a malformed ParameterSchema must crash
+        // the host at startup with a message identifying the offending
+        // tool — operators need to know WHICH tool was misconfigured.
+        var bad = new FakeTool(
+            name: "bad_schema",
+            description: "valid description",
+            parameterSchema: "{not a valid json schema");
+        var act = () => new ToolRegistry(new IAgentTool[] { bad }, _schemaValidator);
+        act.Should().Throw<InvalidOperationException>()
+            .WithMessage("*bad_schema*malformed*",
+                "registry surfaces the tool name + 'malformed' so startup logs identify the offending registration");
+    }
+
+    [Fact]
+    public void EmptyParameterSchema_FailsAtStartup()
+    {
+        var bad = new FakeTool(
+            name: "no_schema",
+            description: "valid description",
+            parameterSchema: "");
+        var act = () => new ToolRegistry(new IAgentTool[] { bad }, _schemaValidator);
+        act.Should().Throw<InvalidOperationException>()
+            .WithMessage("*empty/whitespace*ParameterSchema*");
     }
 
     [Fact]
@@ -125,7 +156,7 @@ public sealed class ToolRegistryTests
     {
         var first = new FakeTool(name: "alpha", description: "first tool");
         var second = new FakeTool(name: "beta", description: "second tool");
-        var registry = new ToolRegistry(new IAgentTool[] { first, second });
+        var registry = new ToolRegistry(new IAgentTool[] { first, second }, _schemaValidator);
         registry.Descriptors.Select(d => d.Name).Should().Equal("alpha", "beta");
     }
 
@@ -133,13 +164,13 @@ public sealed class ToolRegistryTests
     {
         public AgentToolDescriptor Descriptor { get; }
 
-        public FakeTool(string name, string description)
+        public FakeTool(string name, string description, string parameterSchema = """{"type":"object"}""")
         {
             Descriptor = new AgentToolDescriptor
             {
                 Name = name,
                 Description = description,
-                ParameterSchema = """{"type":"object"}""",
+                ParameterSchema = parameterSchema,
                 Category = AgentToolCategory.Inspect,
             };
         }

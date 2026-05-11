@@ -1,5 +1,6 @@
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Options;
 using Trellis.Assistant.AgentExecution;
 using Trellis.Assistant.Data;
 using Trellis.Assistant.Endpoints;
@@ -22,6 +23,16 @@ builder.Services
 builder.Services
     .AddOptions<AssistantAgentExecutorOptions>()
     .Bind(builder.Configuration.GetSection(AssistantAgentExecutorOptions.SectionName))
+    .ValidateDataAnnotations();
+
+// Phase 3.B: trainer search options. Bound from "Assistant:Trainer"
+// (BaseUrl, RequestTimeoutSeconds). The typed HttpClient registration
+// below reads BaseUrl + Timeout through this options binding via the
+// IOptions<TrainerSearchOptions> resolution, preserving the
+// LATE-RESOLUTION rule for WebApplicationFactory overlays.
+builder.Services
+    .AddOptions<TrainerSearchOptions>()
+    .Bind(builder.Configuration.GetSection(TrainerSearchOptions.SectionName))
     .ValidateDataAnnotations();
 
 // ---------------- Postgres + EF Core ----------------
@@ -196,7 +207,48 @@ builder.Services.AddHttpClient<IAgentLlmClient>()
                 ?? throw new InvalidOperationException(
                     "Ollama:BaseUrl is not configured. Set it in appsettings.user.json (Dev) or /etc/trellis-assistant-qa.env (QA).")));
     });
+// Phase 3.B: trainer search client. Typed HttpClient with the
+// LATE-RESOLUTION rule — BaseAddress + Timeout read inside the factory
+// lambda at DI resolution time, so WebApplicationFactory overlays are
+// visible. IOptionsMonitor<TrainerSearchOptions> gives fresh option
+// values per resolution (matches Trainer's loopback config posture +
+// supports a future reload-on-change scenario without an app restart).
+builder.Services.AddHttpClient<ISearchClient, HttpSearchClient>((sp, http) =>
+{
+    var opts = sp.GetRequiredService<IOptionsMonitor<TrainerSearchOptions>>().CurrentValue;
+    if (string.IsNullOrWhiteSpace(opts.BaseUrl))
+    {
+        throw new InvalidOperationException(
+            "Assistant:Trainer:BaseUrl is not configured. Set it in appsettings.user.json (Dev) or /etc/trellis-assistant-qa.env (QA).");
+    }
+    http.BaseAddress = new Uri(opts.BaseUrl);
+    http.Timeout = TimeSpan.FromSeconds(opts.RequestTimeoutSeconds);
+});
+
+// Captive-dep fix (post-PR-#9-review): SearchDocumentsTool is registered
+// as a singleton via the IAgentTool collection, but ISearchClient is
+// effectively transient (typed-HttpClient contract per
+// IHttpClientFactory). Capturing ISearchClient directly in a singleton
+// pins the first transient instance + its handler for the host's
+// lifetime, bypassing the factory's 2-minute handler rotation. The
+// Func<ISearchClient> wrapper resolves ISearchClient fresh per tool
+// dispatch — rotation works, lifetime is correct, and the tool stays a
+// singleton (registry sweeps it once at startup). Same shape applies if
+// future tools take other AddHttpClient-registered clients.
+builder.Services.AddSingleton<Func<ISearchClient>>(sp =>
+    () => sp.GetRequiredService<ISearchClient>());
+
+// Phase 3.B: JSON Schema validator. Singleton — caches parsed schemas
+// across the host's lifetime per tool. v0 has <10 tools; cache size is
+// trivially bounded.
+builder.Services.AddSingleton<IJsonSchemaValidator, JsonSchemaNetValidator>();
+
+// EchoTool ships forward as a debugging aid; SearchDocumentsTool is
+// Phase 3.B's first real tool. Both registered against IAgentTool;
+// ToolRegistry scans all registered IAgentTool services at startup and
+// JSON-schema-validates each descriptor's ParameterSchema.
 builder.Services.AddSingleton<IAgentTool, EchoTool>();
+builder.Services.AddSingleton<IAgentTool, SearchDocumentsTool>();
 builder.Services.AddSingleton<IToolRegistry, ToolRegistry>();
 builder.Services.AddSingleton<IAgentBudgetGate, DefaultBudgetGate>();
 // Register the concrete class + alias the interface to the same scope.

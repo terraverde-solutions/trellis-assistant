@@ -619,6 +619,72 @@ public sealed class AssistantAgentExecutorTests : IClassFixture<PostgresFixture>
         }
     }
 
+    // ---------------- Phase 3.B turn-on: runtime schema validation gate ----------------
+
+    [SkippableFact]
+    public async Task RuntimeSchemaGate_ToolCallWithMissingRequiredArg_PersistsFailedStep_WithSchemaErrorMessage()
+    {
+        // Phase 3.B contract: the executor schema-validates tool_call
+        // args against the tool's ParameterSchema BEFORE dispatch.
+        // Missing required fields → AgentStep.Failed with a structured
+        // error message the LLM sees in history + can retry against.
+        // Decide-and-document #4 REJECT semantics.
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        // EchoTool's schema requires "text"; emit a call without it.
+        var llm = new StubAgentLlmClient()
+            .EnqueueToolCall("echo", """{"not_text":"missing required field"}""")
+            .EnqueueAssistantText("OK, retrying without proper args was rejected.");
+        var executor = NewExecutor(llm);
+
+        var request = AgentRunRequest.Create(
+            orgId: TestOrgId,
+            userPrompt: "Trigger schema-invalid args.",
+            availableTools: new List<AgentToolDescriptor> { new EchoTool().Descriptor });
+
+        var run = await executor.RunAsync(request);
+
+        run.Status.Should().Be(AgentRunStatus.Succeeded,
+            "the loop survives schema rejection; the next LLM iteration emits the final answer");
+        run.Steps.Should().HaveCount(1);
+        var rejectedStep = run.Steps[0];
+        rejectedStep.Status.Should().Be(AgentStepStatus.Failed);
+        rejectedStep.ErrorMessage.Should().Contain("schema validation failed",
+            "rejection message identifies the gate that fired");
+        rejectedStep.ErrorMessage.Should().Contain("echo",
+            "tool name is in the error so the LLM knows which call it needs to retry");
+        rejectedStep.ToolOutputJson.Should().BeNull(
+            "schema-rejected calls never invoke the tool, so no output exists");
+    }
+
+    [SkippableFact]
+    public async Task RuntimeSchemaGate_ToolCallWithValidArgs_DispatchesNormally()
+    {
+        // Negative-control pin: schema-valid args flow through to the
+        // tool normally. Pinning this is important so future-me doesn't
+        // misread the previous test as "schema validation rejects
+        // everything" — it only rejects invalid args.
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        var llm = new StubAgentLlmClient()
+            .EnqueueToolCall("echo", """{"text":"valid call"}""")
+            .EnqueueAssistantText("Done.");
+        var executor = NewExecutor(llm);
+
+        var request = AgentRunRequest.Create(
+            orgId: TestOrgId,
+            userPrompt: "Valid call.",
+            availableTools: new List<AgentToolDescriptor> { new EchoTool().Descriptor });
+
+        var run = await executor.RunAsync(request);
+
+        run.Status.Should().Be(AgentRunStatus.Succeeded);
+        run.Steps.Should().HaveCount(1);
+        run.Steps[0].Status.Should().Be(AgentStepStatus.Succeeded);
+        run.Steps[0].ToolOutputJson.Should().Contain("valid call",
+            "tool dispatched + returned the echoed text in its output");
+    }
+
     // ---------------- Phase 3.A.1 (existing — preserved post-refactor) ----------------
 
     [SkippableFact]
@@ -654,7 +720,8 @@ public sealed class AssistantAgentExecutorTests : IClassFixture<PostgresFixture>
         {
             allTools.AddRange(extraTools);
         }
-        var registry = new ToolRegistry(allTools);
+        var schemaValidator = new JsonSchemaNetValidator();
+        var registry = new ToolRegistry(allTools, schemaValidator);
         // Post-Phase-3.A.2 retrofit: default to Trellis.Core's
         // DefaultBudgetGate. Tests that need to capture the executor's
         // call-time AgentRunState pass a custom gate (used by the
@@ -667,7 +734,7 @@ public sealed class AssistantAgentExecutorTests : IClassFixture<PostgresFixture>
             SystemPrompt = "You are a stub.",
         });
         return new AssistantAgentExecutor(
-            store, llm, registry, gate, options,
+            store, llm, registry, gate, schemaValidator, options,
             NullLogger<AssistantAgentExecutor>.Instance);
     }
 
