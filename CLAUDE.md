@@ -10,6 +10,7 @@ Read first:
 - [`MarkdownFiles/56-project-structure.md`](https://github.com/terraverde-solutions/trellis-docs/blob/main/MarkdownFiles/56-project-structure.md) — repo layout + sibling-repo project-reference convention
 - [`docs/phase-2-design.md`](docs/phase-2-design.md) — Phase 2 design rationale (Q1–Q5 ratifications, worker concerns, scope deltas from Phase 1)
 - [`docs/phase-3a-design.md`](docs/phase-3a-design.md) — Phase 3.A.1 design rationale (Q1–Q11 + 7 worker concerns, OrgId↔TenantId bridge, X1 stub-vs-real test split, Phase 3.A.2 forward plan)
+- [`docs/phase-3b-design.md`](docs/phase-3b-design.md) — Phase 3.B design rationale (Q1 JsonSchema.Net library choice + 7 decide-and-documents, pass-through (a) wire shape, Trainer GET /api/search contract, JSON Schema validation turn-on)
 
 ## What this component is
 
@@ -22,6 +23,16 @@ The component design lives in [`59-trellis-assistant.md`](https://github.com/ter
 phase + guard-rails for what NOT to do yet.
 
 ## Status
+
+**Phase 3.B — search_documents tool + Trainer integration + JSON Schema validation turn-on scaffolded** on `kimi/phase3b-assistant-search-documents-tool`. New surface (this phase):
+
+- `Trellis.Assistant/Services/{TrainerSearchOptions,SearchQuery,ISearchClient,HttpSearchClient}.cs` — loopback-trust HTTP client against trellis-trainer's existing `GET /api/search`. Pure-function `BuildSearchUri` (unit-testable, bakes `source=augmentation` for audit-log discrimination, emits repeated `documentId=` / `contentType=` for multi-value filters, null-elides optionals so Trainer defaults apply). `SearchAsync` 2xx pass-through (verbatim body bytes into `SearchClientResult.ResponseBodyJson`); 4xx → `ProblemDetails.Detail` extraction with `title` fallback; 5xx / transport / timeout / cancellation mapped to structured `ErrorMessage`. 30s default timeout configurable via `Assistant:Trainer:RequestTimeoutSeconds`.
+- `Trellis.Assistant/AgentExecution/{IJsonSchemaValidator,JsonSchemaNetValidator}.cs` — JSON Schema validator (JsonSchema.Net 9.2.0, Draft 2020-12) wrap with `ConcurrentDictionary` parsed-schema cache + normalized first-error reporting (`"<instance-path>: <message>"`). Two responsibilities: `EnsureValidSchema` (startup descriptor check) + `Validate` (runtime args check).
+- `Trellis.Assistant/AgentExecution/SearchDocumentsTool.cs` — Phase 3.B's first real tool. Descriptor with full Draft 2020-12 schema mapping to Assistant-canonical snake_case (`query`, `top_k`, `mode`, `since`, `filter.document_ids`, `filter.content_types`); `MapToSearchQuery` boundary translation to the Trainer wire-aligned `SearchQuery`; pass-through (a) wire shape — Trainer's PascalCase response fields flow through to the LLM verbatim.
+- `Trellis.Assistant/AgentExecution/ToolRegistry.cs` — ctor now takes `IJsonSchemaValidator`; calls `EnsureValidSchema` per registered tool at startup; malformed schema → `InvalidOperationException` with tool-identifying context (operators see which tool was misconfigured in startup log).
+- `Trellis.Assistant/AgentExecution/AssistantAgentExecutor.cs` — ctor now takes `IJsonSchemaValidator`; `DispatchOneToolCallAsync` runtime gate before `tool.RunAsync` — invalid args persist as `AgentStep.Failed` with `ErrorMessage="Tool '<name>': schema validation failed: <path> <reason>"` + skip dispatch. REJECT semantics per decide-and-document #4 — LLM sees the failure in history + retries with corrected args.
+- `appsettings.json` adds `Assistant:Trainer:{BaseUrl="http://127.0.0.1:5114/", RequestTimeoutSeconds=30}`.
+- 169-test suite (43 new + 126 preserved): `HttpSearchClientTests` (18), `JsonSchemaNetValidatorTests` (9), `SearchDocumentsToolTests` (11 + 3 theory cases), `ToolRegistryTests` (+2 pins), `AssistantAgentExecutorTests` (+2 schema-gate pins).
 
 **Phase 3.A.2 — conversation-integrated agent path landed.** What exists:
 
@@ -57,12 +68,12 @@ phase + guard-rails for what NOT to do yet.
 - Phase 3.A.1's standalone `POST /api/agent-runs` remains — both endpoints coexist (standalone is one-shot agentic without conversation context; conversation-integrated threads tool history).
 - 105-test suite — see test breakdown in `docs/phase-3a-design.md` § Phase 3.A.2.
 
-What does NOT exist (Phase 3.B+):
+What does NOT exist (Phase 3.C+):
 
-- Real `search_documents` tool → Trainer integration (Phase 3.B — needs Trainer-side surface scoping)
-- DefaultBudgetGate retrofit (1-PR follow-up after qwen's Phase A merges `Trellis.Core.Services.DefaultBudgetGate`)
 - Tool-result streaming to channel adapters (Phase 4)
 - Tool-allowlist per-model (Phase 3.C)
+- Per-chunk `source_type` / `project_id` filtering (sibling ingestion-side asks for future macros; Trainer has no per-chunk schema for these in v0)
+- S2S JWT auth between Assistant + Trainer (loopback-trust v0; future macro)
 - Channel adapters (Slack / WhatsApp / Telegram webhook handlers — Phase 4)
 - Voice (TTS / STT, push-to-talk, wake word)
 - Identity / sandboxing / DM allowlist (Phase 5)
@@ -218,15 +229,18 @@ Steady-state QA redeploys: `trellis-deploy/scripts/qa/Deploy-Assistant-Standalon
 - Auth: shared `trellisqa` HTTP Basic credential at the Hetzner edge (same as web-qa + trainer-qa); GB10-side nginx is auth-free
 - Bootstrap walkthrough: `trellis-deploy/scripts/qa/bootstrap-assistant.md`
 
-## Don't (Phase 3.A.1)
+## Don't (Phase 3.B)
 
-- **Don't add an SSE / streaming response surface.** Phase 1's POST /turns contract (buffer + return one JSON object) is preserved through Phase 3.A. SSE lands in Phase 3.B+ when there's a concrete streaming consumer (Slack/WhatsApp/Telegram inherently buffer; web/desktop/chat connect to the gateway, not the Assistant).
+- **Don't add an SSE / streaming response surface.** Phase 1's POST /turns contract (buffer + return one JSON object) is preserved. SSE lands when there's a concrete streaming consumer (Slack/WhatsApp/Telegram inherently buffer; web/desktop/chat connect to the gateway, not the Assistant).
 - **Don't add channel adapters.** Phase 4 owns that surface.
 - **Don't lift `IAgentLlmClient` to Trellis.Core.** Phase 3.A.1 ships it parallel to `IOllamaClient` because text-vs-function-calling have different streaming semantics + only one consumer needs it. Lift happens when a SECOND consumer surfaces (qwen's Phase B if/when they need tool-aware LLM).
-- **Don't add JSON Schema validation to the tool registry.** Phase 3.A.1's trimmed validation (name uniqueness + non-empty descriptor fields) is intentional. JSON Schema validation lands in Phase 3.B with `SearchDocumentsTool`'s non-trivial multi-property arg shape.
+- **Don't lift `IJsonSchemaValidator` to Trellis.Core.** Phase 3.B keeps it Assistant-side because Trellis.Core stays dependency-light per `core/CLAUDE.md`'s "no platform deps" guideline; adding JsonSchema.Net to Core would force every Core consumer to take that dep. If a second consumer surfaces (qwen's Workflow turning on schema validation, Server proxying tool calls), lift then.
+- **Don't reshape Trainer's response inside `SearchDocumentsTool` (pass-through (a) is canonical).** The 2xx body bytes flow verbatim into `AgentToolOutput.ResultJson`. The LLM sees Trainer-canonical PascalCase fields. If Trainer ever renames a field, we re-bake the tool descriptor's example response in the prompt rather than introducing a translation layer here.
+- **Don't add tenant headers / JWT to the `HttpSearchClient`.** Loopback-trust v0 — Trainer binds `127.0.0.1:5114` only, kernel filter is the trust boundary. S2S JWT is a future macro when cross-host deployment surfaces.
 - **Don't widen the executor to support multiple tool calls per step.** Core's v0 contract is "1 tool call per step" (61-doc § 5). Multiple tool_calls emitted by the model split into sequential AgentSteps; the per-step `MaxToolCalls=1` cap is pinned by `BudgetGate_PerStepToolCallCap`.
 - **Don't reintroduce a custom `AssistantBudgetGate`.** Post-Phase-3.A.2 retrofit consumed `Trellis.Core.Services.DefaultBudgetGate`. Assistant's `MaxSteps=25` default is injected by `AssistantAgentExecutor.WithAssistantDefaults` (per Core's docstring contract: callers inject per-surface defaults). If a future Assistant-specific gate variant becomes useful, surface a brief — don't fork.
-- **Don't add tool dispatch / MCP plumbing beyond Phase 3.A.1's tool registry surface.** Phase 3.B owns the first real tool (`search_documents` → Trainer); broader MCP plumbing follows.
+- **Don't add tool dispatch / MCP plumbing beyond Phase 3.B's `search_documents` + `EchoTool` surface.** Phase 3.B ships the first real tool; broader MCP plumbing follows. New tools follow the same shape: implement `IAgentTool`, register `services.AddSingleton<IAgentTool, MyTool>()`, the registry picks up + validates the schema at startup.
+- **Don't introduce per-chunk filtering for `source_type` or `project_id`.** Trainer has no schema for these in v0 (verified against the trellis-trainer codebase 2026-05-11). Adding them is an ingestion-side schema-change ask, not a search-client ask. If a tool wants this filtering, surface a sibling ingestion brief rather than smuggling it into the Assistant tool descriptor.
 - **Don't add voice surface.** TTS / STT / push-to-talk / wake-word — all post-tool-dispatch.
 - **Don't add `appsettings.user.json` to the repo.** Gitignored; canonical csproj `<None Remove>` + `<Content Remove>` rules ensure it never rides into a publish bundle.
 - **Don't pin a top-level `"Urls"` key in `appsettings.json`.** Defense-in-depth against the trainer-qa bootstrap-day port-binding bug. Pinned by `AppsettingsConventionsTests`.

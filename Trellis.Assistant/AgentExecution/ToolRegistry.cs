@@ -33,9 +33,13 @@ namespace Trellis.Assistant.AgentExecution;
 ///
 /// <para>
 /// JSON Schema validation of <see cref="AgentToolDescriptor.ParameterSchema"/>
-/// is deferred to Phase 3.B (when <c>SearchDocumentsTool</c> lands
-/// with a non-trivial multi-property schema; EchoTool's 1-property
-/// schema doesn't justify the surface yet).
+/// turned on in Phase 3.B: the ctor calls
+/// <see cref="IJsonSchemaValidator.EnsureValidSchema"/> per registered
+/// tool. A malformed schema string throws
+/// <see cref="InvalidJsonSchemaException"/>, caught + rethrown here as
+/// <see cref="InvalidOperationException"/> with the offending tool's
+/// type + descriptor Name in the message — startup log identifies which
+/// tool caused the failure without operator detective work.
 /// </para>
 /// </summary>
 public sealed class ToolRegistry : IToolRegistry
@@ -43,9 +47,12 @@ public sealed class ToolRegistry : IToolRegistry
     private readonly Dictionary<string, IAgentTool> _toolsByName;
     private readonly IReadOnlyList<AgentToolDescriptor> _descriptors;
 
-    public ToolRegistry(IEnumerable<IAgentTool> registeredTools)
+    public ToolRegistry(
+        IEnumerable<IAgentTool> registeredTools,
+        IJsonSchemaValidator schemaValidator)
     {
         ArgumentNullException.ThrowIfNull(registeredTools);
+        ArgumentNullException.ThrowIfNull(schemaValidator);
 
         var tools = registeredTools.ToList();
         var byName = new Dictionary<string, IAgentTool>(StringComparer.Ordinal);
@@ -53,6 +60,7 @@ public sealed class ToolRegistry : IToolRegistry
         foreach (var tool in tools)
         {
             ValidateDescriptor(tool);
+            ValidateSchema(tool, schemaValidator);
 
             if (byName.ContainsKey(tool.Descriptor.Name))
             {
@@ -77,6 +85,30 @@ public sealed class ToolRegistry : IToolRegistry
             return null;
         }
         return _toolsByName.TryGetValue(name, out var tool) ? tool : null;
+    }
+
+    private static void ValidateSchema(IAgentTool tool, IJsonSchemaValidator validator)
+    {
+        var descriptor = tool.Descriptor;
+        if (string.IsNullOrWhiteSpace(descriptor.ParameterSchema))
+        {
+            throw new InvalidOperationException(
+                $"Tool '{tool.GetType().FullName}' (Name='{descriptor.Name}') has " +
+                "empty/whitespace Descriptor.ParameterSchema. The schema is required for " +
+                "the executor's runtime args validation; an empty schema would let any " +
+                "arguments through.");
+        }
+        try
+        {
+            validator.EnsureValidSchema(descriptor.ParameterSchema);
+        }
+        catch (InvalidJsonSchemaException ex)
+        {
+            throw new InvalidOperationException(
+                $"Tool '{tool.GetType().FullName}' (Name='{descriptor.Name}') has " +
+                $"a malformed Descriptor.ParameterSchema: {ex.Message}",
+                ex);
+        }
     }
 
     private static void ValidateDescriptor(IAgentTool tool)

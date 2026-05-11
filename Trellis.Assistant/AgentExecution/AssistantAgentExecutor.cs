@@ -98,6 +98,7 @@ public sealed class AssistantAgentExecutor : IAgentExecutor
     private readonly IAgentLlmClient _llm;
     private readonly IToolRegistry _tools;
     private readonly IAgentBudgetGate _gate;
+    private readonly IJsonSchemaValidator _schemaValidator;
     private readonly AssistantAgentExecutorOptions _options;
     private readonly ILogger<AssistantAgentExecutor> _logger;
 
@@ -106,6 +107,7 @@ public sealed class AssistantAgentExecutor : IAgentExecutor
         IAgentLlmClient llm,
         IToolRegistry tools,
         IAgentBudgetGate gate,
+        IJsonSchemaValidator schemaValidator,
         IOptions<AssistantAgentExecutorOptions> options,
         ILogger<AssistantAgentExecutor> logger)
     {
@@ -113,6 +115,7 @@ public sealed class AssistantAgentExecutor : IAgentExecutor
         _llm = llm ?? throw new ArgumentNullException(nameof(llm));
         _tools = tools ?? throw new ArgumentNullException(nameof(tools));
         _gate = gate ?? throw new ArgumentNullException(nameof(gate));
+        _schemaValidator = schemaValidator ?? throw new ArgumentNullException(nameof(schemaValidator));
         ArgumentNullException.ThrowIfNull(options);
         _options = options.Value;
         ArgumentException.ThrowIfNullOrWhiteSpace(_options.Model);
@@ -517,6 +520,37 @@ public sealed class AssistantAgentExecutor : IAgentExecutor
                 StartedAt = stepStartedAt,
                 CompletedAt = DateTime.UtcNow,
                 ErrorMessage = $"Tool '{call.ToolName}' is not registered.",
+                DurationMs = sw.ElapsedMilliseconds,
+            };
+            return await _store.AppendStepAsync(orgId, step, cancellationToken).ConfigureAwait(false);
+        }
+
+        // Phase 3.B turn-on: schema-validate args against the tool's
+        // declared ParameterSchema BEFORE dispatch (Phase 0 contract).
+        // Invalid args → AgentStep.Failed with a structured error the
+        // LLM can read in history + retry against. Decide-and-document #4
+        // REJECT semantics: validation failures are LLM-retry-recoverable,
+        // not operator-alert-worthy — Information-level logging only.
+        var schemaResult = _schemaValidator.Validate(tool.Descriptor.ParameterSchema, canonicalArgs);
+        if (!schemaResult.IsValid)
+        {
+            sw.Stop();
+            var schemaErrorMessage = $"Tool '{call.ToolName}': schema validation failed: {schemaResult.FirstError ?? "unknown error"}";
+            _logger.LogInformation(
+                "AgentRun {RunId} step {StepIndex}: schema validation rejected {Tool} args — {Reason}",
+                runId, stepIndex, call.ToolName, schemaResult.FirstError);
+            var step = new AgentStep
+            {
+                Id = Ulid.NewUlid().ToGuid(),
+                AgentRunId = runId,
+                StepIndex = stepIndex,
+                ToolName = call.ToolName,
+                ToolInputJson = canonicalArgs,
+                ToolOutputJson = null,
+                Status = AgentStepStatus.Failed,
+                StartedAt = stepStartedAt,
+                CompletedAt = DateTime.UtcNow,
+                ErrorMessage = schemaErrorMessage,
                 DurationMs = sw.ElapsedMilliseconds,
             };
             return await _store.AppendStepAsync(orgId, step, cancellationToken).ConfigureAwait(false);

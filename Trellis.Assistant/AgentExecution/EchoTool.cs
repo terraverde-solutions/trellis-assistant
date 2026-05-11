@@ -31,6 +31,7 @@ public sealed class EchoTool : IAgentTool
         ParameterSchema = """
         {
             "type": "object",
+            "additionalProperties": false,
             "properties": {
                 "text": {
                     "type": "string",

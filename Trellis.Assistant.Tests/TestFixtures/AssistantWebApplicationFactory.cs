@@ -91,6 +91,15 @@ public sealed class AssistantWebApplicationFactory : WebApplicationFactory<Progr
                 ["Auth:Authority"] = "http://test-host-unreachable/",
                 ["Auth:Audience"] = "trellis-assistant-test",
                 ["Auth:RequireHttpsMetadata"] = "false",
+                // Phase 3.B: SearchDocumentsTool is registered in the
+                // production DI graph and its typed HttpClient resolves
+                // at startup. A dummy BaseUrl keeps that resolution
+                // clean — endpoint tests don't actually round-trip to
+                // Trainer (no integration test crosses that boundary
+                // yet; HttpSearchClientTests covers the client in
+                // isolation with a stub handler).
+                ["Assistant:Trainer:BaseUrl"] = "http://test-host-unreachable:5114/",
+                ["Assistant:Trainer:RequestTimeoutSeconds"] = "30",
             });
         });
 

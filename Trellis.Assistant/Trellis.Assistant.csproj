@@ -51,6 +51,7 @@
          fleet. Microsoft.EntityFrameworkCore.Design is build-only (the
          design-time EF tooling for `dotnet ef migrations add`); marked
          PrivateAssets=all so it doesn't transitively flow to consumers. -->
+    <PackageReference Include="JsonSchema.Net" Version="9.2.0" />
     <PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="10.0.1">
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>

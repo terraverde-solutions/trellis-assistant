@@ -21,9 +21,12 @@ namespace Trellis.Assistant.AgentExecution;
 ///
 /// <para>
 /// JSON Schema validation of <see cref="AgentToolDescriptor.ParameterSchema"/>
-/// deferred to Phase 3.B when <c>SearchDocumentsTool</c> lands with a
-/// non-trivial arg shape. EchoTool's 1-property schema doesn't justify
-/// ~80 lines of JSON Schema parsing surface for v0.
+/// turned on in Phase 3.B (alongside <c>SearchDocumentsTool</c>): the
+/// registry's ctor calls
+/// <see cref="IJsonSchemaValidator.EnsureValidSchema"/> per tool,
+/// throwing on malformed schema strings so the host crashes at startup
+/// rather than letting a misconfigured tool surface as a 500 on first
+/// dispatch.
 /// </para>
 /// </summary>
 public interface IToolRegistry
