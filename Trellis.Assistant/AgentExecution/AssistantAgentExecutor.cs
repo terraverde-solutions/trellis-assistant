@@ -134,13 +134,14 @@ public sealed class AssistantAgentExecutor : IAgentExecutor
         var effectiveOverrides = WithAssistantDefaults(request.BudgetOverrides);
         var maxSteps = effectiveOverrides.MaxSteps ?? AssistantDefaultMaxSteps;
 
-        // Filter the request's tool catalogue to those we actually have
-        // registered. The planner sees only resolvable tools; an emitted
-        // tool_call for a name not in the registry surfaces as a Failed
-        // step inside the loop.
-        var resolvableTools = request.AvailableTools
-            .Where(d => _tools.GetTool(d.Name) is not null)
-            .ToList();
+        // Resolve the request's tool catalogue against the registry —
+        // Phase 3.C swaps placeholder descriptors (orchestrator-supplied
+        // for the conversation path) for the real ones the registered
+        // tool exposes. The LLM sees actual descriptions + schemas; the
+        // system prompt's tool-catalogue section enumerates these.
+        // Unknown names get dropped (the planner can't call what isn't
+        // resolvable).
+        var resolvableTools = ResolveDescriptors(request.AvailableTools);
         var planSummary = BuildPlanSummary(request.UserPrompt, maxSteps, resolvableTools);
 
         var runId = await PersistInitialRunAsync(
@@ -148,7 +149,7 @@ public sealed class AssistantAgentExecutor : IAgentExecutor
 
         var messages = new List<ChatMessage>(8)
         {
-            new() { Role = ChatRole.System, Content = _options.SystemPrompt },
+            new() { Role = ChatRole.System, Content = BuildSystemPromptWithCatalogue(resolvableTools) },
             new() { Role = ChatRole.User, Content = request.UserPrompt },
         };
 
@@ -252,13 +253,23 @@ public sealed class AssistantAgentExecutor : IAgentExecutor
         var effectiveOverrides = WithAssistantDefaults(budgetOverrides);
         var maxSteps = effectiveOverrides.MaxSteps ?? AssistantDefaultMaxSteps;
 
-        var resolvableTools = availableTools
-            .Where(d => _tools.GetTool(d.Name) is not null)
-            .ToList();
+        var resolvableTools = ResolveDescriptors(availableTools);
         var planSummary = BuildPlanSummary(userPrompt, maxSteps, resolvableTools);
 
         var runId = await PersistInitialRunAsync(
             orgId, assistantTurnId, planSummary, startedAt).ConfigureAwait(false);
+
+        // Phase 3.C: prepend the tool-aware system prompt to the
+        // conversation-path messages list. Phase 3.A.2 left this gap —
+        // the orchestrator built [...prior, user] but never injected a
+        // system prompt, so the LLM had no persona + no tool catalogue.
+        // Insert at index 0 so prior history (already in role order)
+        // follows naturally.
+        messages.Insert(0, new ChatMessage
+        {
+            Role = ChatRole.System,
+            Content = BuildSystemPromptWithCatalogue(resolvableTools),
+        });
 
         var loopResult = await ExecuteLoopAsync(
             runId, orgId, startedAt, messages, resolvableTools,
@@ -504,6 +515,14 @@ public sealed class AssistantAgentExecutor : IAgentExecutor
         var stepStartedAt = DateTime.UtcNow;
         var sw = Stopwatch.StartNew();
 
+        // Phase 3.C: operator-visible per-dispatch lifecycle log. Pairs
+        // with the succeeded/failed log below to surface tool latency +
+        // outcome in journalctl. Counter-based metrics (Prometheus,
+        // OpenTelemetry) deferred to Phase 3.D per hub's ratify.
+        _logger.LogInformation(
+            "AgentRun {RunId} step {StepIndex}: tool {Tool} dispatched.",
+            runId, stepIndex, call.ToolName);
+
         var tool = _tools.GetTool(call.ToolName);
         if (tool is null)
         {
@@ -623,11 +642,128 @@ public sealed class AssistantAgentExecutor : IAgentExecutor
             DurationMs = sw.ElapsedMilliseconds,
         };
 
+        // Phase 3.C: operator-visible per-dispatch outcome log.
+        // Information on success (with latency); Information on
+        // cancellation (user-disconnect / executor-timeout; not an
+        // operator-actionable failure); Warning on real failure (tool
+        // threw OR returned Success=false). PR #10 review Blocker 2:
+        // cancellation used to fire LogWarning, which would flood
+        // journalctl with noise on every user disconnect and mask real
+        // tool failures. The OCE-suppression pattern matches Macro 2 PR
+        // 6.7's `when (ex is not OperationCanceledException)` filter
+        // convention.
+        if (status == AgentStepStatus.Succeeded)
+        {
+            _logger.LogInformation(
+                "AgentRun {RunId} step {StepIndex}: tool {Tool} succeeded in {DurationMs}ms.",
+                runId, stepIndex, call.ToolName, sw.ElapsedMilliseconds);
+        }
+        else if (cancellationToken.IsCancellationRequested && threw)
+        {
+            _logger.LogInformation(
+                "AgentRun {RunId} step {StepIndex}: tool {Tool} cancelled after {DurationMs}ms.",
+                runId, stepIndex, call.ToolName, sw.ElapsedMilliseconds);
+        }
+        else
+        {
+            _logger.LogWarning(
+                "AgentRun {RunId} step {StepIndex}: tool {Tool} failed in {DurationMs}ms: {ErrorMessage}",
+                runId, stepIndex, call.ToolName, sw.ElapsedMilliseconds, errorMessage ?? "(no message)");
+        }
+
         return await _store
             .AppendStepAsync(orgId, persistedStep, threw && cancellationToken.IsCancellationRequested
                 ? CancellationToken.None
                 : cancellationToken)
             .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Phase 3.C: resolve a caller-supplied descriptor list against the
+    /// registry. The conversation orchestrator's
+    /// <c>BuildToolCatalogue</c> emits placeholder descriptors (Name is
+    /// real, Description + ParameterSchema are placeholders); the
+    /// standalone <c>POST /api/agent-runs</c> caller may supply real or
+    /// placeholder descriptors. Either way, the registry's actual
+    /// descriptor is what the LLM should see — that's what carries the
+    /// real description text + the real ParameterSchema.
+    ///
+    /// <para>
+    /// Unknown names (descriptor refers to a tool not in the registry)
+    /// are dropped silently — the planner can't dispatch what isn't
+    /// resolvable, and emitting an unknown-name tool_call would just
+    /// surface as a Failed step inside the loop. Cleaner to never tell
+    /// the planner about them.
+    /// </para>
+    /// </summary>
+    private IReadOnlyList<AgentToolDescriptor> ResolveDescriptors(
+        IReadOnlyList<AgentToolDescriptor> requested)
+    {
+        var resolved = new List<AgentToolDescriptor>(requested.Count);
+        foreach (var requestedDescriptor in requested)
+        {
+            var tool = _tools.GetTool(requestedDescriptor.Name);
+            if (tool is null)
+            {
+                continue;
+            }
+            resolved.Add(tool.Descriptor);
+        }
+        return resolved;
+    }
+
+    /// <summary>
+    /// Phase 3.C: compose the system prompt sent to the LLM as
+    /// <see cref="ChatRole.System"/> at the top of every loop iteration.
+    /// Built from <see cref="AssistantAgentExecutorOptions.SystemPrompt"/>
+    /// (the base persona / behavior text; operator-configurable via
+    /// <c>Assistant:Agent:SystemPrompt</c>) plus a dynamically-enumerated
+    /// catalogue of the resolvable tools — each tool's
+    /// <see cref="AgentToolDescriptor.Description"/> already carries
+    /// when-to-use guidance per Core's
+    /// <see cref="AgentToolDescriptor.Description"/> docstring contract,
+    /// so the catalogue section is "Name: Description" lines, no extra
+    /// editorial.
+    ///
+    /// <para>
+    /// When the resolvable set is empty (e.g., a caller explicitly
+    /// passed no tools — direct-LLM path doesn't reach here, but the
+    /// standalone agent-runs endpoint can land here with an empty
+    /// AvailableTools list), the catalogue section is omitted entirely;
+    /// the LLM gets just the base persona. This avoids a confusing
+    /// "Available tools: (none)" line that might make the model wonder
+    /// what it's supposed to do.
+    /// </para>
+    ///
+    /// <para>
+    /// Token budget: ~530 chars / ~135 tokens for the current 2-tool
+    /// catalogue (SearchDocumentsTool + EchoTool). Holds under hub's
+    /// 200-token cap up to ~12 tools at ~140 chars per tool descriptor.
+    /// Phase 3.D+ revisits if the catalogue grows past 5-7 tools, at
+    /// which point a "summary + dynamic tool-selection" pattern may
+    /// replace the full enumeration.
+    /// </para>
+    /// </summary>
+    private string BuildSystemPromptWithCatalogue(IReadOnlyList<AgentToolDescriptor> tools)
+    {
+        if (tools.Count == 0)
+        {
+            return _options.SystemPrompt;
+        }
+
+        var sb = new System.Text.StringBuilder(_options.SystemPrompt.Length + 128 * tools.Count);
+        sb.Append(_options.SystemPrompt);
+        sb.AppendLine();
+        sb.AppendLine();
+        sb.AppendLine("Available tools — use them when the user's request matches a tool's description:");
+        foreach (var tool in tools)
+        {
+            sb.Append("- ");
+            sb.Append(tool.Name);
+            sb.Append(": ");
+            sb.AppendLine(tool.Description);
+        }
+        return sb.ToString();
     }
 
     /// <summary>

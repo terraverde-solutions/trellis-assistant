@@ -619,6 +619,130 @@ public sealed class AssistantAgentExecutorTests : IClassFixture<PostgresFixture>
         }
     }
 
+    // ---------------- Phase 3.C: system prompt + descriptor resolution ----------------
+
+    [SkippableFact]
+    public async Task SystemPrompt_StandalonePath_InjectedAtMessagesIndexZero_WithToolCatalogue()
+    {
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        var llm = new StubAgentLlmClient()
+            .EnqueueAssistantText("ok.");
+        var executor = NewExecutor(llm);
+
+        var request = AgentRunRequest.Create(
+            orgId: TestOrgId,
+            userPrompt: "test prompt",
+            availableTools: new List<AgentToolDescriptor> { new EchoTool().Descriptor });
+
+        await executor.RunAsync(request);
+
+        llm.Calls.Should().HaveCount(1);
+        var call = llm.Calls[0];
+        call.MessageRoles[0].Should().Be(ChatRole.System,
+            "Phase 3.C contract: executor injects system prompt at messages[0]");
+    }
+
+    [SkippableFact]
+    public async Task SystemPrompt_IncludesToolCatalogue_WithNamesAndDescriptions()
+    {
+        // The system-prompt builder enumerates each resolvable tool's
+        // Name + Description so the LLM has natural-language guidance
+        // for when to invoke each tool (the function-calling protocol's
+        // tools array carries the full schema; this gives the LLM
+        // selection guidance).
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        var llm = new StubAgentLlmClient()
+            .EnqueueAssistantText("ok.");
+        var executor = NewExecutor(llm);
+
+        var request = AgentRunRequest.Create(
+            orgId: TestOrgId,
+            userPrompt: "x",
+            availableTools: new List<AgentToolDescriptor> { new EchoTool().Descriptor });
+
+        await executor.RunAsync(request);
+
+        llm.Calls.Should().HaveCount(1);
+        var systemPromptContent = llm.Calls[0].FirstMessageContent;
+        systemPromptContent.Should().Contain("Available tools",
+            "system prompt's catalogue section starts with 'Available tools' header");
+        systemPromptContent.Should().Contain(EchoTool.ToolName,
+            "system prompt enumerates each registered tool's Name");
+        systemPromptContent.Should().Contain("Echo the supplied text",
+            "system prompt enumerates each registered tool's Description (echo's description starts 'Echo the supplied text back...')");
+    }
+
+    [SkippableFact]
+    public async Task SystemPrompt_NoResolvableTools_FallsBackToBaseSystemPromptOnly()
+    {
+        // When the caller passes an empty AvailableTools list, the
+        // executor still injects messages[0] as System role but with
+        // the base persona only (no "Available tools:" section). This
+        // avoids confusing the model with "Available tools: (none)".
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        var llm = new StubAgentLlmClient()
+            .EnqueueAssistantText("ok.");
+        var executor = NewExecutor(llm);
+
+        var request = AgentRunRequest.Create(
+            orgId: TestOrgId,
+            userPrompt: "x",
+            availableTools: new List<AgentToolDescriptor>());  // empty
+
+        await executor.RunAsync(request);
+
+        llm.Calls.Should().HaveCount(1);
+        llm.Calls[0].MessageRoles[0].Should().Be(ChatRole.System,
+            "system prompt is still injected even with empty catalogue");
+        llm.Calls[0].ToolCount.Should().Be(0,
+            "empty AvailableTools → empty function-calling tool array");
+        llm.Calls[0].FirstMessageContent.Should().NotContain("Available tools",
+            "empty catalogue omits the 'Available tools' section entirely; avoids confusing the model with '(none)'");
+    }
+
+    [SkippableFact]
+    public async Task DescriptorResolution_PlaceholderDescriptorSwappedForRegisteredOne()
+    {
+        // Phase 3.C: ResolveDescriptors swaps caller-supplied placeholder
+        // descriptors (e.g., the orchestrator's "(filter placeholder for
+        // 'echo')" descriptions) for the registered tool's actual
+        // descriptor. The LLM sees the real description + real schema.
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        var llm = new StubAgentLlmClient()
+            .EnqueueAssistantText("ok.");
+        var executor = NewExecutor(llm);
+
+        // Caller supplies a placeholder descriptor (name matches a
+        // registered tool, but description + schema are deliberately
+        // wrong-shape).
+        var placeholderDescriptor = new AgentToolDescriptor
+        {
+            Name = EchoTool.ToolName,
+            Description = "WRONG DESCRIPTION — should be replaced by ResolveDescriptors",
+            ParameterSchema = """{"type":"object","additionalProperties":true}""",
+            Category = AgentToolCategory.Inspect,
+        };
+
+        var request = AgentRunRequest.Create(
+            orgId: TestOrgId,
+            userPrompt: "x",
+            availableTools: new List<AgentToolDescriptor> { placeholderDescriptor });
+
+        await executor.RunAsync(request);
+
+        llm.Calls.Should().HaveCount(1);
+        llm.Calls[0].ToolCount.Should().Be(1,
+            "the registered echo tool resolves through the placeholder, so one tool flows to the LLM");
+        llm.Calls[0].ToolDescriptions[0].Should().NotContain("WRONG DESCRIPTION",
+            "ResolveDescriptors swaps the caller's placeholder for the registry's real descriptor — placeholder description never reaches the LLM");
+        llm.Calls[0].ToolDescriptions[0].Should().Contain("Echo the supplied text",
+            "the real EchoTool descriptor's description text flows to the LLM");
+    }
+
     // ---------------- Phase 3.B turn-on: runtime schema validation gate ----------------
 
     [SkippableFact]
@@ -721,7 +845,16 @@ public sealed class AssistantAgentExecutorTests : IClassFixture<PostgresFixture>
             allTools.AddRange(extraTools);
         }
         var schemaValidator = new JsonSchemaNetValidator();
-        var registry = new ToolRegistry(allTools, schemaValidator);
+        // Phase 3.C: ExposeEcho=true for executor tests — they rely on
+        // EchoTool being the dispatched tool. The exposure filter only
+        // affects which descriptors appear in Registry.Descriptors;
+        // GetTool still resolves regardless, but executor tests build
+        // their own AvailableTools (via AgentRunRequest.Create) so they
+        // exercise the dispatch path directly. Setting ExposeEcho=true
+        // also makes Registry.Descriptors include echo for any test
+        // that asserts on the exposed catalogue.
+        var catalogueOptions = Options.Create(new ToolCatalogueOptions { ExposeEcho = true });
+        var registry = new ToolRegistry(allTools, schemaValidator, catalogueOptions);
         // Post-Phase-3.A.2 retrofit: default to Trellis.Core's
         // DefaultBudgetGate. Tests that need to capture the executor's
         // call-time AgentRunState pass a custom gate (used by the

@@ -173,14 +173,27 @@ public static class ConversationEndpoints
     public sealed record AppendTurnRequest(string Content)
     {
         /// <summary>
-        /// Phase 3.A.2: optional tool-name filter. Non-null + non-empty
-        /// routes the request through <see cref="AssistantAgentExecutor"/>
-        /// (the agent path: model can emit tool_calls; tool turns
-        /// persist inline as Role=Tool rows). Null/empty preserves the
-        /// Phase 2 direct-LLM path. The filter is intersected with the
-        /// host's registered tool catalogue — names not in the registry
-        /// are silently dropped. v0 ships only EchoTool; Phase 3.B adds
-        /// SearchDocumentsTool.
+        /// Optional tool-name filter governing the agent-path vs
+        /// direct-LLM routing decision. Phase 3.C Q1 Option A semantics:
+        /// <list type="bullet">
+        /// <item><c>null</c> (field omitted): routes through
+        /// <see cref="AssistantAgentExecutor"/> with the registry's full
+        /// exposed catalogue. Default callers get the agent loop
+        /// automatically.</item>
+        /// <item><c>[]</c> (explicit empty list): direct-LLM opt-out
+        /// — caller explicitly doesn't want tool overhead. Preserves
+        /// Phase 2 per-conversation-model semantics (uses the
+        /// conversation's pinned <c>Model</c>, not
+        /// <c>Assistant:Agent:Model</c>).</item>
+        /// <item><c>["name", ...]</c> (non-empty filter): agent path
+        /// with the supplied names. Unknown names are dropped at the
+        /// orchestrator's pre-resolution layer; if the resolved
+        /// catalogue is empty (all-unknowns), the request degrades to
+        /// the direct-LLM path.</item>
+        /// </list>
+        /// v0 ships <c>EchoTool</c> (test-only, gated by
+        /// <c>Assistant:Tools:ExposeEcho</c>) + <c>SearchDocumentsTool</c>
+        /// (production, always exposed).
         /// </summary>
         public IReadOnlyList<string>? Tools { get; init; }
     }

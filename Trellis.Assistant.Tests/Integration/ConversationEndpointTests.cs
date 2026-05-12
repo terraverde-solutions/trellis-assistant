@@ -1,9 +1,14 @@
 using System.Net;
 using System.Net.Http.Json;
 using FluentAssertions;
+using Microsoft.AspNetCore.TestHost;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Trellis.Assistant.Endpoints;
 using Trellis.Assistant.Middleware;
+using Trellis.Assistant.Services;
 using Trellis.Assistant.Tests.TestFixtures;
+using Trellis.Core.Services;
 using Xunit;
 
 namespace Trellis.Assistant.Tests.Integration;
@@ -199,7 +204,14 @@ public sealed class ConversationEndpointTests : IClassFixture<PostgresFixture>, 
         {
             var turnResp = await client.PostAsJsonAsync(
                 $"/api/conversations/{conv.Id}/turns",
-                new ConversationEndpoints.AppendTurnRequest(Content: $"turn {i}"));
+                new ConversationEndpoints.AppendTurnRequest(Content: $"turn {i}")
+                {
+                    // Phase 3.C: explicit Tools=[] opts into direct-LLM path
+                    // (preserves Phase 2 per-conversation-model semantics this
+                    // test was written against). Null would route through the
+                    // agent path under the new default.
+                    Tools = Array.Empty<string>(),
+                });
             turnResp.StatusCode.Should().Be(HttpStatusCode.OK,
                 $"turn {i} must succeed — Model immutability test depends on the append path executing cleanly");
         }
@@ -227,7 +239,10 @@ public sealed class ConversationEndpointTests : IClassFixture<PostgresFixture>, 
 
         var turnResp = await client.PostAsJsonAsync(
             $"/api/conversations/{conv!.Id}/turns",
-            new ConversationEndpoints.AppendTurnRequest(Content: "Hello, assistant!"));
+            new ConversationEndpoints.AppendTurnRequest(Content: "Hello, assistant!")
+            {
+                Tools = Array.Empty<string>(),  // Phase 3.C: opt into direct-LLM path
+            });
         turnResp.StatusCode.Should().Be(HttpStatusCode.OK);
 
         var turnBody = await turnResp.Content.ReadFromJsonAsync<ConversationEndpoints.AppendTurnResponse>();
@@ -259,7 +274,10 @@ public sealed class ConversationEndpointTests : IClassFixture<PostgresFixture>, 
         var bogusUlid = Ulid.NewUlid().ToString();
         var resp = await client.PostAsJsonAsync(
             $"/api/conversations/{bogusUlid}/turns",
-            new ConversationEndpoints.AppendTurnRequest(Content: "anyone home?"));
+            new ConversationEndpoints.AppendTurnRequest(Content: "anyone home?")
+            {
+                Tools = Array.Empty<string>(),  // Phase 3.C: opt into direct-LLM path
+            });
         resp.StatusCode.Should().Be(HttpStatusCode.NotFound);
     }
 
@@ -275,7 +293,10 @@ public sealed class ConversationEndpointTests : IClassFixture<PostgresFixture>, 
 
         var resp = await client.PostAsJsonAsync(
             $"/api/conversations/{conv!.Id}/turns",
-            new ConversationEndpoints.AppendTurnRequest(Content: "   "));
+            new ConversationEndpoints.AppendTurnRequest(Content: "   ")
+            {
+                Tools = Array.Empty<string>(),  // Phase 3.C: opt into direct-LLM path
+            });
         resp.StatusCode.Should().Be(HttpStatusCode.BadRequest);
     }
 
@@ -351,7 +372,10 @@ public sealed class ConversationEndpointTests : IClassFixture<PostgresFixture>, 
             var c = NewClient();
             return c.PostAsJsonAsync(
                 $"/api/conversations/{conv!.Id}/turns",
-                new ConversationEndpoints.AppendTurnRequest(Content: $"concurrent message {i}"));
+                new ConversationEndpoints.AppendTurnRequest(Content: $"concurrent message {i}")
+                {
+                    Tools = Array.Empty<string>(),  // Phase 3.C: opt into direct-LLM path
+                });
         }).ToArray();
 
         var responses = await Task.WhenAll(tasks);
@@ -427,6 +451,175 @@ public sealed class ConversationEndpointTests : IClassFixture<PostgresFixture>, 
     }
 
     // ---------------- Phase 3.A.2 agent-path tests ----------------
+
+    // ---------------- Phase 3.C: routing defaults + live agent loop ----------------
+
+    [SkippableFact]
+    public async Task PostTurns_NullToolsFilter_RoutesThroughAgentPath_WithFullExposedCatalogue()
+    {
+        // Phase 3.C Q1 Option A: null Tools (omitted from request body)
+        // routes to the agent path with the registry's full exposed
+        // catalogue. Test env has ExposeEcho=true so both EchoTool +
+        // SearchDocumentsTool are exposed. The agent LLM stub receives
+        // tools.Count == 2; the conversation orchestrator did NOT
+        // require the caller to pass Tools.
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        _factory!.AgentLlmStub
+            .EnqueueAssistantText("Default-route answer.");
+
+        using var client = NewClient();
+        var convResp = await client.PostAsJsonAsync("/api/conversations",
+            new ConversationEndpoints.CreateConversationRequest(Channel: "api"));
+        var conv = await convResp.Content.ReadFromJsonAsync<ConversationEndpoints.CreateConversationResponse>();
+
+        // Note: Tools field deliberately OMITTED — null route.
+        var turnResp = await client.PostAsJsonAsync(
+            $"/api/conversations/{conv!.Id}/turns",
+            new ConversationEndpoints.AppendTurnRequest("Question without explicit tools filter."));
+        turnResp.StatusCode.Should().Be(HttpStatusCode.OK);
+
+        _factory.AgentLlmStub.Calls.Should().HaveCount(1,
+            "null Tools routes through the agent path → IAgentLlmClient.ChatWithToolsAsync invoked");
+        _factory.AgentLlmStub.Calls[0].ToolCount.Should().BeGreaterThan(0,
+            "exposed catalogue (EchoTool + SearchDocumentsTool in test env) flows to the LLM");
+    }
+
+    [SkippableFact]
+    public async Task PostTurns_NullToolsFilter_DefaultRoute_LLMSeesSearchDocumentsInCatalogue()
+    {
+        // Phase 3.C hub example: "a conversation turn asking 'what's our
+        // refund policy?' should know search_documents is available."
+        // Pin: default-route system prompt enumerates search_documents
+        // + the function-calling tools array carries it. The model
+        // could then emit a tool_call (in a full integration with a
+        // real tool-aware LLM); the stub returns text directly, but
+        // we pin that the catalogue WAS surfaced.
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        _factory!.AgentLlmStub
+            .EnqueueAssistantText("(answer)");
+
+        using var client = NewClient();
+        var convResp = await client.PostAsJsonAsync("/api/conversations",
+            new ConversationEndpoints.CreateConversationRequest(Channel: "api"));
+        var conv = await convResp.Content.ReadFromJsonAsync<ConversationEndpoints.CreateConversationResponse>();
+
+        await client.PostAsJsonAsync(
+            $"/api/conversations/{conv!.Id}/turns",
+            new ConversationEndpoints.AppendTurnRequest("What's our refund policy?"));
+
+        var call = _factory.AgentLlmStub.Calls[0];
+        call.FirstMessageContent.Should().Contain("search_documents",
+            "system prompt enumerates the registered search_documents tool — LLM knows it's available without caller telling it");
+        call.ToolDescriptions.Should().Contain(d => d.Contains("indexed document corpus"),
+            "function-calling tools array carries search_documents's actual description for the LLM to reason about");
+    }
+
+    [SkippableFact]
+    public async Task ConversationTurn_AskingForDocumentLookup_InvokesSearchDocumentsAndReturnsAugmentedReply()
+    {
+        // PR #10 review Blocker 3: the real Phase 3.C E2E. Hub's brief
+        // explicitly required exercising the full dispatch chain:
+        //   stub LLM emits tool_call("search_documents", {...}) →
+        //   executor dispatches SearchDocumentsTool →
+        //   ISearchClient (stubbed) returns canned chunks →
+        //   second LLM turn returns augmented text →
+        //   AgentRun persisted with 2 LLM calls + 1 step + 3 turns.
+        // The original PR landed without the ISearchClient stub wired in
+        // (a live dispatch would have tried HTTP to a dummy host) so this
+        // chain was never exercised under test. This is the pin that
+        // closes that gap.
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        _factory!.SearchClientStub.NextResult = new SearchClientResult
+        {
+            Success = true,
+            ResponseBodyJson = """[{"DocumentId":"doc1","ChunkContent":"Refunds accepted within 30 days of purchase.","Score":0.97}]""",
+        };
+        _factory.AgentLlmStub
+            .EnqueueToolCall("search_documents", """{"query":"refund policy"}""")
+            .EnqueueAssistantText("Refunds within 30 days.");
+
+        using var client = NewClient();
+        var convResp = await client.PostAsJsonAsync("/api/conversations",
+            new ConversationEndpoints.CreateConversationRequest(Channel: "api"));
+        var conv = await convResp.Content.ReadFromJsonAsync<ConversationEndpoints.CreateConversationResponse>();
+
+        // Tools deliberately OMITTED — default route. The LLM stub emits
+        // search_documents on the first call because we scripted it; in a
+        // real LLM the system prompt's tool catalogue is what guides the
+        // model to pick search_documents (see
+        // PostTurns_NullToolsFilter_DefaultRoute_LLMSeesSearchDocumentsInCatalogue).
+        var turnResp = await client.PostAsJsonAsync(
+            $"/api/conversations/{conv!.Id}/turns",
+            new ConversationEndpoints.AppendTurnRequest("What is the refund policy?"));
+        turnResp.StatusCode.Should().Be(HttpStatusCode.OK);
+
+        var turnBody = await turnResp.Content.ReadFromJsonAsync<ConversationEndpoints.AppendTurnResponse>();
+        turnBody!.AssistantTurn.Content.Should().Contain("Refunds within 30 days",
+            "the second LLM call's assistant text — produced AFTER the tool result was inserted into the loop's message history — surfaces as the conversation's assistant turn");
+        turnBody.ToolTurns.Should().NotBeNull("agent path populated ToolTurns");
+        turnBody.ToolTurns!.Should().HaveCount(1, "exactly one tool dispatch was scripted");
+        turnBody.ToolTurns![0].ToolName.Should().Be("search_documents",
+            "the LLM's emitted tool_call name flowed through to the persisted Tool turn");
+        turnBody.ToolTurns![0].Content.Should().Contain("Refunds accepted within 30 days",
+            "the ISearchClient stub's canned response flowed through SearchDocumentsTool → AgentToolOutput → ToolTurn.Content");
+
+        // Position contiguity pin: user=0, tool=1, assistant=2.
+        turnBody.UserTurn.Position.Should().Be(0);
+        turnBody.ToolTurns![0].Position.Should().Be(1);
+        turnBody.AssistantTurn.Position.Should().Be(2);
+
+        // GET reads the full chain inline.
+        var getBody = (await (await client.GetAsync($"/api/conversations/{conv.Id}"))
+            .Content.ReadFromJsonAsync<ConversationEndpoints.GetConversationResponse>())!;
+        getBody.Turns.Should().HaveCount(3,
+            "GET returns the full [user, tool, assistant] chain in position order");
+
+        // 2 LLM calls: first emitted tool_call, second consumed the
+        // tool result + emitted final assistant text.
+        _factory.AgentLlmStub.Calls.Should().HaveCount(2,
+            "agent loop iterated twice: tool_call dispatch → result back into history → final assistant text");
+
+        // The stub ISearchClient captured the LLM-emitted query verbatim.
+        _factory.SearchClientStub.LastQuery.Should().NotBeNull();
+        _factory.SearchClientStub.LastQuery!.Q.Should().Be("refund policy",
+            "the LLM's tool_call arguments flowed through MapToSearchQuery → ISearchClient.SearchAsync with the query preserved");
+    }
+
+    [SkippableFact]
+    public async Task PostTurns_EmptyToolsArray_PreservesDirectLlmPath_PhaseThreeC()
+    {
+        // Phase 3.C Q1 Option A: Tools = [] (explicit empty list) is the
+        // direct-LLM opt-out. Caller doesn't want tool overhead → use
+        // the conversation's pinned Model directly. IOllamaClient (the
+        // direct-LLM stub) is called; IAgentLlmClient is NOT.
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        var agentCallsBefore = _factory!.AgentLlmStub.Calls.Count;
+
+        using var client = NewClient();
+        var convResp = await client.PostAsJsonAsync("/api/conversations",
+            new ConversationEndpoints.CreateConversationRequest(Channel: "api"));
+        var conv = await convResp.Content.ReadFromJsonAsync<ConversationEndpoints.CreateConversationResponse>();
+
+        var turnResp = await client.PostAsJsonAsync(
+            $"/api/conversations/{conv!.Id}/turns",
+            new ConversationEndpoints.AppendTurnRequest("just chat, no tools")
+            {
+                Tools = Array.Empty<string>(),
+            });
+        turnResp.StatusCode.Should().Be(HttpStatusCode.OK);
+
+        _factory.AgentLlmStub.Calls.Count.Should().Be(agentCallsBefore,
+            "Tools = [] opts out of the agent path; IAgentLlmClient is NOT invoked");
+
+        var turnBody = await turnResp.Content.ReadFromJsonAsync<ConversationEndpoints.AppendTurnResponse>();
+        turnBody!.ToolTurns.Should().BeNull("direct-LLM path leaves ToolTurns null");
+        turnBody.AssistantTurn.Content.Should().Contain("Stub assistant reply",
+            "direct-LLM path returned the IOllamaClient stub's canned text");
+    }
 
     [SkippableFact]
     public async Task Conversation_AgentPath_PersistsToolTurnInline_AndGetReturnsItInTurnsArray()
@@ -512,7 +705,10 @@ public sealed class ConversationEndpointTests : IClassFixture<PostgresFixture>, 
         // NOT be invoked; the StubLlmClient (text streaming) handles it.
         var turnResp = await client.PostAsJsonAsync(
             $"/api/conversations/{conv!.Id}/turns",
-            new ConversationEndpoints.AppendTurnRequest("plain question, no tools"));
+            new ConversationEndpoints.AppendTurnRequest("plain question, no tools")
+            {
+                Tools = Array.Empty<string>(),  // Phase 3.C: opt into direct-LLM path
+            });
         turnResp.StatusCode.Should().Be(HttpStatusCode.OK);
 
         var turnBody = await turnResp.Content.ReadFromJsonAsync<ConversationEndpoints.AppendTurnResponse>();
@@ -525,11 +721,16 @@ public sealed class ConversationEndpointTests : IClassFixture<PostgresFixture>, 
     }
 
     [SkippableFact]
-    public async Task PostTurns_WithEmptyToolsArray_PreservesPhase2DirectLlmPath()
+    public async Task PostTurns_FilterRouteWithAllUnknownNames_DegradesToDirectLlmPath()
     {
-        // Sister pin: empty Tools array (caller sent the field but no
-        // names) is treated identically to null — direct-LLM path.
+        // PR #10 review polish: pins the Blocker 1 fix. A filter of
+        // all-unknown names pre-resolves to empty (the registry doesn't
+        // know any of them), so the orchestrator degrades to the
+        // direct-LLM path instead of running the executor with zero
+        // tools.
         Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        var agentCallsBefore = _factory!.AgentLlmStub.Calls.Count;
 
         using var client = NewClient();
         var convResp = await client.PostAsJsonAsync("/api/conversations",
@@ -538,16 +739,107 @@ public sealed class ConversationEndpointTests : IClassFixture<PostgresFixture>, 
 
         var turnResp = await client.PostAsJsonAsync(
             $"/api/conversations/{conv!.Id}/turns",
-            new ConversationEndpoints.AppendTurnRequest("question")
+            new ConversationEndpoints.AppendTurnRequest("question with ghost tools")
             {
-                Tools = Array.Empty<string>(),
+                Tools = new[] { "ghost_tool", "phantom_tool" },
             });
         turnResp.StatusCode.Should().Be(HttpStatusCode.OK);
 
+        _factory.AgentLlmStub.Calls.Count.Should().Be(agentCallsBefore,
+            "all-unknown filter resolves to empty catalogue; orchestrator degrades to direct-LLM and never invokes IAgentLlmClient");
+
         var turnBody = await turnResp.Content.ReadFromJsonAsync<ConversationEndpoints.AppendTurnResponse>();
-        turnBody!.ToolTurns.Should().BeNull();
-        _factory!.AgentLlmStub.Calls.Should().BeEmpty();
+        turnBody!.ToolTurns.Should().BeNull("direct-LLM path leaves ToolTurns null");
+        turnBody.AssistantTurn.Content.Should().Contain("Stub assistant reply",
+            "direct-LLM path returned the IOllamaClient stub's canned text");
     }
+
+    [SkippableFact]
+    public async Task PostTurns_FilterWithSearchDocuments_RoutesAgentPathWithFilter()
+    {
+        // PR #10 review polish: filter route was only tested with
+        // EchoTool. This pins SearchDocumentsTool through the same
+        // filter route — the registry resolves it + the executor flows
+        // it to the LLM. Stub LLM returns final text (no tool_call
+        // emitted) so we don't need to script the full dispatch chain
+        // here — the ConversationTurn_AskingForDocumentLookup_... test
+        // above covers full dispatch.
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        _factory!.AgentLlmStub
+            .EnqueueAssistantText("(no tool needed for this one).");
+
+        using var client = NewClient();
+        var convResp = await client.PostAsJsonAsync("/api/conversations",
+            new ConversationEndpoints.CreateConversationRequest(Channel: "api"));
+        var conv = await convResp.Content.ReadFromJsonAsync<ConversationEndpoints.CreateConversationResponse>();
+
+        var turnResp = await client.PostAsJsonAsync(
+            $"/api/conversations/{conv!.Id}/turns",
+            new ConversationEndpoints.AppendTurnRequest("filter route with search_documents")
+            {
+                Tools = new[] { "search_documents" },
+            });
+        turnResp.StatusCode.Should().Be(HttpStatusCode.OK);
+
+        _factory.AgentLlmStub.Calls.Should().HaveCount(1);
+        var call = _factory.AgentLlmStub.Calls[0];
+        call.ToolCount.Should().Be(1, "filter resolved to exactly search_documents");
+        call.ToolDescriptions[0].Should().Contain("indexed document corpus",
+            "filter-route descriptor resolved through registry — LLM sees the real description");
+    }
+
+    [SkippableFact]
+    public async Task PostTurns_NullTools_EmptyExposedCatalogue_DegradesToDirectLlmPath()
+    {
+        // PR #10 review polish: pins the null-route + empty-catalogue
+        // degradation contract. Uses WithWebHostBuilder to override DI
+        // for this test only — removes all IAgentTool registrations so
+        // the registry's exposed Descriptors list is empty. The
+        // orchestrator's null route then sees Descriptors.Count == 0
+        // and falls back to the direct-LLM path.
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        var customFactory = _factory!.WithWebHostBuilder(builder =>
+        {
+            builder.ConfigureTestServices(services =>
+            {
+                services.RemoveAll<IAgentTool>();
+            });
+        });
+
+        using var client = customFactory.CreateClient();
+        client.DefaultRequestHeaders.Add("X-Trellis-Tenant-Id", TestTenants.TenantA);
+        client.DefaultRequestHeaders.Add("X-Trellis-User-Id", TestTenants.UserA);
+
+        var convResp = await client.PostAsJsonAsync("/api/conversations",
+            new ConversationEndpoints.CreateConversationRequest(Channel: "api"));
+        var conv = await convResp.Content.ReadFromJsonAsync<ConversationEndpoints.CreateConversationResponse>();
+
+        var agentCallsBefore = _factory.AgentLlmStub.Calls.Count;
+
+        var turnResp = await client.PostAsJsonAsync(
+            $"/api/conversations/{conv!.Id}/turns",
+            new ConversationEndpoints.AppendTurnRequest("question with no exposed tools available"));
+        turnResp.StatusCode.Should().Be(HttpStatusCode.OK);
+
+        _factory.AgentLlmStub.Calls.Count.Should().Be(agentCallsBefore,
+            "null Tools + empty exposed catalogue degrades to direct-LLM; IAgentLlmClient is NOT invoked");
+
+        var turnBody = await turnResp.Content.ReadFromJsonAsync<ConversationEndpoints.AppendTurnResponse>();
+        turnBody!.ToolTurns.Should().BeNull("direct-LLM path leaves ToolTurns null");
+        turnBody.AssistantTurn.Content.Should().Contain("Stub assistant reply");
+    }
+
+    // NOTE: The pre-Phase-3.C Phase 3.A.2 sister pin
+    // `PostTurns_WithEmptyToolsArray_PreservesPhase2DirectLlmPath` was
+    // consolidated into the Phase 3.C-named test
+    // `PostTurns_EmptyToolsArray_PreservesDirectLlmPath_PhaseThreeC`
+    // above (same shape, stronger assertions: explicit "no agent stub
+    // calls" + canonical-text content check). Hub's PR #10 review
+    // Blocker 4 #3 asked to rename + update the stale comment; rather
+    // than carry two redundant pins, the cleaner consolidation is one
+    // canonical Phase 3.C pin.
 
     [SkippableFact]
     public async Task Conversation_AgentPath_AcrossMultipleTurns_HistoryIncludesPriorToolTurns()
@@ -660,9 +952,18 @@ public sealed class ConversationEndpointTests : IClassFixture<PostgresFixture>, 
         secondRoundFirstCall.MessageRoles.Should().Contain(
             Trellis.Core.Models.ChatRole.Tool,
             "round 2's history-to-messages translation must surface the prior persisted Tool turn as ChatRole.Tool — Phase 3.A.2 bridge resolves architectural divergence #4");
-        secondRoundFirstCall.MessageRoles.Should().NotContain(
+
+        // Phase 3.C: the executor now injects a tool-aware system prompt
+        // at messages[0]. The prior tool turn must NOT be re-rendered as
+        // ChatRole.System — that was the pre-bridge workaround. Pin the
+        // negative assertion at the prior-turn slice (skip messages[0]
+        // which is the legitimate Phase 3.C system-prompt injection).
+        secondRoundFirstCall.MessageRoles.Skip(1).Should().NotContain(
             Trellis.Core.Models.ChatRole.System,
-            "round 2's history must NOT carry ChatRole.System for the prior tool turn — that was the pre-bridge workaround we're flipping away from. (System role still appears in messages for genuinely system-role turns; this assertion holds because round 1 had no System turn.)");
+            "round 2's history must NOT carry ChatRole.System for the prior tool turn — that was the pre-bridge workaround we're flipping away from. messages[0] is the Phase 3.C executor-injected system prompt + is excluded from this check.");
+        secondRoundFirstCall.MessageRoles[0].Should().Be(
+            Trellis.Core.Models.ChatRole.System,
+            "Phase 3.C: the executor injects a tool-aware system prompt at messages[0] for both the standalone + conversation-integrated agent paths");
     }
 
     [SkippableFact]
@@ -765,7 +1066,10 @@ public sealed class ConversationEndpointTests : IClassFixture<PostgresFixture>, 
         using var sibling = NewClient(tenantId: TestTenants.TenantA, userId: TestTenants.UserB);
         var resp = await sibling.PostAsJsonAsync(
             $"/api/conversations/{conv!.Id}/turns",
-            new ConversationEndpoints.AppendTurnRequest(Content: "intruding"));
+            new ConversationEndpoints.AppendTurnRequest(Content: "intruding")
+            {
+                Tools = Array.Empty<string>(),  // Phase 3.C: opt into direct-LLM path
+            });
         resp.StatusCode.Should().Be(HttpStatusCode.NotFound);
     }
 }

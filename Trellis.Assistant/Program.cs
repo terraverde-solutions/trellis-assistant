@@ -35,6 +35,15 @@ builder.Services
     .Bind(builder.Configuration.GetSection(TrainerSearchOptions.SectionName))
     .ValidateDataAnnotations();
 
+// Phase 3.C: tool catalogue exposure flags. Bound from "Assistant:Tools".
+// Per-tool boolean knobs control which registered tools the LLM sees in
+// the function-calling tool array. Tools stay dispatchable via
+// IToolRegistry.GetTool regardless — exposure only gates LLM visibility.
+builder.Services
+    .AddOptions<ToolCatalogueOptions>()
+    .Bind(builder.Configuration.GetSection(ToolCatalogueOptions.SectionName))
+    .ValidateDataAnnotations();
+
 // ---------------- Postgres + EF Core ----------------
 //
 // ConnectionStrings:Postgres carries the trellis_assistant_qa role + DB

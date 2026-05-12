@@ -66,7 +66,9 @@ public sealed class StubAgentLlmClient : IAgentLlmClient
             MessageCount: messages.Count,
             ToolCount: tools.Count,
             LastMessageContent: messages.Count > 0 ? messages[^1].Content : "",
-            MessageRoles: messages.Select(m => m.Role).ToList()));
+            FirstMessageContent: messages.Count > 0 ? messages[0].Content : "",
+            MessageRoles: messages.Select(m => m.Role).ToList(),
+            ToolDescriptions: tools.Select(t => t.Description).ToList()));
         var response = _scriptedResponses.Count > 0 ? _scriptedResponses.Dequeue() : FallbackResponse;
         return Task.FromResult(response);
     }
@@ -83,5 +85,7 @@ public sealed class StubAgentLlmClient : IAgentLlmClient
         int MessageCount,
         int ToolCount,
         string LastMessageContent,
-        IReadOnlyList<ChatRole> MessageRoles);
+        string FirstMessageContent,
+        IReadOnlyList<ChatRole> MessageRoles,
+        IReadOnlyList<string> ToolDescriptions);
 }

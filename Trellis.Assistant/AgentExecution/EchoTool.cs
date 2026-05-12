@@ -21,9 +21,17 @@ namespace Trellis.Assistant.AgentExecution;
 /// </summary>
 public sealed class EchoTool : IAgentTool
 {
+    /// <summary>
+    /// Stable name string — mirrors <see cref="SearchDocumentsTool.ToolName"/>'s
+    /// pattern. Used by <see cref="ToolRegistry"/>'s Phase 3.C exposure
+    /// filter (<see cref="ToolCatalogueOptions.ExposeEcho"/>) to identify
+    /// this tool by descriptor name without string-literal duplication.
+    /// </summary>
+    public const string ToolName = "echo";
+
     public AgentToolDescriptor Descriptor { get; } = new()
     {
-        Name = "echo",
+        Name = ToolName,
         Description =
             "Echo the supplied text back in a structured response. Use this when you want " +
             "to confirm the agent loop is dispatching tools correctly without invoking any " +
