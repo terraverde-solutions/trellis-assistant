@@ -65,15 +65,18 @@ public sealed class ConversationOrchestrator
     private readonly IAssistantConversationStore _store;
     private readonly IOllamaClient _llm;
     private readonly AssistantAgentExecutor _agentExecutor;
+    private readonly IToolRegistry _toolRegistry;
 
     public ConversationOrchestrator(
         IAssistantConversationStore store,
         IOllamaClient llm,
-        AssistantAgentExecutor agentExecutor)
+        AssistantAgentExecutor agentExecutor,
+        IToolRegistry toolRegistry)
     {
         _store = store ?? throw new ArgumentNullException(nameof(store));
         _llm = llm ?? throw new ArgumentNullException(nameof(llm));
         _agentExecutor = agentExecutor ?? throw new ArgumentNullException(nameof(agentExecutor));
+        _toolRegistry = toolRegistry ?? throw new ArgumentNullException(nameof(toolRegistry));
     }
 
     /// <summary>
@@ -124,17 +127,73 @@ public sealed class ConversationOrchestrator
             .GetTurnsAsync(tenantId, userId, conversationId, cancellationToken)
             .ConfigureAwait(false);
 
-        // Phase 3.A.2: route through the agent executor when the request
-        // specifies a tools filter. Non-null + non-empty → agent path.
-        // Null/empty → existing Phase 2 direct-LLM path (preserved).
-        var useAgentPath = toolNameFilter is { Count: > 0 };
-        if (useAgentPath)
+        // Phase 3.C routing (Q1 Option A — ratified):
+        //   - toolNameFilter == null    → agent path with the full
+        //                                  exposed registry catalogue.
+        //                                  "Default" — caller doesn't
+        //                                  have to know which tools exist
+        //                                  to benefit from them.
+        //   - toolNameFilter.Count == 0 → direct-LLM path ("just chat"
+        //                                  opt-out — channel adapters or
+        //                                  callers that explicitly don't
+        //                                  want tool overhead).
+        //   - toolNameFilter.Count > 0  → agent path with the supplied
+        //                                  filter (intersected with the
+        //                                  registry's exposed set
+        //                                  inside the executor).
+        //
+        // The null vs empty-list semantics let callers express intent
+        // without an extra "useTools: bool" field. Phase 3.A.2 routed
+        // only on non-empty filter; Phase 3.C upgrades to "null means
+        // use what's available" so default callers get the agent loop
+        // automatically. See docs/phase-3c-design.md for the full
+        // routing-decision rationale.
+        IReadOnlyList<AgentToolDescriptor>? agentDescriptors = null;
+        if (toolNameFilter is null)
+        {
+            // Default route: full exposed catalogue.
+            agentDescriptors = _toolRegistry.Descriptors;
+        }
+        else if (toolNameFilter.Count > 0)
+        {
+            // Filter route: pre-resolve via the registry so the
+            // empty-catalogue degradation check below sees the *resolved*
+            // count, not the placeholder count. PR #10 review Blocker 1:
+            // without pre-resolution, a filter of all-unknown names
+            // produced a non-empty placeholder list, slipped past the
+            // degradation guard, then resolved to empty inside the
+            // executor — running the agent loop with zero tools against
+            // Assistant:Agent:Model. Resolving here keeps "filter +
+            // all-unknowns → direct-LLM" honest at the routing layer.
+            agentDescriptors = toolNameFilter
+                .Select(name => _toolRegistry.GetTool(name)?.Descriptor)
+                .Where(d => d is not null)
+                .Select(d => d!)
+                .ToList();
+        }
+
+        // Empty-catalogue degradation: if the resolved descriptor list
+        // is empty (e.g., no exposed tools in this environment, or the
+        // caller's filter intersected to nothing), the agent path would
+        // run the LLM with an empty function-calling tool array — which
+        // is functionally equivalent to the direct-LLM path but with
+        // executor + budget-gate overhead and a different model
+        // (Assistant:Agent:Model). Degrading to direct-LLM in this case
+        // is the correct semantic: "no tools to choose from" matches
+        // "no tool dispatch" naturally, and preserves the Phase 2
+        // per-conversation-model contract for tool-less environments.
+        // The model can't emit a tool_call for tools it doesn't see,
+        // so there's no behavior change beyond the model selection.
+        if (agentDescriptors is { Count: > 0 })
         {
             return await HandleAgentPathAsync(
                 tenantId, userId, conversationId, conv, prior, userContent,
-                toolNameFilter!, cancellationToken).ConfigureAwait(false);
+                agentDescriptors, cancellationToken).ConfigureAwait(false);
         }
 
+        // toolNameFilter is non-null + empty → explicit opt-out, OR
+        // null but no exposed tools → degraded direct-LLM. Either way,
+        // run the direct-LLM path against the conversation's pinned model.
         return await HandleDirectLlmPathAsync(
             tenantId, userId, conversationId, conv, prior, userContent,
             cancellationToken).ConfigureAwait(false);
@@ -221,12 +280,15 @@ public sealed class ConversationOrchestrator
         AssistantConversation conv,
         IReadOnlyList<AssistantTurn> prior,
         string userContent,
-        IReadOnlyList<string> toolNameFilter,
+        IReadOnlyList<AgentToolDescriptor> availableTools,
         CancellationToken cancellationToken)
     {
-        // Build messages from prior turns + new user message. Same
-        // shape as the direct-LLM path; the executor adds its own
-        // system prompt internally.
+        // Build messages from prior turns + new user message. Phase 3.C:
+        // the executor prepends its own tool-aware system prompt at
+        // messages[0] inside RunForConversationAsync — we deliberately do
+        // NOT inject one here, so executors can compose a system prompt
+        // that reflects the actual resolvable tool catalogue (which the
+        // executor knows about via its IToolRegistry dependency).
         var messages = new List<ChatMessage>(prior.Count + 1);
         foreach (var t in prior)
         {
@@ -247,12 +309,12 @@ public sealed class ConversationOrchestrator
                 $"TenantId '{tenantId}' is not uuid-shaped — agent-path requires uuid tenantIds per Phase 3.A C1 contract. Endpoint layer should have rejected this earlier.");
         }
 
-        // Build the tool descriptor catalogue from the registered tool set
-        // intersected with the caller's filter. The executor filters again
-        // internally (resolvableTools), so a name in the filter that isn't
-        // registered just gets dropped by the planner side.
-        var allTools = _agentExecutor is { } _;  // suppress unused-var warning; _agentExecutor used below
-        var availableTools = BuildToolCatalogue(toolNameFilter);
+        // Phase 3.C: availableTools are already descriptors — either the
+        // registry's exposed Descriptors (default route, toolNameFilter==null)
+        // OR placeholder descriptors built from the caller's explicit name
+        // list (filter route). The executor's ResolveDescriptors swaps
+        // placeholders for registered descriptors before passing to the
+        // LLM, so the LLM always sees real descriptions + schemas.
 
         var result = await _agentExecutor.RunForConversationAsync(
             orgId: orgId,
@@ -311,38 +373,14 @@ public sealed class ConversationOrchestrator
         return new TurnPairResult(userTurn, assistantTurn) { ToolTurns = toolTurns };
     }
 
-    /// <summary>
-    /// Build the agent-path tool descriptor catalogue. The orchestrator
-    /// only knows tool NAMES from the request body; it asks the executor
-    /// (via the registry surface) to resolve them. Phase 3.A.2 keeps this
-    /// simple: pass an empty descriptor list when the filter is empty
-    /// (lets the executor's resolvableTools filter handle the rest).
-    /// </summary>
-    private static IReadOnlyList<AgentToolDescriptor> BuildToolCatalogue(
-        IReadOnlyList<string> filter)
-    {
-        // The executor filters internally based on registered tool names.
-        // We pass placeholder descriptors carrying the requested names —
-        // the executor's `resolvableTools` filter intersects with the
-        // actual registry, so unknown names get dropped before the LLM
-        // sees them. ParameterSchema is filled by the executor at the
-        // tools-array build site (OllamaAgentLlmClient pulls from each
-        // registered IAgentTool's Descriptor when constructing the
-        // function-calling wire body — placeholder ParameterSchema
-        // here is overridden when the registry resolves the actual tool).
-        //
-        // Phase 3.B may surface a richer "filter by name" call on the
-        // registry directly to avoid this placeholder shape. For 3.A.2,
-        // the placeholder works because OllamaAgentLlmClient looks up
-        // descriptors by name when building the wire body.
-        return filter.Select(name => new AgentToolDescriptor
-        {
-            Name = name,
-            Description = $"(filter placeholder for '{name}'; executor resolves via registry)",
-            ParameterSchema = """{"type":"object"}""",
-            Category = AgentToolCategory.Inspect,
-        }).ToList();
-    }
+    // NOTE: BuildToolCatalogue (placeholder-descriptor factory used by
+    // the Phase 3.A.2 filter route) is dead code as of PR #10 fix-up.
+    // The filter route now pre-resolves via the registry before the
+    // empty-catalogue degradation check above, so the placeholder shape
+    // is never constructed. Kept removed; if a future caller needs a
+    // names-to-placeholders helper, write a fresh one with the actual
+    // semantic intent rather than reviving this one (which encoded the
+    // pre-resolution behavior that Blocker 1 fixed).
 
     private static ChatMessage ToChatMessage(AssistantTurn turn)
     {

@@ -11,6 +11,7 @@ Read first:
 - [`docs/phase-2-design.md`](docs/phase-2-design.md) — Phase 2 design rationale (Q1–Q5 ratifications, worker concerns, scope deltas from Phase 1)
 - [`docs/phase-3a-design.md`](docs/phase-3a-design.md) — Phase 3.A.1 design rationale (Q1–Q11 + 7 worker concerns, OrgId↔TenantId bridge, X1 stub-vs-real test split, Phase 3.A.2 forward plan)
 - [`docs/phase-3b-design.md`](docs/phase-3b-design.md) — Phase 3.B design rationale (Q1 JsonSchema.Net library choice + 7 decide-and-documents, pass-through (a) wire shape, Trainer GET /api/search contract, JSON Schema validation turn-on)
+- [`docs/phase-3c-design.md`](docs/phase-3c-design.md) — Phase 3.C design rationale (live agent loop: routing default per Tools=null/[]/[name], system prompt with dynamic tool catalogue, ExposeEcho exposure gate, descriptor resolution, per-tool-dispatch operator logging)
 
 ## What this component is
 
@@ -23,6 +24,16 @@ The component design lives in [`59-trellis-assistant.md`](https://github.com/ter
 phase + guard-rails for what NOT to do yet.
 
 ## Status
+
+**Phase 3.C — live agent-loop tool usage scaffolded** on `kimi/phase3c-live-agent-loop-tool-usage`. New surface (this phase):
+
+- Routing default change (`ConversationOrchestrator`): `Tools=null` (omitted) → agent path with the registry's full exposed catalogue; `Tools=[]` → direct-LLM opt-out ("just chat" — preserves Phase 2 per-conversation-model semantics); `Tools=["x"]` → agent path with caller's filter. Empty-resolved-catalogue (no exposed tools or all-unknowns) degrades to direct-LLM.
+- `AssistantAgentExecutor.BuildSystemPromptWithCatalogue` — composes a tool-aware system prompt from `_options.SystemPrompt` + dynamic `Available tools: - <name>: <description>` enumeration. Injected at `messages[0]` for BOTH the standalone `RunAsync` path and the conversation-integrated `RunForConversationAsync` path (Phase 3.A.2 left the conversation path without a system prompt entirely; 3.C closes that gap).
+- `AssistantAgentExecutor.ResolveDescriptors` — swaps caller-supplied placeholder descriptors (from `ConversationOrchestrator.BuildToolCatalogue`) or stale caller-controlled descriptors for the registry's actual descriptor before the LLM sees them. The LLM always sees the real `Description` + real `ParameterSchema`. Unknown names dropped silently.
+- `ToolCatalogueOptions` + `Assistant:Tools` config section — `ExposeEcho` boolean (default `false`, production-safe). `ToolRegistry.Descriptors` filters by exposure; `GetTool` unchanged (dispatchability preserved for operator-targeted `POST /api/agent-runs` with explicit `toolNames`).
+- Per-tool-dispatch operator logging in `DispatchOneToolCallAsync`: `LogInformation` on dispatch start + on success-with-duration; `LogWarning` on failure-with-message. Counter metrics deferred to Phase 3.D.
+- Model-selection trade-off documented: agent path uses `Assistant:Agent:Model` (qwen2.5:72b — function-calling-capable); direct-LLM path uses conversation's pinned `Model`. A single conversation may produce some turns from each model; per-conversation tool-model selection is Phase 3.D+ ergonomics.
+- 10 new Phase 3.C pins: 3 ToolRegistry exposure (pure unit), 4 executor system-prompt + descriptor-resolution (Docker-gated), 3 orchestrator routing default + opt-out + LLM-sees-search_documents (Docker-gated, hub's "refund policy" E2E example).
 
 **Phase 3.B — search_documents tool + Trainer integration + JSON Schema validation turn-on scaffolded** on `kimi/phase3b-assistant-search-documents-tool`. New surface (this phase):
 
@@ -228,6 +239,14 @@ Steady-state QA redeploys: `trellis-deploy/scripts/qa/Deploy-Assistant-Standalon
 - Unit: `trellis-assistant-qa.service`
 - Auth: shared `trellisqa` HTTP Basic credential at the Hetzner edge (same as web-qa + trainer-qa); GB10-side nginx is auth-free
 - Bootstrap walkthrough: `trellis-deploy/scripts/qa/bootstrap-assistant.md`
+
+## Don't (Phase 3.C)
+
+- **Don't add per-tool exposure flags to `IAgentTool` itself.** Phase 3.C's `Assistant:Tools:ExposeEcho` config flag is the per-environment-override pattern matching `Assistant:AutoMigrate` / `Auth:RequireHttpsMetadata`. If 3.D+ adds 2+ more test-only tools and the config forest becomes a smell, the lift to `bool IAgentTool.IsExposedByDefault` is a follow-up brief — don't pre-empt it.
+- **Don't bypass `ResolveDescriptors` and pass caller-controlled descriptors straight to `IAgentLlmClient`.** The LLM must see the registry's real `Description` + real `ParameterSchema`, not whatever the caller (orchestrator placeholder, future channel adapter, etc.) supplied. The resolution boundary is load-bearing for schema validation gate + the system prompt's catalogue enumeration.
+- **Don't run the agent path when the resolved catalogue is empty.** The orchestrator degrades to direct-LLM in that case — running the executor with `tools.Count == 0` would spend budget-gate + agent_runs overhead on a call functionally equivalent to direct-LLM and would silently switch the model (conversation pinned Model → `Assistant:Agent:Model`).
+- **Don't inject the system prompt at the orchestrator layer.** The executor's `BuildSystemPromptWithCatalogue` reads the registry; injecting at the orchestrator would either duplicate that logic OR force the orchestrator to pre-resolve descriptors before the executor's `ResolveDescriptors` runs. messages[0] is reserved for the executor's injection.
+- **Don't add per-tool Prometheus counters in this PR.** Phase 3.C ships per-tool LogInformation/LogWarning lifecycle logs (journalctl-grep surface). Counter metrics are Phase 3.D scope per hub's ratify — don't pre-empt.
 
 ## Don't (Phase 3.B)
 

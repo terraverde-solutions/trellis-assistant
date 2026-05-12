@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Options;
 using Trellis.Core.Models;
 using Trellis.Core.Services;
 
@@ -41,19 +42,33 @@ namespace Trellis.Assistant.AgentExecution;
 /// type + descriptor Name in the message — startup log identifies which
 /// tool caused the failure without operator detective work.
 /// </para>
+///
+/// <para>
+/// Phase 3.C exposure filter: <see cref="Descriptors"/> returns only the
+/// LLM-visible subset, gated by <see cref="ToolCatalogueOptions"/>. Tools
+/// stay registered + dispatchable via <see cref="GetTool"/> regardless of
+/// exposure — operators can still target unexposed tools through the
+/// standalone <c>POST /api/agent-runs</c> with an explicit
+/// <c>toolNames</c> filter. Hidden tools just don't appear in the LLM's
+/// function-calling tool array (the planner never tries to call what it
+/// can't see).
+/// </para>
 /// </summary>
 public sealed class ToolRegistry : IToolRegistry
 {
     private readonly Dictionary<string, IAgentTool> _toolsByName;
-    private readonly IReadOnlyList<AgentToolDescriptor> _descriptors;
+    private readonly IReadOnlyList<AgentToolDescriptor> _exposedDescriptors;
 
     public ToolRegistry(
         IEnumerable<IAgentTool> registeredTools,
-        IJsonSchemaValidator schemaValidator)
+        IJsonSchemaValidator schemaValidator,
+        IOptions<ToolCatalogueOptions> catalogueOptions)
     {
         ArgumentNullException.ThrowIfNull(registeredTools);
         ArgumentNullException.ThrowIfNull(schemaValidator);
+        ArgumentNullException.ThrowIfNull(catalogueOptions);
 
+        var options = catalogueOptions.Value;
         var tools = registeredTools.ToList();
         var byName = new Dictionary<string, IAgentTool>(StringComparer.Ordinal);
 
@@ -73,10 +88,29 @@ public sealed class ToolRegistry : IToolRegistry
         }
 
         _toolsByName = byName;
-        _descriptors = tools.Select(t => t.Descriptor).ToList();
+        _exposedDescriptors = tools
+            .Where(t => IsExposed(t, options))
+            .Select(t => t.Descriptor)
+            .ToList();
     }
 
-    public IReadOnlyList<AgentToolDescriptor> Descriptors => _descriptors;
+    public IReadOnlyList<AgentToolDescriptor> Descriptors => _exposedDescriptors;
+
+    /// <summary>
+    /// Phase 3.C exposure gate. Per-tool config flag pattern; matches
+    /// <c>Assistant:AutoMigrate</c> + <c>Auth:RequireHttpsMetadata</c>
+    /// surrounding conventions. EchoTool is hidden by default
+    /// (production-safe — it's a debugging aid, not a real tool); future
+    /// tools default exposed unless a per-tool flag says otherwise.
+    /// </summary>
+    private static bool IsExposed(IAgentTool tool, ToolCatalogueOptions options)
+    {
+        if (tool.Descriptor.Name == EchoTool.ToolName)
+        {
+            return options.ExposeEcho;
+        }
+        return true;
+    }
 
     public IAgentTool? GetTool(string name)
     {

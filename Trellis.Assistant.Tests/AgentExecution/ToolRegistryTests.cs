@@ -22,13 +22,15 @@ namespace Trellis.Assistant.Tests.AgentExecution;
 public sealed class ToolRegistryTests
 {
     private readonly JsonSchemaNetValidator _schemaValidator = new();
+    private readonly Microsoft.Extensions.Options.IOptions<ToolCatalogueOptions> _catalogueOptions =
+        Microsoft.Extensions.Options.Options.Create(new ToolCatalogueOptions { ExposeEcho = true });
 
     [Fact]
     public void NameCollision_FailsAtStartup()
     {
         var firstEcho = new EchoTool();
         var collidingEcho = new FakeTool(name: "echo", description: "shouldn't matter");
-        var act = () => new ToolRegistry(new IAgentTool[] { firstEcho, collidingEcho }, _schemaValidator);
+        var act = () => new ToolRegistry(new IAgentTool[] { firstEcho, collidingEcho }, _schemaValidator, _catalogueOptions);
         act.Should().Throw<InvalidOperationException>()
             .WithMessage("*name collision*echo*",
                 "two tools registered with the same Descriptor.Name must crash the host on construction");
@@ -38,7 +40,7 @@ public sealed class ToolRegistryTests
     public void EmptyName_FailsAtStartup()
     {
         var bad = new FakeTool(name: "", description: "valid description");
-        var act = () => new ToolRegistry(new IAgentTool[] { bad }, _schemaValidator);
+        var act = () => new ToolRegistry(new IAgentTool[] { bad }, _schemaValidator, _catalogueOptions);
         act.Should().Throw<InvalidOperationException>()
             .WithMessage("*empty/whitespace Descriptor.Name*");
     }
@@ -47,7 +49,7 @@ public sealed class ToolRegistryTests
     public void WhitespaceName_FailsAtStartup()
     {
         var bad = new FakeTool(name: "   ", description: "valid description");
-        var act = () => new ToolRegistry(new IAgentTool[] { bad }, _schemaValidator);
+        var act = () => new ToolRegistry(new IAgentTool[] { bad }, _schemaValidator, _catalogueOptions);
         act.Should().Throw<InvalidOperationException>()
             .WithMessage("*empty/whitespace Descriptor.Name*",
                 "whitespace-only Name is functionally indistinguishable from empty");
@@ -57,7 +59,7 @@ public sealed class ToolRegistryTests
     public void EmptyDescription_FailsAtStartup()
     {
         var bad = new FakeTool(name: "valid_name", description: "");
-        var act = () => new ToolRegistry(new IAgentTool[] { bad }, _schemaValidator);
+        var act = () => new ToolRegistry(new IAgentTool[] { bad }, _schemaValidator, _catalogueOptions);
         act.Should().Throw<InvalidOperationException>()
             .WithMessage("*empty/whitespace Descriptor.Description*");
     }
@@ -66,7 +68,7 @@ public sealed class ToolRegistryTests
     public void WhitespaceDescription_FailsAtStartup()
     {
         var bad = new FakeTool(name: "valid_name", description: "   ");
-        var act = () => new ToolRegistry(new IAgentTool[] { bad }, _schemaValidator);
+        var act = () => new ToolRegistry(new IAgentTool[] { bad }, _schemaValidator, _catalogueOptions);
         act.Should().Throw<InvalidOperationException>()
             .WithMessage("*empty/whitespace Descriptor.Description*");
     }
@@ -92,7 +94,7 @@ public sealed class ToolRegistryTests
         // descriptor in the registry's dict. Adding the legit tool
         // (same name) triggers the collision detection — same code
         // path that catches name-mismatch drift.
-        var act = () => new ToolRegistry(new IAgentTool[] { slipperyTool, legitTool }, _schemaValidator);
+        var act = () => new ToolRegistry(new IAgentTool[] { slipperyTool, legitTool }, _schemaValidator, _catalogueOptions);
         act.Should().Throw<InvalidOperationException>()
             .WithMessage("*name collision*consistent_name*");
     }
@@ -101,7 +103,7 @@ public sealed class ToolRegistryTests
     public void GetTool_RegisteredName_ReturnsTool()
     {
         var echo = new EchoTool();
-        var registry = new ToolRegistry(new IAgentTool[] { echo }, _schemaValidator);
+        var registry = new ToolRegistry(new IAgentTool[] { echo }, _schemaValidator, _catalogueOptions);
         registry.GetTool("echo").Should().BeSameAs(echo);
     }
 
@@ -109,7 +111,7 @@ public sealed class ToolRegistryTests
     public void GetTool_UnknownName_ReturnsNull()
     {
         var echo = new EchoTool();
-        var registry = new ToolRegistry(new IAgentTool[] { echo }, _schemaValidator);
+        var registry = new ToolRegistry(new IAgentTool[] { echo }, _schemaValidator, _catalogueOptions);
         registry.GetTool("not_registered").Should().BeNull();
     }
 
@@ -117,9 +119,66 @@ public sealed class ToolRegistryTests
     public void GetTool_NullOrEmptyName_ReturnsNull()
     {
         var echo = new EchoTool();
-        var registry = new ToolRegistry(new IAgentTool[] { echo }, _schemaValidator);
+        var registry = new ToolRegistry(new IAgentTool[] { echo }, _schemaValidator, _catalogueOptions);
         registry.GetTool(null!).Should().BeNull();
         registry.GetTool("").Should().BeNull();
+    }
+
+    // ---------------- Phase 3.C: exposure filter ----------------
+
+    [Fact]
+    public void ExposeEchoFalse_HidesEchoFromDescriptors_ButGetToolStillResolves()
+    {
+        // Phase 3.C contract: exposure controls only Descriptors (the
+        // LLM-visible catalogue). GetTool always resolves so existing
+        // dispatch paths (operator-initiated POST /api/agent-runs with
+        // an explicit toolNames filter, etc.) keep working.
+        var options = Microsoft.Extensions.Options.Options.Create(
+            new ToolCatalogueOptions { ExposeEcho = false });
+        var registry = new ToolRegistry(
+            new IAgentTool[] { new EchoTool() },
+            _schemaValidator,
+            options);
+        registry.Descriptors.Should().BeEmpty(
+            "ExposeEcho=false hides EchoTool from the LLM-visible catalogue");
+        registry.GetTool(EchoTool.ToolName).Should().NotBeNull(
+            "ExposeEcho=false does NOT unregister the tool; dispatch still resolves it");
+    }
+
+    [Fact]
+    public void ExposeEchoTrue_IncludesEchoInDescriptors()
+    {
+        var options = Microsoft.Extensions.Options.Options.Create(
+            new ToolCatalogueOptions { ExposeEcho = true });
+        var registry = new ToolRegistry(
+            new IAgentTool[] { new EchoTool() },
+            _schemaValidator,
+            options);
+        registry.Descriptors.Should().ContainSingle(
+            d => d.Name == EchoTool.ToolName,
+            "ExposeEcho=true makes EchoTool visible in Descriptors");
+    }
+
+    [Fact]
+    public void NonEchoTools_AlwaysExposed_RegardlessOfExposeEchoFlag()
+    {
+        // ExposeEcho governs only EchoTool. Other tools (production
+        // tools like SearchDocumentsTool, future Phase 3.D+ additions)
+        // default to exposed unless their own per-tool flag flips.
+        var options = Microsoft.Extensions.Options.Options.Create(
+            new ToolCatalogueOptions { ExposeEcho = false });
+        var productionTool = new FakeTool(
+            name: "future_production_tool",
+            description: "A non-echo tool added in some future phase");
+        var registry = new ToolRegistry(
+            new IAgentTool[] { new EchoTool(), productionTool },
+            _schemaValidator,
+            options);
+        registry.Descriptors.Should().ContainSingle(
+            d => d.Name == "future_production_tool",
+            "non-echo tools stay exposed even when ExposeEcho=false");
+        registry.Descriptors.Select(d => d.Name)
+            .Should().NotContain(EchoTool.ToolName);
     }
 
     [Fact]
@@ -133,7 +192,7 @@ public sealed class ToolRegistryTests
             name: "bad_schema",
             description: "valid description",
             parameterSchema: "{not a valid json schema");
-        var act = () => new ToolRegistry(new IAgentTool[] { bad }, _schemaValidator);
+        var act = () => new ToolRegistry(new IAgentTool[] { bad }, _schemaValidator, _catalogueOptions);
         act.Should().Throw<InvalidOperationException>()
             .WithMessage("*bad_schema*malformed*",
                 "registry surfaces the tool name + 'malformed' so startup logs identify the offending registration");
@@ -146,7 +205,7 @@ public sealed class ToolRegistryTests
             name: "no_schema",
             description: "valid description",
             parameterSchema: "");
-        var act = () => new ToolRegistry(new IAgentTool[] { bad }, _schemaValidator);
+        var act = () => new ToolRegistry(new IAgentTool[] { bad }, _schemaValidator, _catalogueOptions);
         act.Should().Throw<InvalidOperationException>()
             .WithMessage("*empty/whitespace*ParameterSchema*");
     }
@@ -156,7 +215,7 @@ public sealed class ToolRegistryTests
     {
         var first = new FakeTool(name: "alpha", description: "first tool");
         var second = new FakeTool(name: "beta", description: "second tool");
-        var registry = new ToolRegistry(new IAgentTool[] { first, second }, _schemaValidator);
+        var registry = new ToolRegistry(new IAgentTool[] { first, second }, _schemaValidator, _catalogueOptions);
         registry.Descriptors.Select(d => d.Name).Should().Equal("alpha", "beta");
     }
 

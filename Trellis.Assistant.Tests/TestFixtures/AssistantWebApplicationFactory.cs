@@ -39,6 +39,7 @@ public sealed class AssistantWebApplicationFactory : WebApplicationFactory<Progr
 {
     private readonly string _connectionString;
     private readonly StubAgentLlmClient _agentLlmStub = new();
+    private readonly StubSearchClient _searchClientStub = new();
 
     /// <summary>
     /// Test-controlled stub for the agent-execution LLM. Tests use the
@@ -48,6 +49,16 @@ public sealed class AssistantWebApplicationFactory : WebApplicationFactory<Progr
     /// <see cref="StubAgentLlmClient.Calls"/>.
     /// </summary>
     public StubAgentLlmClient AgentLlmStub => _agentLlmStub;
+
+    /// <summary>
+    /// PR #10 review Blocker 3: test-controlled stub for the Trainer
+    /// search HTTP client. Tests set <see cref="StubSearchClient.NextResult"/>
+    /// before driving the endpoint; the executor dispatches
+    /// SearchDocumentsTool → this stub → canned response. Pins the full
+    /// LLM-emits-tool_call → executor-dispatches → ISearchClient-returns
+    /// chain that PR #10's original E2E test missed.
+    /// </summary>
+    public StubSearchClient SearchClientStub => _searchClientStub;
 
     public AssistantWebApplicationFactory(string connectionString)
     {
@@ -100,6 +111,16 @@ public sealed class AssistantWebApplicationFactory : WebApplicationFactory<Progr
                 // isolation with a stub handler).
                 ["Assistant:Trainer:BaseUrl"] = "http://test-host-unreachable:5114/",
                 ["Assistant:Trainer:RequestTimeoutSeconds"] = "30",
+                // Phase 3.C: expose EchoTool in test environments so
+                // existing AssistantAgentExecutor + ConversationEndpoint
+                // tests that exercise the echo dispatch path still see
+                // it in the LLM-visible catalogue. Production default is
+                // false (echo is a debug aid; LLM shouldn't be tempted
+                // to call it in real conversations). SearchDocumentsTool
+                // is exposed unconditionally; the test stub
+                // ISearchClient is the boundary that prevents real
+                // Trainer round-trips.
+                ["Assistant:Tools:ExposeEcho"] = "true",
             });
         });
 
@@ -118,6 +139,21 @@ public sealed class AssistantWebApplicationFactory : WebApplicationFactory<Progr
             // RemoveAll-then-AddSingleton pattern as IOllamaClient.
             services.RemoveAll<IAgentLlmClient>();
             services.AddSingleton<IAgentLlmClient>(_agentLlmStub);
+
+            // PR #10 review Blocker 3: replace the production
+            // HttpSearchClient with the test stub so SearchDocumentsTool
+            // dispatches resolve here instead of attempting an HTTP
+            // round-trip to the dummy Assistant:Trainer:BaseUrl. The
+            // Func<ISearchClient> registration also needs replacement —
+            // SearchDocumentsTool resolves the factory per-call (captive-
+            // dep fix from PR #9 review), and the production registration
+            // pulls from the typed-HttpClient ISearchClient binding which
+            // we just removed.
+            services.RemoveAll<ISearchClient>();
+            services.AddSingleton<ISearchClient>(_searchClientStub);
+            services.RemoveAll<Func<ISearchClient>>();
+            services.AddSingleton<Func<ISearchClient>>(
+                sp => () => sp.GetRequiredService<ISearchClient>());
 
             // Macro 3 PR 2: replace JWT bearer with the test auth
             // scheme that synthesizes claims from headers. Existing
