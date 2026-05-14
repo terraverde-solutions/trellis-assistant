@@ -13,6 +13,7 @@ Read first:
 - [`docs/phase-3b-design.md`](docs/phase-3b-design.md) — Phase 3.B design rationale (Q1 JsonSchema.Net library choice + 7 decide-and-documents, pass-through (a) wire shape, Trainer GET /api/search contract, JSON Schema validation turn-on)
 - [`docs/phase-3c-design.md`](docs/phase-3c-design.md) — Phase 3.C design rationale (live agent loop: routing default per Tools=null/[]/[name], system prompt with dynamic tool catalogue, ExposeEcho exposure gate, descriptor resolution, per-tool-dispatch operator logging)
 - [`docs/phase-3d-design.md`](docs/phase-3d-design.md) — Phase 3.D design rationale (ChatRecentTool: AgentToolInput.UserId threading, IServiceScopeFactory pattern for Singleton→Scoped store, ILIKE query, turn.created_at since filter, standalone-run sentinel)
+- [`docs/phase-3e-design.md`](docs/phase-3e-design.md) — Phase 3.E design rationale (multi-tool dispatch per LLM turn: serial only / 1 step per tool_call / mid-iteration budget gate / synthetic BUDGET_EXHAUSTED system message / preserved Phase 3.A.2 in-loop wire encoding)
 
 ## What this component is
 
@@ -25,6 +26,16 @@ The component design lives in [`59-trellis-assistant.md`](https://github.com/ter
 phase + guard-rails for what NOT to do yet.
 
 ## Status
+
+**Phase 3.E — multi-tool dispatch per LLM turn scaffolded** on `kimi/phase3e-parallel-tool-calls`. New surface (this phase):
+
+- `AssistantAgentExecutor.ExecuteLoopAsync` — mid-iteration budget gate check added inside the foreach over `llmResponse.ToolCalls`. On halt: log `LogWarning`, append synthetic `ChatRole.System` `BUDGET_EXHAUSTED: dispatched N/M ...` message, set terminal status from `MapBudgetDecisionToRunStatus`, break foreach + while. Pre-Phase-3.E the foreach already iterated multi-call (`OllamaAgentLlmClient` parses all `tool_calls[]`) — no test ever drove it past 1 tool. Phase 3.E adds the missing gate + the test coverage.
+- 6 pinned decisions: serial only (no `Task.WhenAll`); 1 step per tool_call (not per LLM call); cancellation propagates immediately; tool result append order matches `tool_calls[]` order; schema validation independent per tool_call; budget exhaust mid-iteration dispatches partial + surfaces synthetic system message.
+- `PostgresAgentRunStore.ToCore(AgentRunEntity, ...)` mapper — pre-existing bug fix. Core PR #14 added `AgentRun.ErrorMessage`; entity + persist were correct but the read mapper dropped it. Surfaced by the budget-cap mid-iteration test (first consumer that inspected ErrorMessage on a budget-halt path).
+- 5 new pure-unit pins in `AssistantAgentExecutorTests` (multi-tool happy, mixed success/fail, budget exhaust mid-iter, cancellation mid-iter, single-call regression-pin).
+- 1 new Docker-gated E2E in `ConversationEndpointTests` — stub LLM emits `search_documents` + `chat_recent` in one turn → 4-turn persistence `[user, tool A, tool B, assistant]` → GET returns full chain in position order.
+- `StubAgentLlmClient.EnqueueMultipleToolCalls(params (string, string)[])` helper for scripting multi-tool LLM responses in tests.
+- In-loop tool-result wire shape preserved from Phase 3.A.2: `ChatRole.System` with `TOOL_RESULT:` envelope (Core's `ChatMessage` doesn't carry `ToolCallId`; canonical role=tool wire body would require a Core widening — deferred). Persisted tool turns DO use canonical `AssistantTurnRole.Tool` already.
 
 **Phase 3.D — ChatRecentTool scaffolded** on `kimi/phase3d-assistant-chat-recent-tool` (pairs with trellis-core PR #17 merged at `e790669`). New surface (this phase):
 
@@ -250,6 +261,14 @@ Steady-state QA redeploys: `trellis-deploy/scripts/qa/Deploy-Assistant-Standalon
 - Unit: `trellis-assistant-qa.service`
 - Auth: shared `trellisqa` HTTP Basic credential at the Hetzner edge (same as web-qa + trainer-qa); GB10-side nginx is auth-free
 - Bootstrap walkthrough: `trellis-deploy/scripts/qa/bootstrap-assistant.md`
+
+## Don't (Phase 3.E)
+
+- **Don't add `Task.WhenAll` parallel dispatch.** Phase 3.E pin #1 ratified serial-only. Database connection pool + Trainer loopback aren't optimized for high concurrency; test determinism is the larger win. If a real latency case surfaces, that's a Phase 3.F brief — measure first.
+- **Don't short-circuit the foreach on the first tool failure.** Phase 3.E pin #5: schema validation + execution failures are independent per tool_call. The LLM gets ALL results (Success=true or Success=false per step) and decides what to do. Pinned by `MultiToolCall_FirstSucceedsSecondFails_BothResultsAppended_LoopContinues`.
+- **Don't move the budget gate check above the first tool dispatch within a foreach iteration.** The top-of-while gate ALREADY passed when the LLM was called; the first dispatch is a contract of the LLM response. Mid-iteration gate fires from the SECOND iteration onward (`dispatchedToolCalls > 0`).
+- **Don't introduce a synthetic system message that re-feeds the LLM after BUDGET_EXHAUSTED.** Pin #6 surfaces the message into the in-flight `messages` list but the loop terminates immediately — the message doesn't reach a follow-up LLM call. Operator visibility is via `LogWarning` + persisted `AgentRun.Status = CapReached` + populated `AgentRun.ErrorMessage`. If a future use case wants "soft halt → let LLM produce a final synthesis", that's a separate routing brief.
+- **Don't try to encode `tool_call_id` in the in-loop `messages` list.** Core's `ChatMessage` carries only `(Role, Content)` — full OAI-compat role=tool+tool_call_id wire shape requires a Core widening. The in-loop encoding stays `ChatRole.System` with `TOOL_RESULT:` envelope (Phase 3.A.2 design preserved). Persisted tool turns DO use canonical `AssistantTurnRole.Tool` with `ToolCallId` populated.
 
 ## Don't (Phase 3.D)
 

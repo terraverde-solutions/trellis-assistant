@@ -54,6 +54,22 @@ public sealed class StubAgentLlmClient : IAgentLlmClient
             TokensUsed = tokensUsed,
         });
 
+    /// <summary>
+    /// Phase 3.E convenience: enqueue a multi-tool_call response (LLM
+    /// emits N tool_calls in a single assistant message). Calls are
+    /// dispatched in the order supplied per Phase 3.E pin #4.
+    /// </summary>
+    public StubAgentLlmClient EnqueueMultipleToolCalls(
+        params (string ToolName, string ArgumentsJson)[] calls)
+        => EnqueueResponse(new AgentLlmResponse
+        {
+            AssistantText = "",
+            ToolCalls = calls
+                .Select(c => new AgentLlmToolCall { ToolName = c.ToolName, ArgumentsJson = c.ArgumentsJson })
+                .ToList(),
+            TokensUsed = 0,
+        });
+
     public Task<AgentLlmResponse> ChatWithToolsAsync(
         string model,
         IReadOnlyList<ChatMessage> messages,

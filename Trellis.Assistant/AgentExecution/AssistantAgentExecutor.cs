@@ -454,11 +454,76 @@ public sealed class AssistantAgentExecutor : IAgentExecutor
                     break;
                 }
 
-                // ---- Dispatch tool calls (sequentially, one per step
-                // per Core's v0 cap of 1 tool call per step) ----
+                // ---- Dispatch tool calls (sequentially; Phase 3.E
+                // ratified pin #1: serial only, no Task.WhenAll). Each
+                // tool_call increments stepIndex (pin #2: 1 step per
+                // tool_call, not per LLM call). The mid-iteration gate
+                // check below honors pin #6: if budget exhausts between
+                // tool_calls, dispatch what fits, skip the rest, emit a
+                // synthetic BUDGET_EXHAUSTED system message, and terminate.
+                // ----
+                var totalToolCalls = llmResponse.ToolCalls.Count;
+                var dispatchedToolCalls = 0;
+                var midIterationHalted = false;
                 foreach (var call in llmResponse.ToolCalls)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
+
+                    // Phase 3.E pin #6: per-tool-call mid-iteration
+                    // budget gate. Skip the pre-LLM check on the first
+                    // iteration (already passed at top of while-loop);
+                    // subsequent iterations re-check so step-cap /
+                    // time-cap / loop-detection fire correctly between
+                    // tool_calls within a multi-tool LLM response.
+                    if (dispatchedToolCalls > 0)
+                    {
+                        var midState = new AgentRunState
+                        {
+                            AgentRunId = runId,
+                            OrgId = orgId,
+                            StartedAt = startedAt,
+                            CheckedAt = DateTime.UtcNow,
+                            CompletedStepCount = stepIndex,
+                            // PR #12 review Blocker: pass the running
+                            // count so DefaultBudgetGate's per-step
+                            // tool-call cap (> 1) actually fires.
+                            // Pre-fix this was hard-coded to 0, making
+                            // the cap dead code on the multi-tool path
+                            // — an LLM emitting 10 tool_calls in one
+                            // assistant message would slip through. The
+                            // step cap (1 step per tool_call) was still
+                            // protective via MaxSteps, but the per-LLM-
+                            // turn cap was silently bypassed.
+                            ToolCallsInCurrentStep = dispatchedToolCalls,
+                            RecentToolDispatches = recentDispatches.ToList(),
+                            Overrides = budgetOverrides,
+                        };
+                        var midVerdict = await _gate
+                            .ShouldContinueAsync(midState, cancellationToken)
+                            .ConfigureAwait(false);
+                        if (midVerdict.Decision != BudgetDecision.Continue)
+                        {
+                            var skipped = totalToolCalls - dispatchedToolCalls;
+                            _logger.LogWarning(
+                                "AgentRun {RunId} budget exhausted mid-iteration after {Dispatched}/{Total} tool_calls; " +
+                                "skipping {Skipped} remaining. Decision={Decision} Reason={Reason}",
+                                runId, dispatchedToolCalls, totalToolCalls, skipped,
+                                midVerdict.Decision, midVerdict.HumanReadableReason);
+                            messages.Add(new ChatMessage
+                            {
+                                Role = ChatRole.System,
+                                Content =
+                                    $"BUDGET_EXHAUSTED: dispatched {dispatchedToolCalls}/{totalToolCalls} " +
+                                    $"tool_calls in this turn; remaining {skipped} skipped due to budget cap. " +
+                                    $"Reason: {midVerdict.HumanReadableReason}",
+                            });
+                            terminalStatus = MapBudgetDecisionToRunStatus(midVerdict.Decision);
+                            terminalErrorMessage = midVerdict.HumanReadableReason;
+                            midIterationHalted = true;
+                            break;
+                        }
+                    }
+
                     var canonicalArgs = CanonicalizeJson(call.ArgumentsJson);
                     var step = await DispatchOneToolCallAsync(
                         runId, orgId, userId, stepIndex, call, canonicalArgs, cancellationToken)
@@ -472,9 +537,15 @@ public sealed class AssistantAgentExecutor : IAgentExecutor
 
                     // Phase 3.A.2: capture the per-dispatch summary the
                     // ConversationOrchestrator persists as a Role=Tool
-                    // turn. ToolCallId is the Ulid-stringified AgentStep.Id;
-                    // ResultContent is the tool's output JSON (success)
-                    // or a JSON-serialized error envelope (failure).
+                    // turn (Phase 3.E pin #4: in original tool_calls[]
+                    // order). ToolCallId is the Ulid-stringified
+                    // AgentStep.Id; ResultContent is the tool's output
+                    // JSON (success) or a JSON-serialized error envelope
+                    // (failure). Pin #5: schema validation fires per
+                    // tool_call inside DispatchOneToolCallAsync — a
+                    // schema-invalid call surfaces here as
+                    // Status=Failed without throwing or short-circuiting
+                    // subsequent dispatches (existing behavior; preserved).
                     var dispatchResultContent = step.Status == AgentStepStatus.Succeeded
                         ? step.ToolOutputJson ?? "{}"
                         : JsonSerializer.Serialize(
@@ -488,14 +559,21 @@ public sealed class AssistantAgentExecutor : IAgentExecutor
                     });
 
                     stepIndex++;
+                    dispatchedToolCalls++;
 
                     // Append tool result back into chat history so the
-                    // next LLM iteration sees it. Phase 3.A.2: still
-                    // rendered as role=System with a TOOL_RESULT envelope
-                    // because the in-flight `messages` list isn't the
-                    // persisted-turns shape — it's the LLM context. Tool
-                    // turns persist separately when the orchestrator
-                    // calls AppendTurnsAsync after the loop.
+                    // next LLM iteration sees it. Rendered as role=System
+                    // with a TOOL_RESULT envelope because Core's
+                    // ChatMessage carries only (Role, Content) — no
+                    // ToolCallId field — so full OAI-compat
+                    // role=tool+tool_call_id wire shape isn't expressible
+                    // on the in-flight messages list. Tool turns DO
+                    // persist as canonical AssistantTurnRole.Tool when
+                    // the orchestrator calls AppendTurnsAsync after the
+                    // loop; the in-loop System+TOOL_RESULT envelope is
+                    // the LLM-context-only encoding. Phase 3.E preserves
+                    // this from Phase 3.A.2; full OAI-compat is a Core
+                    // widening if a future model demands it.
                     var toolResultPayload = new
                     {
                         tool = call.ToolName,
@@ -509,6 +587,19 @@ public sealed class AssistantAgentExecutor : IAgentExecutor
                         Content = "TOOL_RESULT: " +
                             JsonSerializer.Serialize(toolResultPayload, ToolResultJsonOpts),
                     });
+                }
+
+                // Phase 3.E pin #6: break out of the outer while-loop
+                // when a mid-iteration gate halt fired. Without this,
+                // the loop would re-check the gate at the top and
+                // halt cleanly anyway, but the explicit early-exit
+                // makes the control flow easier to reason about + lets
+                // the audit log carry the mid-iteration verdict
+                // verbatim (the top-of-loop verdict would mask it with
+                // its own reason string).
+                if (midIterationHalted)
+                {
+                    break;
                 }
             }
         }

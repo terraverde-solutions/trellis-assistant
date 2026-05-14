@@ -751,6 +751,238 @@ public sealed class AssistantAgentExecutorTests : IClassFixture<PostgresFixture>
             "the real EchoTool descriptor's description text flows to the LLM");
     }
 
+    // ---------------- Phase 3.E: multi-tool dispatch per LLM turn ----------------
+
+    [SkippableFact]
+    public async Task MultiToolCall_TwoToolsInOneTurn_BothDispatch_BothResultsAppendedInOrder()
+    {
+        // Phase 3.E pin: LLM emits two tool_calls in a single assistant
+        // message → executor dispatches both serially in order → both
+        // AgentSteps persist → both ResultContents appear in
+        // ConversationAgentResult.ToolDispatches → second LLM call sees
+        // both TOOL_RESULT envelopes in messages history.
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        var llm = new StubAgentLlmClient()
+            .EnqueueMultipleToolCalls(
+                ("echo", """{"text":"first call"}"""),
+                ("echo", """{"text":"second call"}"""))
+            .EnqueueAssistantText("synthesized both tool results.");
+        var executor = NewExecutor(llm);
+
+        var request = AgentRunRequest.Create(
+            orgId: TestOrgId,
+            userPrompt: "two-tool turn",
+            availableTools: new List<AgentToolDescriptor> { new EchoTool().Descriptor });
+
+        var run = await executor.RunAsync(request);
+
+        run.Status.Should().Be(AgentRunStatus.Succeeded);
+        run.Steps.Should().HaveCount(2,
+            "two tool_calls in one LLM response → two AgentSteps. Phase 3.E pin #2: 1 step per tool_call.");
+        run.Steps[0].StepIndex.Should().Be(0);
+        run.Steps[1].StepIndex.Should().Be(1,
+            "step indices monotonic across multi-tool dispatch (per Phase 3.A.1's sequential-index contract).");
+        run.Steps[0].Status.Should().Be(AgentStepStatus.Succeeded);
+        run.Steps[1].Status.Should().Be(AgentStepStatus.Succeeded);
+        run.Steps[0].ToolInputJson.Should().Contain("first call");
+        run.Steps[1].ToolInputJson.Should().Contain("second call");
+
+        // 2 LLM calls: the multi-tool one + the final synth.
+        llm.Calls.Should().HaveCount(2);
+        // The second LLM call's message context should include BOTH
+        // TOOL_RESULT envelopes (one per dispatched tool_call), in
+        // dispatch order. Phase 3.E pin #4: tool result append order
+        // matches the order in the LLM's tool_calls[] array.
+        var secondCall = llm.Calls[1];
+        var toolResultsInContext = secondCall.MessageRoles
+            .Zip(Enumerable.Range(0, secondCall.MessageCount))
+            .Where(z => z.First == ChatRole.System)
+            .Count();
+        // System prompt + 2 TOOL_RESULT envelopes = 3 system messages
+        toolResultsInContext.Should().BeGreaterThanOrEqualTo(3,
+            "messages list carries the executor's system prompt at [0] + 2 TOOL_RESULT envelopes after dispatch");
+    }
+
+    [SkippableFact]
+    public async Task MultiToolCall_FirstSucceedsSecondFails_BothResultsAppended_LoopContinues()
+    {
+        // Phase 3.E pin #5: per-tool-call schema validation /
+        // execution failures are INDEPENDENT. If tool A's args are
+        // schema-valid + dispatch succeeds, and tool B's args fail
+        // schema validation, both produce AgentSteps (A=Succeeded,
+        // B=Failed) and the loop continues so the LLM sees both
+        // results + can react.
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        var llm = new StubAgentLlmClient()
+            .EnqueueMultipleToolCalls(
+                ("echo", """{"text":"valid call"}"""),
+                ("echo", """{"not_text":"schema-invalid; missing required 'text'"}"""))
+            .EnqueueAssistantText("one ok, one rejected.");
+        var executor = NewExecutor(llm);
+
+        var request = AgentRunRequest.Create(
+            orgId: TestOrgId,
+            userPrompt: "mixed success/failure",
+            availableTools: new List<AgentToolDescriptor> { new EchoTool().Descriptor });
+
+        var run = await executor.RunAsync(request);
+
+        run.Status.Should().Be(AgentRunStatus.Succeeded);
+        run.Steps.Should().HaveCount(2,
+            "both tool_calls produce AgentSteps; failure on the second does NOT short-circuit the first or prevent the loop from continuing");
+        run.Steps[0].Status.Should().Be(AgentStepStatus.Succeeded,
+            "first tool_call had valid args, dispatched cleanly");
+        run.Steps[1].Status.Should().Be(AgentStepStatus.Failed,
+            "second tool_call's schema-invalid args fail the executor's schema gate");
+        run.Steps[1].ErrorMessage.Should().Contain("schema validation failed",
+            "Phase 3.B's schema gate identifies the rejection cause");
+    }
+
+    [SkippableFact]
+    public async Task MultiToolCall_BudgetExhaustsMidIteration_DispatchesPartialAndSurfacesBudgetMarker()
+    {
+        // Phase 3.E pin #6: budget exhaust mid-iteration. With
+        // MaxSteps=1 the gate halts AFTER the first tool dispatch (
+        // step 0 ran, step 1 is over cap). The executor dispatches the
+        // first tool_call, skips the second, emits a synthetic
+        // ChatRole.System BUDGET_EXHAUSTED message, and terminates with
+        // CapReached.
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        var llm = new StubAgentLlmClient()
+            .EnqueueMultipleToolCalls(
+                ("echo", """{"text":"dispatched"}"""),
+                ("echo", """{"text":"should be skipped"}"""));
+        var executor = NewExecutor(llm);
+
+        var request = AgentRunRequest.Create(
+            orgId: TestOrgId,
+            userPrompt: "budget-exhaust mid iter",
+            availableTools: new List<AgentToolDescriptor> { new EchoTool().Descriptor },
+            budgetOverrides: new AgentBudgetOverrides { MaxSteps = 1 });
+
+        var run = await executor.RunAsync(request);
+
+        run.Status.Should().Be(AgentRunStatus.CapReached,
+            "terminal status carries the mid-iteration verdict (StepCapReached → CapReached)");
+        run.Steps.Should().HaveCount(1,
+            "only the first tool_call dispatched; the second was skipped");
+        run.Steps[0].StepIndex.Should().Be(0);
+        run.Steps[0].ToolInputJson.Should().Contain("dispatched",
+            "the first tool_call's args were preserved in the persisted step");
+        run.ErrorMessage.Should().NotBeNullOrEmpty();
+        run.ErrorMessage.Should().Contain("steps",
+            "step-cap verdict's reason string mentions the step budget");
+    }
+
+    [SkippableFact]
+    public async Task MultiToolCall_ExceedsPerStepCap_TerminatesAtCap_WithCapReachedStatus()
+    {
+        // PR #12 review Blocker fix-up: pins the DefaultBudgetGate's
+        // per-step tool-call cap (`state.ToolCallsInCurrentStep > 1`)
+        // actually firing on the multi-tool path. Pre-fix the executor
+        // hardcoded ToolCallsInCurrentStep=0 in the mid-iteration state,
+        // so the gate's cap NEVER fired regardless of LLM emission size
+        // — an LLM emitting 10 tool_calls would slip through.
+        //
+        // Drive 3 tool_calls in one LLM emission. With the fix:
+        //   • Iter 1 (call 0): dispatchedToolCalls=0, skip mid-check.
+        //     Dispatch. dispatchedToolCalls=1.
+        //   • Iter 2 (call 1): dispatchedToolCalls=1, mid-check state's
+        //     ToolCallsInCurrentStep=1. Gate's `> 1` is FALSE → Continue.
+        //     Dispatch. dispatchedToolCalls=2.
+        //   • Iter 3 (call 2): dispatchedToolCalls=2, mid-check state's
+        //     ToolCallsInCurrentStep=2. Gate's `> 1` is TRUE →
+        //     ToolCallCapReached → halt.
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        var llm = new StubAgentLlmClient()
+            .EnqueueMultipleToolCalls(
+                ("echo", """{"text":"first"}"""),
+                ("echo", """{"text":"second"}"""),
+                ("echo", """{"text":"third — should trip the per-step cap"}"""));
+        var executor = NewExecutor(llm);
+
+        var request = AgentRunRequest.Create(
+            orgId: TestOrgId,
+            userPrompt: "three tool_calls in one turn",
+            availableTools: new List<AgentToolDescriptor> { new EchoTool().Descriptor });
+
+        var run = await executor.RunAsync(request);
+
+        run.Status.Should().Be(AgentRunStatus.CapReached,
+            "DefaultBudgetGate.ToolCallCapReached maps to CapReached on the AgentRun (matches StepCapReached + TimedOut)");
+        run.Steps.Should().HaveCount(2,
+            "first two tool_calls dispatch; the third trips the per-step cap (`ToolCallsInCurrentStep > 1`) before dispatch");
+        run.Steps[0].Status.Should().Be(AgentStepStatus.Succeeded);
+        run.Steps[1].Status.Should().Be(AgentStepStatus.Succeeded);
+        run.ErrorMessage.Should().NotBeNullOrEmpty();
+        run.ErrorMessage.Should().Contain("tool-call cap",
+            "verdict's HumanReadableReason names the cap that fired ('Step exceeded per-step tool-call cap (2/1).')");
+    }
+
+    [SkippableFact]
+    public async Task MultiToolCall_CancellationPreDispatch_PropagatesAsCancelled_NoStepsPersisted()
+    {
+        // Phase 3.E pin #3: cancellation propagates immediately
+        // (OperationCanceledException). Pre-cancelled CT fires before
+        // any tool dispatches → zero steps + Cancelled run.
+        // PR #12 polish: renamed from _Mid* → _PreDispatch* for
+        // accuracy. Mid-dispatch-cancellation (CT trips during a
+        // tool's RunAsync) is covered by single-tool cancellation
+        // tests elsewhere; this pin specifically covers the foreach-
+        // entry cancellation path.
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        var llm = new StubAgentLlmClient()
+            .EnqueueMultipleToolCalls(
+                ("echo", """{"text":"first"}"""),
+                ("echo", """{"text":"second"}"""));
+        var executor = NewExecutor(llm);
+
+        var request = AgentRunRequest.Create(
+            orgId: TestOrgId,
+            userPrompt: "cancel pre-dispatch",
+            availableTools: new List<AgentToolDescriptor> { new EchoTool().Descriptor });
+
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+        var run = await executor.RunAsync(request, cts.Token);
+
+        run.Status.Should().Be(AgentRunStatus.Cancelled,
+            "pre-cancelled token produces Cancelled before any tool dispatches");
+        run.Steps.Should().BeEmpty(
+            "no tool_calls dispatched when CT cancelled at loop start");
+    }
+
+    [SkippableFact]
+    public async Task MultiToolCall_SingleCallStillWorks_RegressionPin()
+    {
+        // Negative-control pin: the multi-tool path additions (mid-
+        // iteration gate, dispatchedToolCalls counter, etc.) must NOT
+        // regress the single-tool path. Pre-Phase-3.E behavior:
+        // one tool_call → one AgentStep → loop continues → final text.
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        var llm = new StubAgentLlmClient()
+            .EnqueueToolCall("echo", """{"text":"single"}""")
+            .EnqueueAssistantText("done.");
+        var executor = NewExecutor(llm);
+
+        var request = AgentRunRequest.Create(
+            orgId: TestOrgId,
+            userPrompt: "single-tool turn",
+            availableTools: new List<AgentToolDescriptor> { new EchoTool().Descriptor });
+
+        var run = await executor.RunAsync(request);
+
+        run.Status.Should().Be(AgentRunStatus.Succeeded);
+        run.Steps.Should().HaveCount(1);
+        run.Steps[0].Status.Should().Be(AgentStepStatus.Succeeded);
+    }
+
     // ---------------- Phase 3.B turn-on: runtime schema validation gate ----------------
 
     [SkippableFact]
