@@ -61,13 +61,26 @@ public sealed class TestAuthenticationHandler : AuthenticationHandler<Authentica
             return Task.FromResult(AuthenticateResult.NoResult());
         }
 
-        var identity = new ClaimsIdentity(
-            new[]
-            {
-                new Claim(TenantClaimsMiddleware.TenantIdClaimName, tenant),
-                new Claim(ClaimTypes.NameIdentifier, user),
-            },
-            authenticationType: SchemeName);
+        var claims = new List<Claim>(3)
+        {
+            new(TenantClaimsMiddleware.TenantIdClaimName, tenant),
+            new(ClaimTypes.NameIdentifier, user),
+        };
+        // Phase 3.F: optionally synthesize the tenant_role claim from
+        // the X-Trellis-Tenant-Role header. TestAuthenticationHandler
+        // short-circuits TenantClaimsMiddleware's deprecated-header
+        // fallback path (which would read the role header directly), so
+        // E2E tests that exercise the IToolExposurePolicy RequiredRole
+        // gate need the claim attached here for the canonical JWT-path
+        // extraction inside the middleware to see it. Missing header →
+        // no claim → middleware resolves null → policy fails-closed
+        // on any RequiredRole gate, same as production.
+        var role = Request.Headers[TenantClaimsMiddleware.TenantRoleHeaderName].ToString();
+        if (!string.IsNullOrWhiteSpace(role))
+        {
+            claims.Add(new Claim(TenantClaimsMiddleware.TenantRoleClaimName, role));
+        }
+        var identity = new ClaimsIdentity(claims, authenticationType: SchemeName);
         var principal = new ClaimsPrincipal(identity);
         var ticket = new AuthenticationTicket(principal, SchemeName);
         return Task.FromResult(AuthenticateResult.Success(ticket));

@@ -57,16 +57,20 @@ namespace Trellis.Assistant.AgentExecution;
 public sealed class ToolRegistry : IToolRegistry
 {
     private readonly Dictionary<string, IAgentTool> _toolsByName;
-    private readonly IReadOnlyList<AgentToolDescriptor> _exposedDescriptors;
+    private readonly IReadOnlyList<IAgentTool> _allTools;
+    private readonly IReadOnlyList<AgentToolDescriptor> _untenantedExposedDescriptors;
+    private readonly IToolExposurePolicy _exposurePolicy;
 
     public ToolRegistry(
         IEnumerable<IAgentTool> registeredTools,
         IJsonSchemaValidator schemaValidator,
-        IOptions<ToolCatalogueOptions> catalogueOptions)
+        IOptions<ToolCatalogueOptions> catalogueOptions,
+        IToolExposurePolicy exposurePolicy)
     {
         ArgumentNullException.ThrowIfNull(registeredTools);
         ArgumentNullException.ThrowIfNull(schemaValidator);
         ArgumentNullException.ThrowIfNull(catalogueOptions);
+        ArgumentNullException.ThrowIfNull(exposurePolicy);
 
         var options = catalogueOptions.Value;
         var tools = registeredTools.ToList();
@@ -88,22 +92,48 @@ public sealed class ToolRegistry : IToolRegistry
         }
 
         _toolsByName = byName;
-        _exposedDescriptors = tools
-            .Where(t => IsExposed(t, options))
+        _allTools = tools;
+        _exposurePolicy = exposurePolicy;
+
+        // Untenanted Descriptors property — Phase 3.C ExposeEcho gate
+        // only. The standalone POST /api/agent-runs path consumes this
+        // (no tenancy in scope) per Phase 3.F pin #6. Cached at
+        // construction since ExposeEcho doesn't change across requests.
+        _untenantedExposedDescriptors = tools
+            .Where(t => IsExposedUntenanted(t, options))
             .Select(t => t.Descriptor)
             .ToList();
     }
 
-    public IReadOnlyList<AgentToolDescriptor> Descriptors => _exposedDescriptors;
+    public IReadOnlyList<AgentToolDescriptor> Descriptors => _untenantedExposedDescriptors;
+
+    public IReadOnlyList<AgentToolDescriptor> GetExposedDescriptorsFor(AgentToolTenancy tenancy)
+    {
+        ArgumentNullException.ThrowIfNull(tenancy);
+
+        // Phase 3.F: full policy per call — different tenancies see
+        // different lists. O(N) over the registered tool count (~3 in
+        // v0; trivial). Not cached because the policy depends on the
+        // tenancy input, which varies per request.
+        var exposed = new List<AgentToolDescriptor>(_allTools.Count);
+        foreach (var tool in _allTools)
+        {
+            if (_exposurePolicy.IsExposedTo(tool, tenancy))
+            {
+                exposed.Add(tool.Descriptor);
+            }
+        }
+        return exposed;
+    }
 
     /// <summary>
-    /// Phase 3.C exposure gate. Per-tool config flag pattern; matches
-    /// <c>Assistant:AutoMigrate</c> + <c>Auth:RequireHttpsMetadata</c>
-    /// surrounding conventions. EchoTool is hidden by default
-    /// (production-safe — it's a debugging aid, not a real tool); future
-    /// tools default exposed unless a per-tool flag says otherwise.
+    /// Untenanted exposure gate for the <see cref="Descriptors"/>
+    /// property. Phase 3.C ExposeEcho only — does NOT consult the
+    /// Phase 3.F per-tool/per-tenancy matrix. Standalone path uses
+    /// this (per pin #6); conversation path uses the full policy via
+    /// <see cref="GetExposedDescriptorsFor"/>.
     /// </summary>
-    private static bool IsExposed(IAgentTool tool, ToolCatalogueOptions options)
+    private static bool IsExposedUntenanted(IAgentTool tool, ToolCatalogueOptions options)
     {
         if (tool.Descriptor.Name == EchoTool.ToolName)
         {

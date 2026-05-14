@@ -47,4 +47,72 @@ public sealed class ToolCatalogueOptions
     /// </para>
     /// </summary>
     public bool ExposeEcho { get; set; } = false;
+
+    /// <summary>
+    /// Phase 3.F per-tenant tool gating. Map keyed by tool name
+    /// (<see cref="Trellis.Core.Models.AgentToolDescriptor.Name"/>); each
+    /// rule combines an <see cref="ToolExposureRule.AllowedTenants"/>
+    /// UUID allowlist + an optional <see cref="ToolExposureRule.RequiredRole"/>
+    /// gate. Tools NOT in this map default to "exposed to all tenants"
+    /// per Phase 3.F pin #1 (back-compat: no PerTool config → unchanged
+    /// behavior).
+    ///
+    /// <para>
+    /// EchoTool is the exception — it's gated by <see cref="ExposeEcho"/>
+    /// (Phase 3.C), NOT by PerTool. Listing "echo" in PerTool is
+    /// harmless but ignored by the policy.
+    /// </para>
+    ///
+    /// <para>
+    /// Sample appsettings binding:
+    /// <code>
+    /// "Assistant:Tools:PerTool": {
+    ///   "chat_recent": {
+    ///     "AllowedTenants": [],          // [] = any tenant
+    ///     "RequiredRole": "admin"        // only role=admin sees it
+    ///   },
+    ///   "search_documents": {
+    ///     "AllowedTenants": ["00000000-0000-0000-0000-000000000001"]
+    ///   }
+    /// }
+    /// </code>
+    /// </para>
+    /// </summary>
+    public Dictionary<string, ToolExposureRule> PerTool { get; set; } = new();
+}
+
+/// <summary>
+/// One per-tool exposure rule. AllowedTenants + RequiredRole are AND'd
+/// at the policy boundary — both must pass for the tool to expose.
+/// Empty <see cref="AllowedTenants"/> + null <see cref="RequiredRole"/>
+/// is equivalent to "no gating" (same as omitting the rule entirely).
+/// </summary>
+public sealed class ToolExposureRule
+{
+    /// <summary>
+    /// Allowlist of tenant Guids that may see this tool. Empty list →
+    /// any tenant passes the AllowedTenants gate (the RequiredRole gate
+    /// still applies independently if set). Matches the JWT's
+    /// <c>tenant_id</c> claim shape (uuid-format string per Phase 3.A
+    /// C1; parsed to Guid by the orchestrator before policy invocation).
+    /// </summary>
+    public List<Guid> AllowedTenants { get; set; } = new();
+
+    /// <summary>
+    /// Required role string. <c>null</c> → no role gate (the
+    /// AllowedTenants gate still applies). Non-null → the request's
+    /// <see cref="AgentToolTenancy.TenantRole"/> must equal this string
+    /// exactly (ordinal comparison; case-sensitive). Macro 2 ships
+    /// single-role-per-user, so a single-string check is sufficient
+    /// per Phase 3.F pin #4; a future multi-role-per-user surface would
+    /// upgrade this to a list.
+    ///
+    /// <para>
+    /// Fail-closed posture: if the request carries no role claim
+    /// (<c>TenantRole == null</c>), any non-null <c>RequiredRole</c>
+    /// hides the tool. Matches Macro 2 PR 6.7's missing-claim defense
+    /// convention.
+    /// </para>
+    /// </summary>
+    public string? RequiredRole { get; set; }
 }

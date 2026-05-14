@@ -48,11 +48,30 @@ public sealed class TenantClaimsMiddleware
     /// <summary>JWT claim name carrying the tenant Guid (uuid-format string per Phase 3.A C1).</summary>
     public const string TenantIdClaimName = "tenant_id";
 
+    /// <summary>
+    /// Phase 3.F: JWT claim name carrying the tenant-role string (drives
+    /// <c>IToolExposurePolicy</c>'s RequiredRole gate). Optional —
+    /// requests without this claim get
+    /// <c>HttpContext.Items[TenantRoleKey] = null</c>; policy treats
+    /// missing role as fail-closed for any RequiredRole gate. Macro 2's
+    /// QA token issuer may or may not emit this claim; the middleware
+    /// is permissive (null when absent), not 401-on-absent.
+    /// </summary>
+    public const string TenantRoleClaimName = "tenant_role";
+
     /// <summary>Deprecated Phase 1 header — fallback path emits a deprecation warning per request.</summary>
     public const string TenantHeaderName = "X-Trellis-Tenant-Id";
 
     /// <summary>Deprecated Phase 1 header — fallback path emits a deprecation warning per request.</summary>
     public const string UserHeaderName = "X-Trellis-User-Id";
+
+    /// <summary>
+    /// Phase 3.F: deprecated-header fallback for the tenant-role claim.
+    /// Optional — header-path requests without this header land with
+    /// <c>HttpContext.Items[TenantRoleKey] = null</c>, same fail-closed
+    /// behavior as the JWT path with the claim absent.
+    /// </summary>
+    public const string TenantRoleHeaderName = "X-Trellis-Tenant-Role";
 
     /// <summary>
     /// HttpContext.Items key for the resolved tenant id. Endpoint handlers
@@ -62,6 +81,15 @@ public sealed class TenantClaimsMiddleware
     public const string TenantIdKey = "trellis.tenant_id";
 
     public const string UserIdKey = "trellis.user_id";
+
+    /// <summary>
+    /// Phase 3.F: HttpContext.Items key for the resolved tenant-role
+    /// string. NULLABLE — value is <c>string?</c> (cast as
+    /// <c>(string?)context.Items[TenantClaimsMiddleware.TenantRoleKey]</c>).
+    /// Null when neither the JWT's <c>tenant_role</c> claim NOR the
+    /// deprecated <c>X-Trellis-Tenant-Role</c> header was present.
+    /// </summary>
+    public const string TenantRoleKey = "trellis.tenant_role";
 
     /// <summary>
     /// Meter for deprecation telemetry. Counter
@@ -127,6 +155,11 @@ public sealed class TenantClaimsMiddleware
 
             context.Items[TenantIdKey] = tenantClaim;
             context.Items[UserIdKey] = userClaim;
+            // Phase 3.F: optional tenant_role claim. Null when absent —
+            // IToolExposurePolicy treats null as fail-closed for any
+            // RequiredRole gate. Macro 2 may not emit this claim today;
+            // permissive read so existing JWTs continue working.
+            context.Items[TenantRoleKey] = context.User.FindFirst(TenantRoleClaimName)?.Value;
             await _next(context).ConfigureAwait(false);
             return;
         }
@@ -169,17 +202,24 @@ public sealed class TenantClaimsMiddleware
         // pass through to the endpoint. The DeprecatedHeader scheme name
         // distinguishes header-path principals from JWT principals in
         // any downstream auth-event logging.
-        var identity = new ClaimsIdentity(
-            new[]
-            {
-                new Claim(TenantIdClaimName, tenant),
-                new Claim(ClaimTypes.NameIdentifier, user),
-            },
-            authenticationType: DeprecatedHeaderAuthScheme);
+        // Phase 3.F: include the optional tenant-role claim when the
+        // X-Trellis-Tenant-Role header was present.
+        var roleHeader = context.Request.Headers[TenantRoleHeaderName].ToString();
+        var claims = new List<Claim>(3)
+        {
+            new(TenantIdClaimName, tenant),
+            new(ClaimTypes.NameIdentifier, user),
+        };
+        if (!string.IsNullOrWhiteSpace(roleHeader))
+        {
+            claims.Add(new Claim(TenantRoleClaimName, roleHeader));
+        }
+        var identity = new ClaimsIdentity(claims, authenticationType: DeprecatedHeaderAuthScheme);
         context.User = new ClaimsPrincipal(identity);
 
         context.Items[TenantIdKey] = tenant;
         context.Items[UserIdKey] = user;
+        context.Items[TenantRoleKey] = string.IsNullOrWhiteSpace(roleHeader) ? null : roleHeader;
         await _next(context).ConfigureAwait(false);
     }
 

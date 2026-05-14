@@ -2,6 +2,7 @@ using System.Net;
 using System.Net.Http.Json;
 using FluentAssertions;
 using Microsoft.AspNetCore.TestHost;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Trellis.Assistant.Endpoints;
@@ -56,7 +57,10 @@ public sealed class ConversationEndpointTests : IClassFixture<PostgresFixture>, 
         }
     }
 
-    private HttpClient NewClient(string? tenantId = TestTenants.TenantA, string? userId = TestTenants.UserA)
+    private HttpClient NewClient(
+        string? tenantId = TestTenants.TenantA,
+        string? userId = TestTenants.UserA,
+        string? tenantRole = null)
     {
         var client = _factory!.CreateClient();
         if (tenantId is not null)
@@ -66,6 +70,14 @@ public sealed class ConversationEndpointTests : IClassFixture<PostgresFixture>, 
         if (userId is not null)
         {
             client.DefaultRequestHeaders.Add(TenantClaimsMiddleware.UserHeaderName, userId);
+        }
+        // Phase 3.F: optional X-Trellis-Tenant-Role header for E2E tests
+        // that exercise the IToolExposurePolicy RequiredRole gate. Null
+        // (default) → no header → tenancy.TenantRole resolves to null
+        // at the middleware → fail-closed on any RequiredRole gate.
+        if (tenantRole is not null)
+        {
+            client.DefaultRequestHeaders.Add(TenantClaimsMiddleware.TenantRoleHeaderName, tenantRole);
         }
         return client;
     }
@@ -588,6 +600,156 @@ public sealed class ConversationEndpointTests : IClassFixture<PostgresFixture>, 
             "the LLM's tool_call arguments flowed through MapToSearchQuery → ISearchClient.SearchAsync with the query preserved");
     }
 
+    // ---------------- Phase 3.F: per-tenant tool exposure gating ----------------
+
+    [SkippableFact]
+    public async Task PostTurns_RoleGatedTool_HiddenWhenRoleClaimAbsent()
+    {
+        // Phase 3.F E2E pin: when PerTool config gates a tool by
+        // RequiredRole, callers without the role claim don't see it
+        // in the LLM-visible catalogue. Middleware extracts null (no
+        // X-Trellis-Tenant-Role header) → policy fail-closes →
+        // registry omits the tool from GetExposedDescriptorsFor.
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        // Override the test factory's options to gate chat_recent
+        // behind RequiredRole=admin. Apply per-test via WithWebHostBuilder
+        // so the global factory's behavior is preserved for other tests.
+        await using var customFactory = _factory!.WithWebHostBuilder(b =>
+        {
+            b.ConfigureAppConfiguration((_, cfg) =>
+            {
+                cfg.AddInMemoryCollection(new Dictionary<string, string?>
+                {
+                    ["Assistant:Tools:PerTool:chat_recent:RequiredRole"] = "admin",
+                });
+            });
+        });
+
+        // Default user — no role header → tenancy.TenantRole = null.
+        using var client = customFactory.CreateClient();
+        client.DefaultRequestHeaders.Add(TenantClaimsMiddleware.TenantHeaderName, TestTenants.TenantA);
+        client.DefaultRequestHeaders.Add(TenantClaimsMiddleware.UserHeaderName, TestTenants.UserA);
+
+        _factory.AgentLlmStub.EnqueueAssistantText("ok");
+
+        var convResp = await client.PostAsJsonAsync("/api/conversations",
+            new ConversationEndpoints.CreateConversationRequest(Channel: "api"));
+        var conv = await convResp.Content.ReadFromJsonAsync<ConversationEndpoints.CreateConversationResponse>();
+
+        await client.PostAsJsonAsync(
+            $"/api/conversations/{conv!.Id}/turns",
+            new ConversationEndpoints.AppendTurnRequest("default route — catalogue should omit chat_recent"));
+
+        var call = _factory!.AgentLlmStub.Calls[^1];
+        call.ToolDescriptions.Should().NotContain(d => d.Contains("recent conversation history"),
+            "chat_recent gated to role=admin; null-role caller does NOT see it in the LLM catalogue");
+        call.ToolDescriptions.Should().Contain(d => d.Contains("indexed document corpus"),
+            "search_documents is not role-gated; still exposed");
+    }
+
+    [SkippableFact]
+    public async Task PostTurns_RoleGatedTool_VisibleWhenRoleMatches()
+    {
+        // Companion pin: same RequiredRole=admin gate, but caller now
+        // carries X-Trellis-Tenant-Role=admin → tenancy.TenantRole=admin
+        // → policy passes → tool visible.
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        await using var customFactory = _factory!.WithWebHostBuilder(b =>
+        {
+            b.ConfigureAppConfiguration((_, cfg) =>
+            {
+                cfg.AddInMemoryCollection(new Dictionary<string, string?>
+                {
+                    ["Assistant:Tools:PerTool:chat_recent:RequiredRole"] = "admin",
+                });
+            });
+        });
+
+        using var client = customFactory.CreateClient();
+        client.DefaultRequestHeaders.Add(TenantClaimsMiddleware.TenantHeaderName, TestTenants.TenantA);
+        client.DefaultRequestHeaders.Add(TenantClaimsMiddleware.UserHeaderName, TestTenants.UserA);
+        // The role header is the load-bearing addition here.
+        client.DefaultRequestHeaders.Add(TenantClaimsMiddleware.TenantRoleHeaderName, "admin");
+
+        _factory.AgentLlmStub.EnqueueAssistantText("ok");
+
+        var convResp = await client.PostAsJsonAsync("/api/conversations",
+            new ConversationEndpoints.CreateConversationRequest(Channel: "api"));
+        var conv = await convResp.Content.ReadFromJsonAsync<ConversationEndpoints.CreateConversationResponse>();
+
+        await client.PostAsJsonAsync(
+            $"/api/conversations/{conv!.Id}/turns",
+            new ConversationEndpoints.AppendTurnRequest("admin caller — should see chat_recent"));
+
+        var call = _factory!.AgentLlmStub.Calls[^1];
+        call.ToolDescriptions.Should().Contain(d => d.Contains("recent conversation history"),
+            "chat_recent gated to role=admin; admin caller DOES see it (policy passes)");
+    }
+
+    [SkippableFact]
+    public async Task PostTurns_AllowedTenantsGate_HidesToolFromNonAllowedTenant()
+    {
+        // Phase 3.F E2E pin: AllowedTenants UUID gate. Configure
+        // chat_recent to only allow TenantA. TenantB caller hits the
+        // endpoint with otherwise-valid headers → policy hides
+        // chat_recent → catalogue omits it.
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        await using var customFactory = _factory!.WithWebHostBuilder(b =>
+        {
+            b.ConfigureAppConfiguration((_, cfg) =>
+            {
+                cfg.AddInMemoryCollection(new Dictionary<string, string?>
+                {
+                    ["Assistant:Tools:PerTool:chat_recent:AllowedTenants:0"] = TestTenants.TenantA,
+                });
+            });
+        });
+
+        // TenantB caller — not in AllowedTenants → chat_recent hidden.
+        using var clientB = customFactory.CreateClient();
+        clientB.DefaultRequestHeaders.Add(TenantClaimsMiddleware.TenantHeaderName, TestTenants.TenantB);
+        clientB.DefaultRequestHeaders.Add(TenantClaimsMiddleware.UserHeaderName, TestTenants.UserA);
+
+        _factory.AgentLlmStub.EnqueueAssistantText("ok");
+
+        var convResp = await clientB.PostAsJsonAsync("/api/conversations",
+            new ConversationEndpoints.CreateConversationRequest(Channel: "api"));
+        var conv = await convResp.Content.ReadFromJsonAsync<ConversationEndpoints.CreateConversationResponse>();
+
+        await clientB.PostAsJsonAsync(
+            $"/api/conversations/{conv!.Id}/turns",
+            new ConversationEndpoints.AppendTurnRequest("TenantB request"));
+
+        var denyCall = _factory!.AgentLlmStub.Calls[^1];
+        denyCall.ToolDescriptions.Should().NotContain(d => d.Contains("recent conversation history"),
+            "TenantB not in AllowedTenants → chat_recent hidden");
+
+        // PR #13 review polish: positive-side assertion. Without this,
+        // the test would pass even if the policy hid chat_recent from
+        // ALL tenants (false-green on the mutual-exclusion property).
+        // TenantA caller with otherwise-identical setup should see the
+        // tool — falsifies the "policy too restrictive" failure mode.
+        using var clientA = customFactory.CreateClient();
+        clientA.DefaultRequestHeaders.Add(TenantClaimsMiddleware.TenantHeaderName, TestTenants.TenantA);
+        clientA.DefaultRequestHeaders.Add(TenantClaimsMiddleware.UserHeaderName, TestTenants.UserA);
+
+        _factory.AgentLlmStub.EnqueueAssistantText("ok");
+
+        var convRespA = await clientA.PostAsJsonAsync("/api/conversations",
+            new ConversationEndpoints.CreateConversationRequest(Channel: "api"));
+        var convA = await convRespA.Content.ReadFromJsonAsync<ConversationEndpoints.CreateConversationResponse>();
+        await clientA.PostAsJsonAsync(
+            $"/api/conversations/{convA!.Id}/turns",
+            new ConversationEndpoints.AppendTurnRequest("TenantA request — should see chat_recent"));
+
+        var allowCall = _factory.AgentLlmStub.Calls[^1];
+        allowCall.ToolDescriptions.Should().Contain(d => d.Contains("recent conversation history"),
+            "TenantA IS on the AllowedTenants list — must still see chat_recent");
+    }
+
     // ---------------- Phase 3.E: multi-tool dispatch per LLM turn ----------------
 
     [SkippableFact]
@@ -1005,7 +1167,7 @@ public sealed class ConversationEndpointTests : IClassFixture<PostgresFixture>, 
         // and falls back to the direct-LLM path.
         Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
 
-        var customFactory = _factory!.WithWebHostBuilder(builder =>
+        await using var customFactory = _factory!.WithWebHostBuilder(builder =>
         {
             builder.ConfigureTestServices(services =>
             {
