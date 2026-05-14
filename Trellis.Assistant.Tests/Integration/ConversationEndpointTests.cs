@@ -588,6 +588,82 @@ public sealed class ConversationEndpointTests : IClassFixture<PostgresFixture>, 
             "the LLM's tool_call arguments flowed through MapToSearchQuery → ISearchClient.SearchAsync with the query preserved");
     }
 
+    // ---------------- Phase 3.E: multi-tool dispatch per LLM turn ----------------
+
+    [SkippableFact]
+    public async Task PostTurns_MultiToolCall_BothDispatchInOneTurn_FourTurnPersistence()
+    {
+        // Phase 3.E E2E pin: stub LLM emits TWO tool_calls in a single
+        // assistant message → executor dispatches both serially →
+        // orchestrator persists [user, tool A, tool B, assistant] as
+        // a 4-turn batch. The full chain is reachable via GET in
+        // position order.
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        // Search stub returns canned chunks; chat_recent stub doesn't
+        // need a seed (operates against the live store, which is empty
+        // for this fresh tenant).
+        _factory!.SearchClientStub.NextResult = new SearchClientResult
+        {
+            Success = true,
+            ResponseBodyJson = """[{"DocumentId":"doc1","ChunkContent":"Refunds within 30 days.","Score":0.95}]""",
+        };
+        _factory.AgentLlmStub
+            .EnqueueMultipleToolCalls(
+                ("search_documents", """{"query":"refund policy"}"""),
+                ("chat_recent", """{"query":"refund"}"""))
+            .EnqueueAssistantText("Combining both sources: refunds within 30 days; no prior discussion found.");
+
+        using var client = NewClient();
+        var convResp = await client.PostAsJsonAsync("/api/conversations",
+            new ConversationEndpoints.CreateConversationRequest(Channel: "api"));
+        var conv = await convResp.Content.ReadFromJsonAsync<ConversationEndpoints.CreateConversationResponse>();
+
+        // Tools = null → default agent path with full exposed catalogue.
+        var turnResp = await client.PostAsJsonAsync(
+            $"/api/conversations/{conv!.Id}/turns",
+            new ConversationEndpoints.AppendTurnRequest(
+                "What's the refund policy? Did we discuss it before?"));
+        turnResp.StatusCode.Should().Be(HttpStatusCode.OK);
+
+        var turnBody = await turnResp.Content.ReadFromJsonAsync<ConversationEndpoints.AppendTurnResponse>();
+        turnBody!.AssistantTurn.Content.Should().Contain("refunds within 30 days",
+            "final assistant text emitted after both tool results landed in context");
+
+        turnBody.ToolTurns.Should().NotBeNull();
+        turnBody.ToolTurns!.Should().HaveCount(2,
+            "two tool_calls in one LLM response → two persisted tool turns");
+        turnBody.ToolTurns![0].ToolName.Should().Be("search_documents",
+            "tool dispatches preserved in tool_calls[] order (Phase 3.E pin #4)");
+        turnBody.ToolTurns![1].ToolName.Should().Be("chat_recent");
+
+        // Position contiguity: user=0, tool A=1, tool B=2, assistant=3.
+        turnBody.UserTurn.Position.Should().Be(0);
+        turnBody.ToolTurns![0].Position.Should().Be(1);
+        turnBody.ToolTurns![1].Position.Should().Be(2);
+        turnBody.AssistantTurn.Position.Should().Be(3);
+
+        // Search tool actually invoked with the LLM's args.
+        _factory.SearchClientStub.LastQuery.Should().NotBeNull();
+        _factory.SearchClientStub.LastQuery!.Q.Should().Be("refund policy");
+
+        // 2 LLM calls: multi-tool dispatch turn + final synth.
+        _factory.AgentLlmStub.Calls.Should().HaveCount(2,
+            "agent loop iterated twice: 1 multi-tool turn + 1 final synth");
+
+        // GET returns the full 4-turn chain.
+        var getBody = (await (await client.GetAsync($"/api/conversations/{conv.Id}"))
+            .Content.ReadFromJsonAsync<ConversationEndpoints.GetConversationResponse>())!;
+        getBody.Turns.Should().HaveCount(4,
+            "[user, tool search_documents, tool chat_recent, assistant] — contiguous position order");
+        getBody.Turns[0].Role.Should().Be("user");
+        getBody.Turns[1].Role.Should().Be("tool");
+        getBody.Turns[1].ToolName.Should().Be("search_documents");
+        getBody.Turns[2].Role.Should().Be("tool");
+        getBody.Turns[2].ToolName.Should().Be("chat_recent");
+        getBody.Turns[3].Role.Should().Be("assistant");
+    }
+
     // ---------------- Phase 3.D: chat_recent live agent loop ----------------
 
     [SkippableFact]

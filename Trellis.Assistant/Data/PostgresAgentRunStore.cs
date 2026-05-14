@@ -221,6 +221,13 @@ public sealed class PostgresAgentRunStore : IAgentRunStore
         ArchivedAt = e.ArchivedAt,
         Steps = steps,
         TokensUsed = checked((int)Math.Min(e.TokensUsed, int.MaxValue)),
+        // Phase 3.E uncovered: pre-existing mapper bug. Core PR #14
+        // (AgentRun.ErrorMessage) added the field on the Core record +
+        // the entity + CompleteRunAsync persists it, but the entity →
+        // Core mapper here was missed — terminal-state diagnostic was
+        // silently null on GetRunAsync reads. Pinned by Phase 3.E's
+        // MultiToolCall_BudgetExhaustsMidIteration_DispatchesPartialAndSurfacesBudgetMarker.
+        ErrorMessage = e.ErrorMessage,
     };
 
     private static AgentStep ToCoreStep(AgentStepEntity e) => new()
