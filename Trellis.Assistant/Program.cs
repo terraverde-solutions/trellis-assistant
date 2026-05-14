@@ -253,11 +253,20 @@ builder.Services.AddSingleton<Func<ISearchClient>>(sp =>
 builder.Services.AddSingleton<IJsonSchemaValidator, JsonSchemaNetValidator>();
 
 // EchoTool ships forward as a debugging aid; SearchDocumentsTool is
-// Phase 3.B's first real tool. Both registered against IAgentTool;
+// Phase 3.B's first real tool; ChatRecentTool (Phase 3.D) is the
+// second production tool. All registered against IAgentTool;
 // ToolRegistry scans all registered IAgentTool services at startup and
 // JSON-schema-validates each descriptor's ParameterSchema.
 builder.Services.AddSingleton<IAgentTool, EchoTool>();
 builder.Services.AddSingleton<IAgentTool, SearchDocumentsTool>();
+// Phase 3.D: ChatRecentTool. Singleton — takes IServiceScopeFactory
+// (itself Singleton, built-in) + creates a fresh scope per RunAsync
+// call to resolve the scoped IAssistantConversationStore. The
+// IServiceScopeFactory pattern is the canonical fix for Singleton →
+// Scoped boundaries; the Phase 3.B Func<ISearchClient> pattern works
+// only because ISearchClient is transient (typed-HttpClient), not
+// scoped — same-tier consumers, different lifetime mismatch.
+builder.Services.AddSingleton<IAgentTool, ChatRecentTool>();
 builder.Services.AddSingleton<IToolRegistry, ToolRegistry>();
 builder.Services.AddSingleton<IAgentBudgetGate, DefaultBudgetGate>();
 // Register the concrete class + alias the interface to the same scope.

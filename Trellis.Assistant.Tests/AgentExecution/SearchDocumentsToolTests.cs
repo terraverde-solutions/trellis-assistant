@@ -175,6 +175,7 @@ public sealed class SearchDocumentsToolTests
         StepIndex = 0,
         ParametersJson = parametersJson,
         OrgId = Guid.NewGuid(),
+        UserId = "test-user",  // Phase 3.D widening; SearchDocumentsTool ignores user scope (loopback-trust Trainer is single-tenant) but the field is required.
     };
 
     private sealed class StubSearchClient : ISearchClient

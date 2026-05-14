@@ -12,6 +12,7 @@ Read first:
 - [`docs/phase-3a-design.md`](docs/phase-3a-design.md) — Phase 3.A.1 design rationale (Q1–Q11 + 7 worker concerns, OrgId↔TenantId bridge, X1 stub-vs-real test split, Phase 3.A.2 forward plan)
 - [`docs/phase-3b-design.md`](docs/phase-3b-design.md) — Phase 3.B design rationale (Q1 JsonSchema.Net library choice + 7 decide-and-documents, pass-through (a) wire shape, Trainer GET /api/search contract, JSON Schema validation turn-on)
 - [`docs/phase-3c-design.md`](docs/phase-3c-design.md) — Phase 3.C design rationale (live agent loop: routing default per Tools=null/[]/[name], system prompt with dynamic tool catalogue, ExposeEcho exposure gate, descriptor resolution, per-tool-dispatch operator logging)
+- [`docs/phase-3d-design.md`](docs/phase-3d-design.md) — Phase 3.D design rationale (ChatRecentTool: AgentToolInput.UserId threading, IServiceScopeFactory pattern for Singleton→Scoped store, ILIKE query, turn.created_at since filter, standalone-run sentinel)
 
 ## What this component is
 
@@ -24,6 +25,16 @@ The component design lives in [`59-trellis-assistant.md`](https://github.com/ter
 phase + guard-rails for what NOT to do yet.
 
 ## Status
+
+**Phase 3.D — ChatRecentTool scaffolded** on `kimi/phase3d-assistant-chat-recent-tool` (pairs with trellis-core PR #17 merged at `e790669`). New surface (this phase):
+
+- `Trellis.Assistant/AgentExecution/ChatRecentTool.cs` — second production tool (after SearchDocumentsTool). LLM can fetch the requesting user's recent conversation history via `tool_call("chat_recent", {query, limit?, since?})`. Returns turns sorted newest-first; tenant + user scope enforced via `IAssistantConversationStore`'s chokepoint.
+- `Trellis.Assistant/Data/PostgresAssistantConversationStore.SearchRecentTurnsAsync` — EF JOIN turns↔conversations with `EF.Functions.ILike`, defensive `Math.Clamp(limit, 1, 50)`, UTC kind coercion on `since`.
+- `AgentToolInput.UserId` threading: ConversationOrchestrator → AssistantAgentExecutor → ExecuteLoopAsync → DispatchOneToolCallAsync → AgentToolInput. Tools that don't need user scope (SearchDocumentsTool / EchoTool) ignore the field.
+- `AssistantAgentExecutor.AnonymousStandaloneUserId = "standalone"` sentinel for the operator `POST /api/agent-runs` path (no end-user identity). ChatRecentTool returns empty `[]` on that sentinel without making a store call.
+- DI lifetime: ChatRecentTool is Singleton; takes `IServiceScopeFactory` + creates a fresh scope per RunAsync call to resolve the scoped IAssistantConversationStore. Canonical Singleton→Scoped fix (Phase 3.B's `Func<T>` factory pattern works for Transient typed-HttpClient consumers but not for genuinely Scoped services).
+- 21 new tests (12 ChatRecentTool unit + 7 Postgres-backed integration + 2 E2E in ConversationEndpointTests).
+- Part E PR #10 follow-up: renamed `PostTurns_WithoutToolsField_PreservesPhase2DirectLlmPath` → `PostTurns_EmptyToolsArray_OptsOutOfAgentPath_DirectLlmPath`; comment rewritten + assertion swapped to snapshot pattern.
 
 **Phase 3.C — live agent-loop tool usage scaffolded** on `kimi/phase3c-live-agent-loop-tool-usage`. New surface (this phase):
 
@@ -239,6 +250,14 @@ Steady-state QA redeploys: `trellis-deploy/scripts/qa/Deploy-Assistant-Standalon
 - Unit: `trellis-assistant-qa.service`
 - Auth: shared `trellisqa` HTTP Basic credential at the Hetzner edge (same as web-qa + trainer-qa); GB10-side nginx is auth-free
 - Bootstrap walkthrough: `trellis-deploy/scripts/qa/bootstrap-assistant.md`
+
+## Don't (Phase 3.D)
+
+- **Don't capture a scoped service in a Singleton tool directly.** Phase 3.D's `IServiceScopeFactory` pattern in ChatRecentTool is the canonical fix. Phase 3.B's `Func<T>` factory works for Transient consumers (typed-HttpClient) but NOT for genuinely Scoped services like `IAssistantConversationStore` — ASP.NET Core's scope validation blocks Singleton-from-Scoped resolution at runtime.
+- **Don't add `chat_recent` results outside the (tenant, user) scope.** The JOIN-based filter at `PostgresAssistantConversationStore.SearchRecentTurnsAsync` is the single chokepoint; bypassing it via direct EF queries (rather than the interface method) would lose the protection. Pinned by `PostgresAssistantConversationStoreSearchTests.SearchRecentTurnsAsync_TenantAndUserScope_FiltersOutOtherTenantsAndUsers` + the E2E `ChatRecent_TenantScoping_TenantBCannotSeeTenantATurns`.
+- **Don't run chat_recent against `AgentToolInput.UserId == AnonymousStandaloneUserId`.** The sentinel signals "no end-user identity" (operator-facing standalone path); querying with the sentinel as the userId would either match no rows OR (worse, hypothetically) match a tenant that registered a literal user named "standalone." ChatRecentTool short-circuits to empty `[]` at the tool layer; this contract is pinned.
+- **Don't read `IAssistantConversationStore` from `ChatRecentTool` ctor directly.** The store is Scoped; the tool is Singleton. Use `IServiceScopeFactory.CreateScope()` per RunAsync. The Phase 3.D class doc on ChatRecentTool spells out why.
+- **Don't add a trigram or tsvector index on `turns.content` for Phase 3.D.** v0 uses sequential-scan ILIKE; small per-user inboxes don't need it. If real-world query latency surfaces, that's a Phase 3.E+ migration brief.
 
 ## Don't (Phase 3.C)
 

@@ -25,6 +25,7 @@ namespace Trellis.Assistant.Tests.AgentExecution;
 public sealed class AssistantAgentExecutorTests : IClassFixture<PostgresFixture>, IAsyncLifetime
 {
     private static readonly Guid TestOrgId = Guid.Parse(TestTenants.TenantA);
+    private const string TestUserId = TestTenants.UserA;
     private readonly PostgresFixture _pg;
     private AssistantDbContext? _db;
 
@@ -339,6 +340,7 @@ public sealed class AssistantAgentExecutorTests : IClassFixture<PostgresFixture>
         };
         var result = await executor.RunForConversationAsync(
             orgId: TestOrgId,
+            userId: TestUserId,
             assistantTurnId: null,
             userPrompt: "what's the capital?",
             messages: messages,
@@ -367,6 +369,7 @@ public sealed class AssistantAgentExecutorTests : IClassFixture<PostgresFixture>
         };
         var result = await executor.RunForConversationAsync(
             orgId: TestOrgId,
+            userId: TestUserId,
             assistantTurnId: null,
             userPrompt: "echo agent dispatch",
             messages: messages,
@@ -407,6 +410,7 @@ public sealed class AssistantAgentExecutorTests : IClassFixture<PostgresFixture>
         };
         var result = await executor.RunForConversationAsync(
             orgId: TestOrgId,
+            userId: TestUserId,
             assistantTurnId: null,
             userPrompt: "test failure path",
             messages: messages,
@@ -440,6 +444,7 @@ public sealed class AssistantAgentExecutorTests : IClassFixture<PostgresFixture>
         };
         var result = await executor.RunForConversationAsync(
             orgId: TestOrgId,
+            userId: TestUserId,
             assistantTurnId: null,
             userPrompt: "loop a bit",
             messages: messages,
@@ -469,6 +474,7 @@ public sealed class AssistantAgentExecutorTests : IClassFixture<PostgresFixture>
         };
         var act = () => executor.RunForConversationAsync(
             orgId: Guid.Empty,
+            userId: TestUserId,
             assistantTurnId: null,
             userPrompt: "x",
             messages: messages,
@@ -501,6 +507,7 @@ public sealed class AssistantAgentExecutorTests : IClassFixture<PostgresFixture>
         };
         var result = await executor.RunForConversationAsync(
             orgId: TestOrgId,
+            userId: TestUserId,
             assistantTurnId: null,
             userPrompt: "test",
             messages: messages,
@@ -588,6 +595,7 @@ public sealed class AssistantAgentExecutorTests : IClassFixture<PostgresFixture>
         };
         await executor.RunForConversationAsync(
             orgId: TestOrgId,
+            userId: TestUserId,
             assistantTurnId: null,
             userPrompt: "test",
             messages: messages,

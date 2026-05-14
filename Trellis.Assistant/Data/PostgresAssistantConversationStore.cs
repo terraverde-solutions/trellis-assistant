@@ -248,6 +248,90 @@ public sealed class PostgresAssistantConversationStore : IAssistantConversationS
         return entities.Select(ToCore).ToList();
     }
 
+    public async Task<IReadOnlyList<RecentTurnSummary>> SearchRecentTurnsAsync(
+        string tenantId,
+        string userId,
+        string query,
+        int limit,
+        DateTime? since,
+        CancellationToken cancellationToken = default)
+    {
+        ValidateTenantUser(tenantId, userId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(query);
+        // Defensive LIMIT clamp. The Phase 3.D tool-args JSON Schema
+        // enforces 1-50 client-side, but the store can't trust callers
+        // per the chokepoint discipline that protects every other
+        // method on this interface. <1 collapses to 1; >50 caps at 50.
+        var effectiveLimit = Math.Clamp(limit, 1, 50);
+
+        // since must be UTC. Per the Phase 3.D ratify XML doc + caller
+        // contract — but coerce defensively to avoid a Postgres
+        // "timestamp with/without time zone" mismatch. Unspecified is
+        // treated as UTC (matches our DateTime.UtcNow write path);
+        // Local is converted.
+        DateTime? effectiveSinceUtc = since switch
+        {
+            null => null,
+            { Kind: DateTimeKind.Utc } => since,
+            { Kind: DateTimeKind.Unspecified } => DateTime.SpecifyKind(since.Value, DateTimeKind.Utc),
+            { Kind: DateTimeKind.Local } => since.Value.ToUniversalTime(),
+            _ => since,
+        };
+
+        // EF Core query joining turns → conversations to push the
+        // (tenant, user) filter through the FK relationship. The
+        // join + filter compile to a single SELECT with the tenant +
+        // user constraint applied at the Postgres layer — callers
+        // cannot race-leak turns from other tenants.
+        //
+        // EF.Functions.ILike is the Npgsql provider's case-insensitive
+        // LIKE extension (compiles to Postgres-native `ILIKE`). v0
+        // sequential-scan acceptable for small per-user inboxes; the
+        // 3.E+ trigram index migration lands if real-world latency
+        // justifies it. Caller's `query` is parameterized — no SQL
+        // injection seam even though the wildcard fences are
+        // concatenated.
+        var pattern = $"%{query}%";
+        // AsNoTracking: this is a read-only search query — never updates
+        // the projected entities — so we don't pay the tracker overhead
+        // AND we don't return stale cached entities from the change
+        // tracker when a caller has updated rows via ExecuteUpdateAsync
+        // elsewhere (the PR #11 v2 review surfaced this: the
+        // SearchRecentTurnsAsync_ResultsSortedNewestFirst test backdates
+        // a turn directly via ExecuteUpdateAsync, then re-queries — the
+        // tracker-cached entity has the original CreatedAt, masking the
+        // backdate. AsNoTracking forces a fresh DB read).
+        var q = from t in _db.Turns.AsNoTracking()
+                join c in _db.Conversations.AsNoTracking() on t.ConversationId equals c.Id
+                where c.TenantId == tenantId && c.UserId == userId
+                where EF.Functions.ILike(t.Content, pattern)
+                select t;
+
+        if (effectiveSinceUtc.HasValue)
+        {
+            // Per Phase 3.D Q4 ratify: filter on turn.created_at, NOT
+            // conversation.updated_at. More precise — matches the LLM's
+            // mental model ("what did we discuss yesterday after 3pm" =
+            // turn-level instant, not conversation-level last-touch).
+            var sinceUtc = effectiveSinceUtc.Value;
+            q = q.Where(t => t.CreatedAt >= sinceUtc);
+        }
+
+        var rows = await q
+            .OrderByDescending(t => t.CreatedAt)
+            .Take(effectiveLimit)
+            .ToListAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        return rows.Select(t => new RecentTurnSummary(
+            ConversationId: t.ConversationId,
+            TurnId: t.Id,
+            Position: t.Position,
+            Role: ToRoleEnum(t.Role),
+            Content: t.Content,
+            CreatedAt: t.CreatedAt)).ToList();
+    }
+
     private static void ValidateTenantUser(string tenantId, string userId)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(tenantId);

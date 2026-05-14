@@ -1,5 +1,6 @@
 using FluentAssertions;
 using Trellis.Assistant.AgentExecution;
+using Trellis.Assistant.Tests.TestFixtures;
 using Trellis.Core.Models;
 using Xunit;
 
@@ -87,5 +88,6 @@ public sealed class EchoToolTests
         StepIndex = 0,
         ParametersJson = parametersJson,
         OrgId = TestOrgId,
+        UserId = TestTenants.UserA,  // Phase 3.D widening; EchoTool ignores user scope but the field is required.
     };
 }

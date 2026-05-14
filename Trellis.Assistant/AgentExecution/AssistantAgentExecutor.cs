@@ -128,7 +128,38 @@ public sealed class AssistantAgentExecutor : IAgentExecutor
         AgentRunRequest request,
         CancellationToken cancellationToken = default)
     {
+        return await RunAsync(request, userId: AnonymousStandaloneUserId, cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Phase 3.D: standalone-run user-scope sentinel. The standalone
+    /// <c>POST /api/agent-runs</c> endpoint doesn't carry a per-user
+    /// identity (it's an operator-facing audit/debugging surface, not a
+    /// per-end-user conversation endpoint); the <see cref="IAgentTool"/>
+    /// interface widening to require <see cref="AgentToolInput.UserId"/>
+    /// applies uniformly. The sentinel value <c>standalone</c> documents
+    /// "this dispatch wasn't triggered by an authenticated end-user."
+    /// Tools that filter on user-scope (chat_recent) treat this as a
+    /// signal to skip user filtering OR return empty — chat_recent
+    /// currently returns empty (no user-history to surface), which
+    /// matches the standalone endpoint's audit-only intent.
+    /// </summary>
+    public const string AnonymousStandaloneUserId = "standalone";
+
+    /// <summary>
+    /// Phase 3.D: standalone path with explicit userId. Used by the
+    /// conversation-integrated path's internal call to keep a single
+    /// loop body; external callers go through the parameterless overload
+    /// + accept the <c>standalone</c> sentinel.
+    /// </summary>
+    public async Task<AgentRun> RunAsync(
+        AgentRunRequest request,
+        string userId,
+        CancellationToken cancellationToken = default)
+    {
         ArgumentNullException.ThrowIfNull(request);
+        ArgumentException.ThrowIfNullOrWhiteSpace(userId);
 
         var startedAt = DateTime.UtcNow;
         var effectiveOverrides = WithAssistantDefaults(request.BudgetOverrides);
@@ -154,7 +185,7 @@ public sealed class AssistantAgentExecutor : IAgentExecutor
         };
 
         var loopResult = await ExecuteLoopAsync(
-            runId, request.OrgId, startedAt, messages, resolvableTools,
+            runId, request.OrgId, userId, startedAt, messages, resolvableTools,
             effectiveOverrides, cancellationToken).ConfigureAwait(false);
 
         return await PersistTerminalStateAsync(
@@ -232,6 +263,7 @@ public sealed class AssistantAgentExecutor : IAgentExecutor
     /// passing in.</param>
     public async Task<ConversationAgentResult> RunForConversationAsync(
         Guid orgId,
+        string userId,
         Guid? assistantTurnId,
         string userPrompt,
         List<ChatMessage> messages,
@@ -245,6 +277,7 @@ public sealed class AssistantAgentExecutor : IAgentExecutor
                 "OrgId must be non-empty (matches AgentRunRequest.Create's contract).",
                 nameof(orgId));
         }
+        ArgumentException.ThrowIfNullOrWhiteSpace(userId);
         ArgumentException.ThrowIfNullOrWhiteSpace(userPrompt);
         ArgumentNullException.ThrowIfNull(messages);
         ArgumentNullException.ThrowIfNull(availableTools);
@@ -272,7 +305,7 @@ public sealed class AssistantAgentExecutor : IAgentExecutor
         });
 
         var loopResult = await ExecuteLoopAsync(
-            runId, orgId, startedAt, messages, resolvableTools,
+            runId, orgId, userId, startedAt, messages, resolvableTools,
             effectiveOverrides, cancellationToken).ConfigureAwait(false);
 
         var completedRun = await PersistTerminalStateAsync(
@@ -342,6 +375,7 @@ public sealed class AssistantAgentExecutor : IAgentExecutor
     private async Task<LoopResult> ExecuteLoopAsync(
         Guid runId,
         Guid orgId,
+        string userId,
         DateTime startedAt,
         List<ChatMessage> messages,
         IReadOnlyList<AgentToolDescriptor> resolvableTools,
@@ -427,7 +461,7 @@ public sealed class AssistantAgentExecutor : IAgentExecutor
                     cancellationToken.ThrowIfCancellationRequested();
                     var canonicalArgs = CanonicalizeJson(call.ArgumentsJson);
                     var step = await DispatchOneToolCallAsync(
-                        runId, orgId, stepIndex, call, canonicalArgs, cancellationToken)
+                        runId, orgId, userId, stepIndex, call, canonicalArgs, cancellationToken)
                         .ConfigureAwait(false);
 
                     recentDispatches.Add(new AgentRunStateToolDispatch
@@ -507,6 +541,7 @@ public sealed class AssistantAgentExecutor : IAgentExecutor
     private async Task<AgentStep> DispatchOneToolCallAsync(
         Guid runId,
         Guid orgId,
+        string userId,
         int stepIndex,
         AgentLlmToolCall call,
         string canonicalArgs,
@@ -588,6 +623,7 @@ public sealed class AssistantAgentExecutor : IAgentExecutor
                         StepIndex = stepIndex,
                         ParametersJson = canonicalArgs,
                         OrgId = orgId,
+                        UserId = userId,
                     },
                     cancellationToken)
                 .ConfigureAwait(false);

@@ -19,27 +19,31 @@ namespace Trellis.Assistant.Tests.TestFixtures;
 /// </summary>
 public sealed class PostgresFixture : IAsyncLifetime
 {
-#pragma warning disable CS0618 // Obsolete parameterless ctor — kept while
-    // we mirror trellis-trainer's TestDatabaseFixture exactly. The
-    // image-as-constructor-arg variant produced password-auth failures
-    // mid-startup in the AssistantWebApplicationFactory's auto-migrate
-    // path on this build (the new ctor's interaction with WithUsername/
-    // WithPassword overrides differs subtly from the parameterless +
-    // WithImage chain). Once trainer's fixture migrates to the new
-    // signature, this one follows.
-    private readonly PostgreSqlContainer _container = new PostgreSqlBuilder()
-        .WithImage("postgres:16")
-        .WithDatabase("trellis_assistant_test")
-        .WithUsername("postgres")
-        .WithPassword("postgres")
-        .Build();
-#pragma warning restore CS0618
+    // PR #11 review Blocker 1: PostgreSqlBuilder.Build() probes Docker
+    // synchronously during .Validate(). On Docker-down hosts this throws
+    // DockerUnavailableException; xUnit catches the class-fixture
+    // constructor exception and marks every gated test as Failed (not
+    // Skipped) — the SkippableFact + Skip.IfNot(IsAvailable) gate never
+    // runs because the fixture couldn't be constructed.
+    //
+    // Defer both the build + the start into InitializeAsync, after the
+    // IsDockerAvailable() probe. Field is nullable; ConnectionString
+    // throws clearly if accessed before InitializeAsync ran successfully
+    // (which means the gate was bypassed — operator error, not silent
+    // Docker-down).
+    private PostgreSqlContainer? _container;
 
     /// <summary>
     /// Connection string for the started container. Throws if the
-    /// container hasn't been started yet via <see cref="InitializeAsync"/>.
+    /// container hasn't been started yet via <see cref="InitializeAsync"/>
+    /// (i.e., Docker was down OR the caller bypassed the
+    /// <see cref="IsAvailable"/> gate).
     /// </summary>
-    public string ConnectionString => _container.GetConnectionString();
+    public string ConnectionString => _container?.GetConnectionString()
+        ?? throw new InvalidOperationException(
+            "PostgresFixture not initialized — Docker was unavailable at InitializeAsync, " +
+            "or the caller bypassed the IsAvailable skip gate. Wrap consumer tests in " +
+            "[SkippableFact] + Skip.IfNot(_pg.IsAvailable, \"...\").");
 
     public bool IsAvailable { get; private set; }
 
@@ -50,25 +54,54 @@ public sealed class PostgresFixture : IAsyncLifetime
             // Tests that depend on this fixture should use Skip.IfNot
             // and gate on IsAvailable. Fixture initialisation is skipped
             // entirely so we don't waste 30s waiting for a container
-            // that can't start.
+            // that can't start AND we don't crash the class-fixture ctor.
             IsAvailable = false;
             return;
         }
         try
         {
+#pragma warning disable CS0618 // Obsolete parameterless ctor — kept while
+            // we mirror trellis-trainer's TestDatabaseFixture exactly. The
+            // image-as-constructor-arg variant produced password-auth failures
+            // mid-startup in the AssistantWebApplicationFactory's auto-migrate
+            // path on this build (the new ctor's interaction with WithUsername/
+            // WithPassword overrides differs subtly from the parameterless +
+            // WithImage chain). Once trainer's fixture migrates to the new
+            // signature, this one follows.
+            _container = new PostgreSqlBuilder()
+                .WithImage("postgres:16")
+                .WithDatabase("trellis_assistant_test")
+                .WithUsername("postgres")
+                .WithPassword("postgres")
+                .Build();
+#pragma warning restore CS0618
             await _container.StartAsync();
             IsAvailable = true;
         }
         catch
         {
+            // PR #11 v2 review polish: don't rethrow. A failure in
+            // .Build() / .StartAsync() AFTER IsDockerAvailable() passed
+            // is rare but possible (image pull failure, port exhaustion,
+            // OOM, intermittent daemon hiccup). Rethrowing reintroduces
+            // the original PR #11 Blocker 1 symptom on a different path
+            // — xUnit catches the class-fixture init failure + marks
+            // every consumer test as Failed (not Skipped). Dispose the
+            // partially-built container if any, leave IsAvailable=false,
+            // let the SkippableFact gate skip cleanly.
             IsAvailable = false;
-            throw;
+            if (_container is not null)
+            {
+                try { await _container.DisposeAsync().ConfigureAwait(false); }
+                catch { /* best-effort cleanup; do not mask the original failure path */ }
+                _container = null;
+            }
         }
     }
 
     public async Task DisposeAsync()
     {
-        if (IsAvailable)
+        if (_container is not null)
         {
             await _container.DisposeAsync();
         }
