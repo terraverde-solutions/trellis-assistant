@@ -612,6 +612,16 @@ public sealed class AssistantAgentExecutorTests : IClassFixture<PostgresFixture>
     /// passed in + then halts the loop with StepCapReached so the
     /// executor exits quickly. Used by the injection-contract pins.
     /// </summary>
+    /// <summary>
+    /// Phase 3.F test helper. Returns true for every tool — preserves
+    /// the pre-Phase-3.F "all tools exposed" behavior for executor
+    /// tests that don't specifically exercise per-tenant gating.
+    /// </summary>
+    private sealed class AllowAllExposurePolicy : IToolExposurePolicy
+    {
+        public bool IsExposedTo(IAgentTool tool, AgentToolTenancy tenancy) => true;
+    }
+
     private sealed class CaptureBudgetGate : IAgentBudgetGate
     {
         public AgentRunState? FirstCallState { get; private set; }
@@ -1094,7 +1104,13 @@ public sealed class AssistantAgentExecutorTests : IClassFixture<PostgresFixture>
         // also makes Registry.Descriptors include echo for any test
         // that asserts on the exposed catalogue.
         var catalogueOptions = Options.Create(new ToolCatalogueOptions { ExposeEcho = true });
-        var registry = new ToolRegistry(allTools, schemaValidator, catalogueOptions);
+        // Phase 3.F: executor tests build their own AvailableTools via
+        // AgentRunRequest.Create — the registry's tenancy-aware getter
+        // isn't exercised by these tests. Allow-all policy preserves
+        // pre-Phase-3.F behavior; gating-specific tests live in
+        // ToolRegistry / IToolExposurePolicy test classes.
+        var exposurePolicy = new AllowAllExposurePolicy();
+        var registry = new ToolRegistry(allTools, schemaValidator, catalogueOptions, exposurePolicy);
         // Post-Phase-3.A.2 retrofit: default to Trellis.Core's
         // DefaultBudgetGate. Tests that need to capture the executor's
         // call-time AgentRunState pass a custom gate (used by the

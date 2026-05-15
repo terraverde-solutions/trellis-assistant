@@ -102,11 +102,17 @@ public sealed class ConversationOrchestrator
         Guid conversationId,
         string userContent,
         IReadOnlyList<string>? toolNameFilter = null,
+        string? tenantRole = null,
         CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(tenantId);
         ArgumentException.ThrowIfNullOrWhiteSpace(userId);
         ArgumentException.ThrowIfNullOrWhiteSpace(userContent);
+        // tenantRole is intentionally nullable — Phase 3.F middleware
+        // resolves null when neither JWT's tenant_role claim nor the
+        // deprecated X-Trellis-Tenant-Role header was present. The
+        // IToolExposurePolicy fails-closed on null for any RequiredRole
+        // gate, so the orchestrator forwards null without normalization.
 
         // Verify the conversation exists + is owned by (tenantId, userId)
         // up-front. AppendTurnsAsync re-checks inside its transaction
@@ -151,8 +157,30 @@ public sealed class ConversationOrchestrator
         IReadOnlyList<AgentToolDescriptor>? agentDescriptors = null;
         if (toolNameFilter is null)
         {
-            // Default route: full exposed catalogue.
-            agentDescriptors = _toolRegistry.Descriptors;
+            // Default route: per-tenant exposed catalogue. Phase 3.F:
+            // the registry's tenancy-aware getter applies the full
+            // IToolExposurePolicy (EchoTool ExposeEcho gate + per-tool
+            // AllowedTenants + RequiredRole matrix). Untenanted
+            // Descriptors property is reserved for the standalone
+            // POST /api/agent-runs path (per Phase 3.F pin #6).
+            if (Guid.TryParse(tenantId, out var tenancyOrgId))
+            {
+                var tenancy = new AgentExecution.AgentToolTenancy(
+                    TenantId: tenancyOrgId,
+                    UserId: userId,
+                    TenantRole: tenantRole);
+                agentDescriptors = _toolRegistry.GetExposedDescriptorsFor(tenancy);
+            }
+            else
+            {
+                // Non-uuid tenantId — same Phase 3.A C1 contract path
+                // as below. Fall back to untenanted Descriptors so the
+                // existing 400-Bad-Request flow (which fires when the
+                // agent path tries to parse the orgId) surfaces
+                // unchanged. The tenancy gate doesn't get a chance to
+                // act on malformed input.
+                agentDescriptors = _toolRegistry.Descriptors;
+            }
         }
         else if (toolNameFilter.Count > 0)
         {

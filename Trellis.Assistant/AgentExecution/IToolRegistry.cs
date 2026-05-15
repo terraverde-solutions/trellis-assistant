@@ -32,16 +32,49 @@ namespace Trellis.Assistant.AgentExecution;
 public interface IToolRegistry
 {
     /// <summary>
-    /// All registered tool descriptors. Surfaced to the planner LLM as
-    /// the <c>AgentRunRequest.AvailableTools</c> input.
+    /// Untenanted exposed-tool descriptor list. Phase 3.C filtering by
+    /// <see cref="ToolCatalogueOptions.ExposeEcho"/> only — does NOT
+    /// apply the Phase 3.F per-tenant <see cref="ToolCatalogueOptions.PerTool"/>
+    /// matrix. Used by the standalone <c>POST /api/agent-runs</c> path
+    /// (operator-facing; no end-user tenancy in scope) per Phase 3.F
+    /// pin #6.
     /// </summary>
     IReadOnlyList<AgentToolDescriptor> Descriptors { get; }
+
+    /// <summary>
+    /// Phase 3.F: per-tenant exposed-tool descriptor list. Applies the
+    /// full <see cref="IToolExposurePolicy"/>:
+    /// <list type="bullet">
+    /// <item>EchoTool gated by <see cref="ToolCatalogueOptions.ExposeEcho"/>
+    /// (Phase 3.C special case).</item>
+    /// <item>Other tools gated by the per-tool rule in
+    /// <see cref="ToolCatalogueOptions.PerTool"/>: AllowedTenants
+    /// allowlist + RequiredRole gate.</item>
+    /// <item>Default exposed when no rule matches (Phase 3.F pin #1
+    /// back-compat).</item>
+    /// </list>
+    /// Used by the conversation-integrated agent path
+    /// (<c>POST /api/conversations/{id}/turns</c>) where
+    /// <see cref="AgentToolTenancy"/> is available from the request
+    /// context.
+    /// </summary>
+    IReadOnlyList<AgentToolDescriptor> GetExposedDescriptorsFor(AgentToolTenancy tenancy);
 
     /// <summary>
     /// Resolve a tool by name. Returns <c>null</c> when the model emits
     /// a tool_call for a name that isn't registered — the executor
     /// converts that to an <see cref="AgentStepStatus.Failed"/> step
     /// with a "tool not registered" error message.
+    ///
+    /// <para>
+    /// Phase 3.F note: <see cref="GetTool"/> is INTENTIONALLY not
+    /// tenancy-gated. v0 relies on catalogue-only gating —
+    /// <see cref="GetExposedDescriptorsFor"/> filters what the LLM sees;
+    /// the LLM can't emit a tool_call for what it doesn't see. A
+    /// dispatch-time tenancy check would be defense-in-depth against
+    /// post-jailbreak attempts and is a future 3.G+ hardening if a
+    /// real bypass surfaces.
+    /// </para>
     /// </summary>
     IAgentTool? GetTool(string name);
 }

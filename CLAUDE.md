@@ -14,6 +14,7 @@ Read first:
 - [`docs/phase-3c-design.md`](docs/phase-3c-design.md) — Phase 3.C design rationale (live agent loop: routing default per Tools=null/[]/[name], system prompt with dynamic tool catalogue, ExposeEcho exposure gate, descriptor resolution, per-tool-dispatch operator logging)
 - [`docs/phase-3d-design.md`](docs/phase-3d-design.md) — Phase 3.D design rationale (ChatRecentTool: AgentToolInput.UserId threading, IServiceScopeFactory pattern for Singleton→Scoped store, ILIKE query, turn.created_at since filter, standalone-run sentinel)
 - [`docs/phase-3e-design.md`](docs/phase-3e-design.md) — Phase 3.E design rationale (multi-tool dispatch per LLM turn: serial only / 1 step per tool_call / mid-iteration budget gate / synthetic BUDGET_EXHAUSTED system message / preserved Phase 3.A.2 in-loop wire encoding)
+- [`docs/phase-3f-design.md`](docs/phase-3f-design.md) — Phase 3.F design rationale (per-tenant tool exposure gating: IToolExposurePolicy + AllowedTenants UUID gate + RequiredRole single-string gate; AgentToolTenancy local record; tenant_role JWT claim extraction + X-Trellis-Tenant-Role header fallback; standalone path bypasses policy; fail-closed on null role)
 
 ## What this component is
 
@@ -26,6 +27,18 @@ The component design lives in [`59-trellis-assistant.md`](https://github.com/ter
 phase + guard-rails for what NOT to do yet.
 
 ## Status
+
+**Phase 3.F — per-tenant tool exposure gating scaffolded** on `kimi/phase3f-per-tenant-tool-gating`. New surface (this phase):
+
+- `AgentExecution/AgentToolTenancy.cs` — new local record `(Guid TenantId, string UserId, string? TenantRole)` passed into the exposure policy. Single-consumer rule (lives in Assistant.AgentExecution, NOT Trellis.Core); lift when Workflow/Server need the same shape.
+- `AgentExecution/IToolExposurePolicy.cs` + `DefaultToolExposurePolicy.cs` — policy seam returning true/false per tool+tenancy. EchoTool special case (ExposeEcho flag, no tenant filtering); other tools check `Assistant:Tools:PerTool[name]` rule for `AllowedTenants` UUID allowlist + `RequiredRole` string. Both gates AND'd. Default exposed when no rule matches (Phase 3.F pin #1 back-compat). LogDebug on denials (gating is normal operation, not alert-worthy).
+- `AgentExecution/ToolCatalogueOptions.cs` extended with `Dictionary<string, ToolExposureRule> PerTool` + the rule type. ExposeEcho preserved.
+- `AgentExecution/IToolRegistry.GetExposedDescriptorsFor(AgentToolTenancy)` — new tenancy-aware getter returns descriptor list filtered by policy. Untenanted `Descriptors` property preserved unchanged for the standalone `POST /api/agent-runs` path (per Phase 3.F pin #6).
+- `Middleware/TenantClaimsMiddleware` — reads `tenant_role` JWT claim + `X-Trellis-Tenant-Role` deprecated-header fallback. Stashed in `HttpContext.Items[TenantRoleKey]` as nullable string. Permissive on null — when neither source has the claim, policy fails-closed on any RequiredRole gate. Macro 2 emission status doesn't block Phase 3.F.
+- `Services/ConversationOrchestrator.HandleUserTurnAsync` — new optional `tenantRole : string?` param. Default route reads `GetExposedDescriptorsFor(tenancy)`; filter route preserves Phase 3.C pre-resolution.
+- `Endpoints/ConversationEndpoints` — forwards `(string?)HttpContext.Items[TenantRoleKey]` into orchestrator.
+- `TestFixtures/TestAuthenticationHandler` — synthesizes `tenant_role` claim from `X-Trellis-Tenant-Role` header when present (test factory short-circuits the deprecated-header path; tests exercising role gating need the claim attached at the handler).
+- 20 new tests: 13 pure-unit `DefaultToolExposurePolicyTests` + 4 `ToolRegistryTests` Phase 3.F pins (delegate-to-policy, different-tenancies-different-lists, empty-list-not-null, untenanted-bypass) + 3 Docker-gated E2E (role-gated hidden without claim, visible with matching claim, AllowedTenants tenant-mismatch hidden).
 
 **Phase 3.E — multi-tool dispatch per LLM turn scaffolded** on `kimi/phase3e-parallel-tool-calls`. New surface (this phase):
 
@@ -261,6 +274,14 @@ Steady-state QA redeploys: `trellis-deploy/scripts/qa/Deploy-Assistant-Standalon
 - Unit: `trellis-assistant-qa.service`
 - Auth: shared `trellisqa` HTTP Basic credential at the Hetzner edge (same as web-qa + trainer-qa); GB10-side nginx is auth-free
 - Bootstrap walkthrough: `trellis-deploy/scripts/qa/bootstrap-assistant.md`
+
+## Don't (Phase 3.F)
+
+- **Don't apply `IToolExposurePolicy` on the untenanted `Descriptors` property.** Pin #6: standalone `POST /api/agent-runs` is operator-facing; bypasses the policy intentionally. If a future operator-facing endpoint wants per-operator gating, that's a separate brief — `Descriptors` stays untenanted.
+- **Don't tenancy-gate `GetTool(name)` (dispatch).** v0 relies on catalogue-only gating — the LLM can't emit tool_calls for tools it never saw. Dispatch-time tenancy check is defense-in-depth Phase 3.G+ when a real bypass surfaces.
+- **Don't move `AgentToolTenancy` to Trellis.Core for Phase 3.F.** Single-consumer rule (Phase 3.A precedent): the only consumer today is `IToolExposurePolicy`. Lift when a second component (Workflow / Server) needs the same shape.
+- **Don't broaden `RequiredRole` to a list of roles in Phase 3.F.** Pin #4: single-string ordinal compare matches Macro 2's single-role-per-user model. Multi-role-per-user is a config-shape change + a Macro 2 dependency; revisit when the upstream model supports it.
+- **Don't pass `tenantRole` as required.** Permissive on null is the safety posture: fail-closed on null role + non-null RequiredRole hides the tool. Requiring the role at the boundary would 401 every JWT that didn't carry the claim, breaking Macro 2 callers that don't emit it.
 
 ## Don't (Phase 3.E)
 

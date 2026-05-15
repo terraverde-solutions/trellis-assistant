@@ -253,10 +253,18 @@ public static class ConversationEndpoints
 
         try
         {
+            // Phase 3.F: forward the optional tenant_role from
+            // HttpContext.Items. Null when neither JWT's tenant_role
+            // claim nor the deprecated X-Trellis-Tenant-Role header
+            // was present — IToolExposurePolicy fails-closed on null
+            // for any RequiredRole gate.
+            var tenantRole = (string?)context.Items[TenantClaimsMiddleware.TenantRoleKey];
+
             var result = await orchestrator
                 .HandleUserTurnAsync(
                     tenantId, userId, conversationId, request.Content,
                     toolNameFilter: request.Tools,
+                    tenantRole: tenantRole,
                     cancellationToken: timeoutCts.Token)
                 .ConfigureAwait(false);
 

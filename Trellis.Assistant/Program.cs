@@ -252,6 +252,16 @@ builder.Services.AddSingleton<Func<ISearchClient>>(sp =>
 // trivially bounded.
 builder.Services.AddSingleton<IJsonSchemaValidator, JsonSchemaNetValidator>();
 
+// Phase 3.F: per-tenant tool exposure policy. Singleton — reads
+// ToolCatalogueOptions via IOptionsMonitor at evaluation time, so
+// appsettings reloads + WebApplicationFactory overlays apply without
+// restarting. ToolRegistry takes the policy as a ctor dep + invokes
+// it from GetExposedDescriptorsFor on the conversation-integrated
+// agent path. Standalone POST /api/agent-runs uses the untenanted
+// Descriptors property which bypasses the policy (operator runs see
+// all production tools per Phase 3.F pin #6).
+builder.Services.AddSingleton<IToolExposurePolicy, DefaultToolExposurePolicy>();
+
 // EchoTool ships forward as a debugging aid; SearchDocumentsTool is
 // Phase 3.B's first real tool; ChatRecentTool (Phase 3.D) is the
 // second production tool. All registered against IAgentTool;

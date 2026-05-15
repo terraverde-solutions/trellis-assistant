@@ -24,13 +24,19 @@ public sealed class ToolRegistryTests
     private readonly JsonSchemaNetValidator _schemaValidator = new();
     private readonly Microsoft.Extensions.Options.IOptions<ToolCatalogueOptions> _catalogueOptions =
         Microsoft.Extensions.Options.Options.Create(new ToolCatalogueOptions { ExposeEcho = true });
+    // Phase 3.F: Phase 3.C registry tests pre-date the IToolExposurePolicy
+    // dependency. The default no-op policy (all tools exposed) preserves
+    // these tests' assertions — they verify ctor validation +
+    // untenanted Descriptors property, not the tenancy-gated path.
+    private readonly IToolExposurePolicy _exposurePolicy =
+        new AllowAllExposurePolicy();
 
     [Fact]
     public void NameCollision_FailsAtStartup()
     {
         var firstEcho = new EchoTool();
         var collidingEcho = new FakeTool(name: "echo", description: "shouldn't matter");
-        var act = () => new ToolRegistry(new IAgentTool[] { firstEcho, collidingEcho }, _schemaValidator, _catalogueOptions);
+        var act = () => new ToolRegistry(new IAgentTool[] { firstEcho, collidingEcho }, _schemaValidator, _catalogueOptions, _exposurePolicy);
         act.Should().Throw<InvalidOperationException>()
             .WithMessage("*name collision*echo*",
                 "two tools registered with the same Descriptor.Name must crash the host on construction");
@@ -40,7 +46,7 @@ public sealed class ToolRegistryTests
     public void EmptyName_FailsAtStartup()
     {
         var bad = new FakeTool(name: "", description: "valid description");
-        var act = () => new ToolRegistry(new IAgentTool[] { bad }, _schemaValidator, _catalogueOptions);
+        var act = () => new ToolRegistry(new IAgentTool[] { bad }, _schemaValidator, _catalogueOptions, _exposurePolicy);
         act.Should().Throw<InvalidOperationException>()
             .WithMessage("*empty/whitespace Descriptor.Name*");
     }
@@ -49,7 +55,7 @@ public sealed class ToolRegistryTests
     public void WhitespaceName_FailsAtStartup()
     {
         var bad = new FakeTool(name: "   ", description: "valid description");
-        var act = () => new ToolRegistry(new IAgentTool[] { bad }, _schemaValidator, _catalogueOptions);
+        var act = () => new ToolRegistry(new IAgentTool[] { bad }, _schemaValidator, _catalogueOptions, _exposurePolicy);
         act.Should().Throw<InvalidOperationException>()
             .WithMessage("*empty/whitespace Descriptor.Name*",
                 "whitespace-only Name is functionally indistinguishable from empty");
@@ -59,7 +65,7 @@ public sealed class ToolRegistryTests
     public void EmptyDescription_FailsAtStartup()
     {
         var bad = new FakeTool(name: "valid_name", description: "");
-        var act = () => new ToolRegistry(new IAgentTool[] { bad }, _schemaValidator, _catalogueOptions);
+        var act = () => new ToolRegistry(new IAgentTool[] { bad }, _schemaValidator, _catalogueOptions, _exposurePolicy);
         act.Should().Throw<InvalidOperationException>()
             .WithMessage("*empty/whitespace Descriptor.Description*");
     }
@@ -68,7 +74,7 @@ public sealed class ToolRegistryTests
     public void WhitespaceDescription_FailsAtStartup()
     {
         var bad = new FakeTool(name: "valid_name", description: "   ");
-        var act = () => new ToolRegistry(new IAgentTool[] { bad }, _schemaValidator, _catalogueOptions);
+        var act = () => new ToolRegistry(new IAgentTool[] { bad }, _schemaValidator, _catalogueOptions, _exposurePolicy);
         act.Should().Throw<InvalidOperationException>()
             .WithMessage("*empty/whitespace Descriptor.Description*");
     }
@@ -94,7 +100,7 @@ public sealed class ToolRegistryTests
         // descriptor in the registry's dict. Adding the legit tool
         // (same name) triggers the collision detection — same code
         // path that catches name-mismatch drift.
-        var act = () => new ToolRegistry(new IAgentTool[] { slipperyTool, legitTool }, _schemaValidator, _catalogueOptions);
+        var act = () => new ToolRegistry(new IAgentTool[] { slipperyTool, legitTool }, _schemaValidator, _catalogueOptions, _exposurePolicy);
         act.Should().Throw<InvalidOperationException>()
             .WithMessage("*name collision*consistent_name*");
     }
@@ -103,7 +109,7 @@ public sealed class ToolRegistryTests
     public void GetTool_RegisteredName_ReturnsTool()
     {
         var echo = new EchoTool();
-        var registry = new ToolRegistry(new IAgentTool[] { echo }, _schemaValidator, _catalogueOptions);
+        var registry = new ToolRegistry(new IAgentTool[] { echo }, _schemaValidator, _catalogueOptions, _exposurePolicy);
         registry.GetTool("echo").Should().BeSameAs(echo);
     }
 
@@ -111,7 +117,7 @@ public sealed class ToolRegistryTests
     public void GetTool_UnknownName_ReturnsNull()
     {
         var echo = new EchoTool();
-        var registry = new ToolRegistry(new IAgentTool[] { echo }, _schemaValidator, _catalogueOptions);
+        var registry = new ToolRegistry(new IAgentTool[] { echo }, _schemaValidator, _catalogueOptions, _exposurePolicy);
         registry.GetTool("not_registered").Should().BeNull();
     }
 
@@ -119,7 +125,7 @@ public sealed class ToolRegistryTests
     public void GetTool_NullOrEmptyName_ReturnsNull()
     {
         var echo = new EchoTool();
-        var registry = new ToolRegistry(new IAgentTool[] { echo }, _schemaValidator, _catalogueOptions);
+        var registry = new ToolRegistry(new IAgentTool[] { echo }, _schemaValidator, _catalogueOptions, _exposurePolicy);
         registry.GetTool(null!).Should().BeNull();
         registry.GetTool("").Should().BeNull();
     }
@@ -138,7 +144,8 @@ public sealed class ToolRegistryTests
         var registry = new ToolRegistry(
             new IAgentTool[] { new EchoTool() },
             _schemaValidator,
-            options);
+            options,
+            _exposurePolicy);
         registry.Descriptors.Should().BeEmpty(
             "ExposeEcho=false hides EchoTool from the LLM-visible catalogue");
         registry.GetTool(EchoTool.ToolName).Should().NotBeNull(
@@ -153,7 +160,8 @@ public sealed class ToolRegistryTests
         var registry = new ToolRegistry(
             new IAgentTool[] { new EchoTool() },
             _schemaValidator,
-            options);
+            options,
+            _exposurePolicy);
         registry.Descriptors.Should().ContainSingle(
             d => d.Name == EchoTool.ToolName,
             "ExposeEcho=true makes EchoTool visible in Descriptors");
@@ -173,12 +181,123 @@ public sealed class ToolRegistryTests
         var registry = new ToolRegistry(
             new IAgentTool[] { new EchoTool(), productionTool },
             _schemaValidator,
-            options);
+            options,
+            _exposurePolicy);
         registry.Descriptors.Should().ContainSingle(
             d => d.Name == "future_production_tool",
             "non-echo tools stay exposed even when ExposeEcho=false");
         registry.Descriptors.Select(d => d.Name)
             .Should().NotContain(EchoTool.ToolName);
+    }
+
+    // ---------------- Phase 3.F: GetExposedDescriptorsFor (tenancy-aware) ----------------
+
+    [Fact]
+    public void GetExposedDescriptorsFor_DelegatesToPolicy_ReturnsFilteredList()
+    {
+        // Phase 3.F: registry's tenancy-aware getter invokes the
+        // IToolExposurePolicy per tool. With a deny-only-echo stub
+        // policy + EchoTool + a production tool, the returned list
+        // should exclude echo.
+        var prodTool = new FakeTool("prod_tool", "production tool that exposure allows");
+        var policy = new DenyEchoPolicy();
+        var registry = new ToolRegistry(
+            new IAgentTool[] { new EchoTool(), prodTool },
+            _schemaValidator,
+            _catalogueOptions,  // ExposeEcho = true, but the policy denies it independently
+            policy);
+
+        var tenancy = new AgentToolTenancy(
+            Guid.Parse(TestFixtures.TestTenants.TenantA), "user-a", TenantRole: null);
+        var exposed = registry.GetExposedDescriptorsFor(tenancy);
+
+        exposed.Should().ContainSingle(d => d.Name == "prod_tool");
+        exposed.Should().NotContain(d => d.Name == EchoTool.ToolName,
+            "policy denied EchoTool; registry filters it out of the tenancy-scoped list");
+    }
+
+    [Fact]
+    public void GetExposedDescriptorsFor_DifferentTenancies_DifferentLists()
+    {
+        // Pin: the registry calls the policy per-tenancy. A policy that
+        // allows tool only for TenantA returns different lists for
+        // TenantA vs TenantB.
+        var gatedTool = new FakeTool("tenant_a_only", "only TenantA may see");
+        var policy = new TenantAOnlyPolicy(Guid.Parse(TestFixtures.TestTenants.TenantA));
+        var registry = new ToolRegistry(
+            new IAgentTool[] { gatedTool },
+            _schemaValidator,
+            _catalogueOptions,
+            policy);
+
+        var tenantAList = registry.GetExposedDescriptorsFor(new AgentToolTenancy(
+            Guid.Parse(TestFixtures.TestTenants.TenantA), "u", null));
+        var tenantBList = registry.GetExposedDescriptorsFor(new AgentToolTenancy(
+            Guid.Parse(TestFixtures.TestTenants.TenantB), "u", null));
+
+        tenantAList.Should().ContainSingle(d => d.Name == "tenant_a_only");
+        tenantBList.Should().BeEmpty(
+            "policy hides tenant_a_only from TenantB; registry filters per-call");
+    }
+
+    [Fact]
+    public void GetExposedDescriptorsFor_EmptyResult_ReturnsEmptyListNotNull()
+    {
+        var policy = new DenyAllPolicy();
+        var registry = new ToolRegistry(
+            new IAgentTool[] { new EchoTool() },
+            _schemaValidator,
+            _catalogueOptions,
+            policy);
+
+        var exposed = registry.GetExposedDescriptorsFor(new AgentToolTenancy(
+            Guid.Parse(TestFixtures.TestTenants.TenantA), "u", null));
+
+        exposed.Should().NotBeNull();
+        exposed.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void Descriptors_UntenantedPath_BypassesPolicy()
+    {
+        // Phase 3.F pin #6: the standalone POST /api/agent-runs path
+        // reads Descriptors (untenanted) — bypasses IToolExposurePolicy.
+        // Operator runs see the full catalog regardless of the
+        // policy's per-tenancy decisions.
+        var prodTool = new FakeTool("prod_tool", "production tool");
+        // Policy that denies ALL tools — Descriptors still returns them
+        // (minus echo, gated by ExposeEcho=true → exposed in this options).
+        var registry = new ToolRegistry(
+            new IAgentTool[] { new EchoTool(), prodTool },
+            _schemaValidator,
+            _catalogueOptions,
+            new DenyAllPolicy());
+
+        registry.Descriptors.Select(d => d.Name).Should().Contain("prod_tool",
+            "Descriptors property uses Phase 3.C ExposeEcho only — Phase 3.F policy is NOT consulted");
+        registry.Descriptors.Select(d => d.Name).Should().Contain(EchoTool.ToolName,
+            "ExposeEcho=true exposes echo on the untenanted path regardless of policy");
+    }
+
+    // Phase 3.F test helper policies — distinct from the AllowAllExposurePolicy
+    // used by the ctor-validation tests above.
+    private sealed class DenyEchoPolicy : IToolExposurePolicy
+    {
+        public bool IsExposedTo(IAgentTool tool, AgentToolTenancy tenancy)
+            => tool.Descriptor.Name != EchoTool.ToolName;
+    }
+
+    private sealed class TenantAOnlyPolicy : IToolExposurePolicy
+    {
+        private readonly Guid _allowed;
+        public TenantAOnlyPolicy(Guid allowed) { _allowed = allowed; }
+        public bool IsExposedTo(IAgentTool tool, AgentToolTenancy tenancy)
+            => tenancy.TenantId == _allowed;
+    }
+
+    private sealed class DenyAllPolicy : IToolExposurePolicy
+    {
+        public bool IsExposedTo(IAgentTool tool, AgentToolTenancy tenancy) => false;
     }
 
     [Fact]
@@ -192,7 +311,7 @@ public sealed class ToolRegistryTests
             name: "bad_schema",
             description: "valid description",
             parameterSchema: "{not a valid json schema");
-        var act = () => new ToolRegistry(new IAgentTool[] { bad }, _schemaValidator, _catalogueOptions);
+        var act = () => new ToolRegistry(new IAgentTool[] { bad }, _schemaValidator, _catalogueOptions, _exposurePolicy);
         act.Should().Throw<InvalidOperationException>()
             .WithMessage("*bad_schema*malformed*",
                 "registry surfaces the tool name + 'malformed' so startup logs identify the offending registration");
@@ -205,7 +324,7 @@ public sealed class ToolRegistryTests
             name: "no_schema",
             description: "valid description",
             parameterSchema: "");
-        var act = () => new ToolRegistry(new IAgentTool[] { bad }, _schemaValidator, _catalogueOptions);
+        var act = () => new ToolRegistry(new IAgentTool[] { bad }, _schemaValidator, _catalogueOptions, _exposurePolicy);
         act.Should().Throw<InvalidOperationException>()
             .WithMessage("*empty/whitespace*ParameterSchema*");
     }
@@ -215,8 +334,21 @@ public sealed class ToolRegistryTests
     {
         var first = new FakeTool(name: "alpha", description: "first tool");
         var second = new FakeTool(name: "beta", description: "second tool");
-        var registry = new ToolRegistry(new IAgentTool[] { first, second }, _schemaValidator, _catalogueOptions);
+        var registry = new ToolRegistry(new IAgentTool[] { first, second }, _schemaValidator, _catalogueOptions, _exposurePolicy);
         registry.Descriptors.Select(d => d.Name).Should().Equal("alpha", "beta");
+    }
+
+    /// <summary>
+    /// Phase 3.F test helper. Returns true for every tool — preserves
+    /// the pre-Phase-3.F "all tools exposed" behavior for tests that
+    /// don't specifically exercise the per-tenant gating matrix. Tests
+    /// that DO exercise gating construct their own
+    /// <see cref="IToolExposurePolicy"/> stub or use the production
+    /// <see cref="DefaultToolExposurePolicy"/> with crafted options.
+    /// </summary>
+    private sealed class AllowAllExposurePolicy : IToolExposurePolicy
+    {
+        public bool IsExposedTo(IAgentTool tool, AgentToolTenancy tenancy) => true;
     }
 
     private sealed class FakeTool : IAgentTool
