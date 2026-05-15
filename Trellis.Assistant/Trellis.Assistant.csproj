@@ -71,6 +71,19 @@
          the DB index. Trellis.Core stays Ulid-free; the interface speaks
          Guid (see Trellis.Core/Services/IAssistantConversationStore.cs). -->
     <PackageReference Include="Ulid" Version="1.3.4" />
+
+    <!-- Phase 3.H: OpenTelemetry. Pin the SDK + the optional
+         exporter/instrumentation packages explicitly so the build
+         deps lock to a known-good set. OTel 1.10.x is the current
+         stable for net10.0; OTLP HTTP exporter (NOT gRPC) per pin #4
+         — simpler firewall posture for the QA collector + matches the
+         trellis-deploy network policy that's only ports-80/443. The
+         ASP.NET Core + HttpClient instrumentation packages are
+         separate NuGets per OTel's à-la-carte convention. -->
+    <PackageReference Include="OpenTelemetry.Extensions.Hosting" Version="1.15.3" />
+    <PackageReference Include="OpenTelemetry.Instrumentation.AspNetCore" Version="1.15.2" />
+    <PackageReference Include="OpenTelemetry.Instrumentation.Http" Version="1.15.1" />
+    <PackageReference Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" Version="1.15.3" />
   </ItemGroup>
 
   <!-- Trellis.Core lives in a sibling repo at ..\..\core\. Local builds

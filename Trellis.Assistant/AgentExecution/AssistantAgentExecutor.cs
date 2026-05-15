@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Text.Json;
 using Microsoft.Extensions.Options;
 using Trellis.Assistant.Data;
+using Trellis.Assistant.Observability;
 using Trellis.Core.Models;
 using Trellis.Core.Services;
 
@@ -509,6 +510,19 @@ public sealed class AssistantAgentExecutor : IAgentExecutor
                                 "skipping {Skipped} remaining. Decision={Decision} Reason={Reason}",
                                 runId, dispatchedToolCalls, totalToolCalls, skipped,
                                 midVerdict.Decision, midVerdict.HumanReadableReason);
+                            // Phase 3.H pin #1: budget-exhausted gets its own
+                            // counter, NOT the failure counter. Operator-policy
+                            // outcome (LLM emitted more tool_calls than the
+                            // budget allowed) vs tool fault are different
+                            // signals; conflating them would mask budget-tuning
+                            // intent. Tagged with the NEXT tool_call's name
+                            // (the one that DIDN'T dispatch) + tenant for
+                            // drill-down.
+                            AgentTelemetry.ToolDispatchBudgetExhaustedCount.Add(
+                                1,
+                                new KeyValuePair<string, object?>("tool.name", call.ToolName),
+                                new KeyValuePair<string, object?>("tenant.id", orgId.ToString("D")),
+                                new KeyValuePair<string, object?>("decision", midVerdict.Decision.ToString()));
                             messages.Add(new ChatMessage
                             {
                                 Role = ChatRole.System,
@@ -641,10 +655,37 @@ public sealed class AssistantAgentExecutor : IAgentExecutor
         var stepStartedAt = DateTime.UtcNow;
         var sw = Stopwatch.StartNew();
 
+        // Phase 3.H: open an OTel activity per tool dispatch. Tags per
+        // pin #3: tool.name + tenant.id (NOT user.id — unbounded
+        // cardinality risk); plus agent.run.id + step.index for
+        // trace-side drill-down. Activity disposes at method scope end;
+        // each return path sets the appropriate ActivityStatusCode +
+        // emits the dispatch counter/histogram before returning.
+        var tenantIdTag = orgId.ToString("D");
+        using var activity = AgentTelemetry.ActivitySource.StartActivity(
+            "agent.tool.dispatch",
+            ActivityKind.Internal);
+        activity?.SetTag("tool.name", call.ToolName);
+        activity?.SetTag("tenant.id", tenantIdTag);
+        activity?.SetTag("agent.run.id", runId.ToString("D"));
+        activity?.SetTag("step.index", stepIndex);
+
+        // Phase 3.H: trace-correlated log scope so structured logs
+        // pair with traces on the operator-side query path. trace_id +
+        // span_id are 0s when no OTel listener is registered (dev
+        // without OpenTelemetry:Endpoint); operators searching by
+        // trace_id won't match the 0-pattern accidentally.
+        using var logScope = _logger.BeginScope(new Dictionary<string, object>
+        {
+            ["trace_id"] = activity?.TraceId.ToString() ?? "00000000000000000000000000000000",
+            ["span_id"] = activity?.SpanId.ToString() ?? "0000000000000000",
+            ["tool.name"] = call.ToolName,
+            ["agent.run.id"] = runId,
+        });
+
         // Phase 3.C: operator-visible per-dispatch lifecycle log. Pairs
         // with the succeeded/failed log below to surface tool latency +
-        // outcome in journalctl. Counter-based metrics (Prometheus,
-        // OpenTelemetry) deferred to Phase 3.D per hub's ratify.
+        // outcome in journalctl.
         _logger.LogInformation(
             "AgentRun {RunId} step {StepIndex}: tool {Tool} dispatched.",
             runId, stepIndex, call.ToolName);
@@ -653,6 +694,14 @@ public sealed class AssistantAgentExecutor : IAgentExecutor
         if (tool is null)
         {
             sw.Stop();
+            // Phase 3.H: unregistered-tool path = failure outcome.
+            // The activity records why; the failure counter increments
+            // so operators can alert on "model emitted tool_call for
+            // an unregistered name" (Phase 3.F's per-tenant filter
+            // should have prevented this, but an LLM hallucination
+            // could still slip a name through).
+            activity?.SetStatus(ActivityStatusCode.Error, $"tool '{call.ToolName}' not registered");
+            EmitDispatchMetrics(call.ToolName, tenantIdTag, AgentTelemetry.Outcomes.Failure, sw.ElapsedMilliseconds);
             var step = new AgentStep
             {
                 Id = Ulid.NewUlid().ToGuid(),
@@ -684,6 +733,14 @@ public sealed class AssistantAgentExecutor : IAgentExecutor
             _logger.LogInformation(
                 "AgentRun {RunId} step {StepIndex}: schema validation rejected {Tool} args — {Reason}",
                 runId, stepIndex, call.ToolName, schemaResult.FirstError);
+            // Phase 3.H: schema-validation rejection counts as failure
+            // (the args didn't satisfy the declared shape; the tool
+            // never ran). Distinct from "tool threw" via the activity's
+            // tag — but the outcome metric is the same bucket because
+            // both produce AgentStepStatus.Failed.
+            activity?.SetStatus(ActivityStatusCode.Error, schemaErrorMessage);
+            activity?.SetTag("dispatch.reject_reason", "schema_validation");
+            EmitDispatchMetrics(call.ToolName, tenantIdTag, AgentTelemetry.Outcomes.Failure, sw.ElapsedMilliseconds);
             var step = new AgentStep
             {
                 Id = Ulid.NewUlid().ToGuid(),
@@ -779,23 +836,36 @@ public sealed class AssistantAgentExecutor : IAgentExecutor
         // tool failures. The OCE-suppression pattern matches Macro 2 PR
         // 6.7's `when (ex is not OperationCanceledException)` filter
         // convention.
+        // Phase 3.H: outcome metric + activity status. Three-way split
+        // matches the log levels — success / cancelled / failure. The
+        // outcome tag values match the Outcomes constants for collector-
+        // side alerting (e.g. `outcome=failure` rate by tool).
         if (status == AgentStepStatus.Succeeded)
         {
             _logger.LogInformation(
                 "AgentRun {RunId} step {StepIndex}: tool {Tool} succeeded in {DurationMs}ms.",
                 runId, stepIndex, call.ToolName, sw.ElapsedMilliseconds);
+            activity?.SetStatus(ActivityStatusCode.Ok);
+            EmitDispatchMetrics(call.ToolName, tenantIdTag, AgentTelemetry.Outcomes.Success, sw.ElapsedMilliseconds);
         }
         else if (cancellationToken.IsCancellationRequested && threw)
         {
             _logger.LogInformation(
                 "AgentRun {RunId} step {StepIndex}: tool {Tool} cancelled after {DurationMs}ms.",
                 runId, stepIndex, call.ToolName, sw.ElapsedMilliseconds);
+            // Cancellation is NOT an activity Error — it's a caller-
+            // initiated stop. ActivityStatusCode.Unset leaves the span
+            // status neutral; the cancelled outcome tag tells operators
+            // what happened.
+            EmitDispatchMetrics(call.ToolName, tenantIdTag, AgentTelemetry.Outcomes.Cancelled, sw.ElapsedMilliseconds);
         }
         else
         {
             _logger.LogWarning(
                 "AgentRun {RunId} step {StepIndex}: tool {Tool} failed in {DurationMs}ms: {ErrorMessage}",
                 runId, stepIndex, call.ToolName, sw.ElapsedMilliseconds, errorMessage ?? "(no message)");
+            activity?.SetStatus(ActivityStatusCode.Error, errorMessage ?? "(no message)");
+            EmitDispatchMetrics(call.ToolName, tenantIdTag, AgentTelemetry.Outcomes.Failure, sw.ElapsedMilliseconds);
         }
 
         return await _store
@@ -803,6 +873,35 @@ public sealed class AssistantAgentExecutor : IAgentExecutor
                 ? CancellationToken.None
                 : cancellationToken)
             .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Phase 3.H: emit per-dispatch metrics. Three counters fire (or
+    /// two, depending on outcome):
+    /// <list type="bullet">
+    /// <item><see cref="AgentTelemetry.ToolDispatchCount"/> — always
+    /// fires, tagged with outcome.</item>
+    /// <item><see cref="AgentTelemetry.ToolDispatchFailureCount"/> —
+    /// fires ONLY on failure outcome. Operators can alert directly
+    /// on this counter without tag-filtering.</item>
+    /// <item><see cref="AgentTelemetry.ToolDispatchDurationMs"/> —
+    /// always fires; collector derives p50/p95/p99.</item>
+    /// </list>
+    /// Tags per pin #3: tool.name + tenant.id + outcome. NO user.id.
+    /// </summary>
+    private static void EmitDispatchMetrics(
+        string toolName, string tenantId, string outcome, long durationMs)
+    {
+        var tagToolName = new KeyValuePair<string, object?>("tool.name", toolName);
+        var tagTenantId = new KeyValuePair<string, object?>("tenant.id", tenantId);
+        var tagOutcome = new KeyValuePair<string, object?>("outcome", outcome);
+
+        AgentTelemetry.ToolDispatchCount.Add(1, tagToolName, tagTenantId, tagOutcome);
+        AgentTelemetry.ToolDispatchDurationMs.Record(durationMs, tagToolName, tagTenantId, tagOutcome);
+        if (outcome == AgentTelemetry.Outcomes.Failure)
+        {
+            AgentTelemetry.ToolDispatchFailureCount.Add(1, tagToolName, tagTenantId);
+        }
     }
 
     /// <summary>
