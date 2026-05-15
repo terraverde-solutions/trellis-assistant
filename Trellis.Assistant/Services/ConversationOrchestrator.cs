@@ -163,24 +163,21 @@ public sealed class ConversationOrchestrator
             // AllowedTenants + RequiredRole matrix). Untenanted
             // Descriptors property is reserved for the standalone
             // POST /api/agent-runs path (per Phase 3.F pin #6).
-            if (Guid.TryParse(tenantId, out var tenancyOrgId))
-            {
-                var tenancy = new AgentExecution.AgentToolTenancy(
-                    TenantId: tenancyOrgId,
-                    UserId: userId,
-                    TenantRole: tenantRole);
-                agentDescriptors = _toolRegistry.GetExposedDescriptorsFor(tenancy);
-            }
-            else
-            {
-                // Non-uuid tenantId — same Phase 3.A C1 contract path
-                // as below. Fall back to untenanted Descriptors so the
-                // existing 400-Bad-Request flow (which fires when the
-                // agent path tries to parse the orgId) surfaces
-                // unchanged. The tenancy gate doesn't get a chance to
-                // act on malformed input.
-                agentDescriptors = _toolRegistry.Descriptors;
-            }
+            //
+            // Phase 3.G: tenantId is guaranteed UUID-parseable by
+            // TenantClaimsMiddleware (rejects non-UUID claims at 401
+            // before they reach here). Pre-3.G this used
+            // Guid.TryParse + an untenanted-fallback branch that
+            // silently bypassed the Phase 3.F policy for the brief
+            // window before the agent-path 400 fired downstream. The
+            // middleware validation closes that gap; collapsed to
+            // Guid.Parse (known-safe) + the fallback branch deleted.
+            var tenancyOrgId = Guid.Parse(tenantId);
+            var tenancy = new AgentExecution.AgentToolTenancy(
+                TenantId: tenancyOrgId,
+                UserId: userId,
+                TenantRole: tenantRole);
+            agentDescriptors = _toolRegistry.GetExposedDescriptorsFor(tenancy);
         }
         else if (toolNameFilter.Count > 0)
         {
@@ -328,13 +325,21 @@ public sealed class ConversationOrchestrator
             Content = userContent,
         });
 
-        // OrgId derivation: same Phase 3.A C1 contract as POST /api/agent-runs.
-        // The endpoint layer pre-validated the tenantId is uuid-shaped; here
-        // we Guid.Parse + fail loud if somehow not.
-        if (!Guid.TryParse(tenantId, out var orgId) || orgId == Guid.Empty)
+        // Phase 3.G: TenantClaimsMiddleware validates UUID-shape at the
+        // request boundary + rejects 401 on non-UUID. By the time the
+        // orchestrator runs, tenantId is guaranteed UUID-parseable;
+        // Guid.Parse won't throw. The pre-3.G TryParse + defensive
+        // throw was load-bearing when middleware accepted raw strings;
+        // collapsed now to a single safe Parse.
+        var orgId = Guid.Parse(tenantId);
+        if (orgId == Guid.Empty)
         {
+            // Guid.Empty IS UUID-parseable; the middleware doesn't
+            // reject it (a UUID-shaped string of all zeros is still
+            // valid UUID syntax). The agent-path contract specifically
+            // requires non-empty OrgId per Phase 3.A C1.
             throw new InvalidOperationException(
-                $"TenantId '{tenantId}' is not uuid-shaped — agent-path requires uuid tenantIds per Phase 3.A C1 contract. Endpoint layer should have rejected this earlier.");
+                "TenantId resolved to Guid.Empty — agent-path requires non-empty OrgId per Phase 3.A C1. Middleware validates UUID shape but not Guid.Empty; closing the loop here.");
         }
 
         // Phase 3.C: availableTools are already descriptors — either the

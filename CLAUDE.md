@@ -15,6 +15,7 @@ Read first:
 - [`docs/phase-3d-design.md`](docs/phase-3d-design.md) — Phase 3.D design rationale (ChatRecentTool: AgentToolInput.UserId threading, IServiceScopeFactory pattern for Singleton→Scoped store, ILIKE query, turn.created_at since filter, standalone-run sentinel)
 - [`docs/phase-3e-design.md`](docs/phase-3e-design.md) — Phase 3.E design rationale (multi-tool dispatch per LLM turn: serial only / 1 step per tool_call / mid-iteration budget gate / synthetic BUDGET_EXHAUSTED system message / preserved Phase 3.A.2 in-loop wire encoding)
 - [`docs/phase-3f-design.md`](docs/phase-3f-design.md) — Phase 3.F design rationale (per-tenant tool exposure gating: IToolExposurePolicy + AllowedTenants UUID gate + RequiredRole single-string gate; AgentToolTenancy local record; tenant_role JWT claim extraction + X-Trellis-Tenant-Role header fallback; standalone path bypasses policy; fail-closed on null role)
+- [`docs/phase-3g-design.md`](docs/phase-3g-design.md) — Phase 3.G design rationale (middleware-level UUID validation: rejects non-UUID tenant_id at 401 before reaching endpoints; collapses 3× redundant `Guid.TryParse + defensive 400` branches downstream; upgrades 401 body to RFC 7807 ProblemDetails; closes the Phase 3.F untenanted-fallback bypass; pin #3 Guid-in-Items deferred to cross-repo Core widening)
 
 ## What this component is
 
@@ -27,6 +28,15 @@ The component design lives in [`59-trellis-assistant.md`](https://github.com/ter
 phase + guard-rails for what NOT to do yet.
 
 ## Status
+
+**Phase 3.G — middleware-level UUID validation for tenantId scaffolded** on `kimi/phase3g-tenant-uuid-at-middleware`. Closes the Phase 3.F forward-flag (untenanted-fallback bypass) by moving UUID validation up to `TenantClaimsMiddleware`. New surface (this phase):
+
+- `Middleware/TenantClaimsMiddleware` — JWT path + deprecated-header path BOTH validate `Guid.TryParse` on the tenant_id claim/header. Non-UUID → 401 reject at the boundary BEFORE the orchestrator or endpoint runs. The bespoke `{"error": "..."}` 401 body upgraded to RFC 7807 ProblemDetails (`application/problem+json`, fields `type/title/status/detail`).
+- `Services/ConversationOrchestrator` — default-route `Guid.TryParse + untenanted-fallback` branch DELETED. Collapsed to single `Guid.Parse` (known-safe per middleware guarantee). `HandleAgentPathAsync`'s orgId derivation similarly collapsed; `Guid.Empty` defense preserved.
+- `Endpoints/AgentRunEndpoints` — defensive `Guid.TryParse + 400-fallback` branch DELETED. Collapsed to `Guid.Parse`; the all-zeros `Guid.Empty` defense stays.
+- Wire-shape change: non-UUID tenant_id now surfaces as **401 ProblemDetails** at the middleware (was: 400 from endpoint OR orchestrator throw OR silent untenanted-fallback descriptor leak). Existing 401 tests assert status code only; body upgrade back-compat-safe.
+- 6 new tests: `PostConversations_NonUuidTenantId_Returns401_FromMiddleware` (4-inline theory), `PostConversations_NonUuidTenantId_ResponseShape_IsProblemDetails`, `PostConversations_NonUuidTenantId_DeprecatedHeaderPath_AlsoReturns401`. Plus 2 retrofits to existing 400-asserting tests (`PostAgentRuns_NonUuidTenantId_*` + `PostTurns_AgentPath_NonUuidTenant_*` now `_Returns401_FromMiddleware`).
+- **Pin #3 (Guid in HttpContext.Items) DEFERRED** — `IAssistantConversationStore` in Trellis.Core takes `string tenantId` across every method; flipping to Guid would mean every endpoint adds a `.ToString("D")` for the store call (net more code, no real safety gain). The actual win needs cross-repo Core widening; forward-flagged.
 
 **Phase 3.F — per-tenant tool exposure gating scaffolded** on `kimi/phase3f-per-tenant-tool-gating`. New surface (this phase):
 
@@ -274,6 +284,14 @@ Steady-state QA redeploys: `trellis-deploy/scripts/qa/Deploy-Assistant-Standalon
 - Unit: `trellis-assistant-qa.service`
 - Auth: shared `trellisqa` HTTP Basic credential at the Hetzner edge (same as web-qa + trainer-qa); GB10-side nginx is auth-free
 - Bootstrap walkthrough: `trellis-deploy/scripts/qa/bootstrap-assistant.md`
+
+## Don't (Phase 3.G)
+
+- **Don't accept non-UUID tenant_id at any downstream layer.** Phase 3.G middleware validation is THE gate; downstream code uses `Guid.Parse` (not `TryParse`) and trusts it. Adding a defensive `TryParse + fallback` re-introduces the dead-code path the cleanup just deleted.
+- **Don't try to flip `HttpContext.Items[TenantClaimsMiddleware.TenantIdKey]` to `Guid` in Phase 3.G.** Pin #3 was deferred because `IAssistantConversationStore` in Trellis.Core takes `string tenantId` across every method (cross-repo contract). Flipping HttpContext.Items to Guid means every endpoint does `((Guid)items).ToString("D")` before calling the store — more code, no real safety win. The real fix requires a Core widening; revisit when the cross-repo PR lands.
+- **Don't change the deprecated-header-path UUID validation to skip-on-non-UUID.** Pin #5: legacy callers get the same gate. If a legacy caller emits a non-UUID tenant_id, that's a misconfiguration the operator needs to see (401, not silent acceptance).
+- **Don't downgrade 401 ProblemDetails back to bespoke JSON.** Macro 3's HTTP-error contract uses RFC 7807; downstream Trellis services parse `type/title/status/detail` consistently. Operators relying on the standard shape would have to special-case the Assistant if it diverged.
+- **Don't add a dedicated `TenantClaimsMiddlewareTests` class.** Integration-test coverage via `ConversationEndpointTests` is sufficient for the middleware's request-shape contract. A dedicated middleware test class would require a new fixture pattern (synthetic HttpContext setup); cost not earned at the current coverage gap.
 
 ## Don't (Phase 3.F)
 

@@ -168,19 +168,23 @@ public sealed class AgentRunEndpointTests : IClassFixture<PostgresFixture>, IAsy
     }
 
     [SkippableFact]
-    public async Task PostAgentRuns_NonUuidTenantId_Returns400()
+    public async Task PostAgentRuns_NonUuidTenantId_Returns401_FromMiddleware()
     {
-        // Phase 3.A C1 contract: agent runs require uuid-shaped tenant
-        // identifiers. A non-uuid tenant slipping through TenantClaimsMiddleware
-        // (which only checks non-blank) gets 400 here rather than silently
-        // mis-mapping to a random Guid via Guid.Parse failure.
+        // Phase 3.G: TenantClaimsMiddleware validates UUID-shape at the
+        // request boundary and rejects 401 BEFORE the endpoint handler
+        // sees the request. Pre-3.G the middleware accepted any
+        // non-blank tenant_id; the endpoint defensively re-parsed +
+        // returned 400. Phase 3.G moves the gate up, so non-UUID gets
+        // 401 (auth-failure shape — invalid claim) instead of 400
+        // (request-body failure).
         Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
 
         using var client = NewClient(tenantId: "not-a-uuid", userId: TestTenants.UserA);
         var resp = await client.PostAsJsonAsync(
             "/api/agent-runs",
             new AgentRunEndpoints.CreateAgentRunRequest(UserPrompt: "Hi", ToolNames: null, MaxSteps: null));
-        resp.StatusCode.Should().Be(HttpStatusCode.BadRequest);
+        resp.StatusCode.Should().Be(HttpStatusCode.Unauthorized,
+            "Phase 3.G middleware rejects non-UUID tenant_id at 401 before reaching the endpoint");
     }
 
     [SkippableFact]

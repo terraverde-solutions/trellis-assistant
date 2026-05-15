@@ -93,16 +93,20 @@ public static class AgentRunEndpoints
             return Results.BadRequest(new { error = "userPrompt is required" });
         }
 
-        if (!Guid.TryParse(tenantIdString, out var orgId) || orgId == Guid.Empty)
+        // Phase 3.G: TenantClaimsMiddleware validates UUID-shape at the
+        // request boundary + rejects 401 on non-UUID. Pre-3.G this
+        // endpoint defensively re-parsed + returned 400 on non-UUID
+        // ("middleware only checks non-blank"); that branch is now
+        // unreachable for the UUID-malformed case. Guid.Empty IS
+        // syntactically UUID-parseable, though, so the empty-check
+        // stays as a defense against the all-zeros UUID being treated
+        // as a real tenant.
+        var orgId = Guid.Parse(tenantIdString);
+        if (orgId == Guid.Empty)
         {
-            // Phase 3.A C1 contract: production tenantIds are uuid-shaped.
-            // A non-uuid tenant slipping through TenantClaimsMiddleware
-            // (which only checks non-blank) means a misconfigured client
-            // or a pre-Phase-3 test fixture. 400 surfaces it loud rather
-            // than silently mis-scoping the run.
             return Results.BadRequest(new
             {
-                error = "tenant_id is not a valid uuid; agent runs require uuid-shaped tenant identifiers per Phase 3.A C1 contract",
+                error = "tenant_id resolved to Guid.Empty; agent runs require non-empty OrgId per Phase 3.A C1 contract",
             });
         }
 
