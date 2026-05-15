@@ -1,14 +1,78 @@
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
+using OpenTelemetry.Metrics;
+using OpenTelemetry.Resources;
+using OpenTelemetry.Trace;
 using Trellis.Assistant.AgentExecution;
 using Trellis.Assistant.Data;
 using Trellis.Assistant.Endpoints;
 using Trellis.Assistant.Middleware;
+using Trellis.Assistant.Observability;
 using Trellis.Assistant.Services;
 using Trellis.Core.Services;
 
 var builder = WebApplication.CreateBuilder(args);
+
+// ---------------- Phase 3.H: OpenTelemetry ----------------
+//
+// Binds OpenTelemetryOptions from "OpenTelemetry:*" (Endpoint, ServiceName,
+// ServiceVersion). The OTel SDK ALWAYS registers (so the Meter +
+// ActivitySource have listeners locally + test pins observe via
+// MeterListener / ActivityListener), but the OTLP exporter is gated on
+// a non-empty Endpoint config — dev/test stays in-process.
+//
+// Activity source + meter names: Trellis.Assistant.AgentExecution
+// (Phase 3.H pin #6). ASP.NET Core + HttpClient auto-instrumentation
+// covers the inbound /api/* request surface + outbound Trainer +
+// Ollama HTTP calls — no custom code per request.
+//
+// OTLP HTTP (not gRPC) per pin #4 — simpler firewall posture for the
+// QA collector.
+builder.Services
+    .AddOptions<OpenTelemetryOptions>()
+    .Bind(builder.Configuration.GetSection(OpenTelemetryOptions.SectionName));
+
+var otelOpts = builder.Configuration
+    .GetSection(OpenTelemetryOptions.SectionName)
+    .Get<OpenTelemetryOptions>() ?? new OpenTelemetryOptions();
+var hasOtelEndpoint = !string.IsNullOrWhiteSpace(otelOpts.Endpoint);
+
+builder.Services
+    .AddOpenTelemetry()
+    .ConfigureResource(r => r
+        .AddService(serviceName: otelOpts.ServiceName, serviceVersion: otelOpts.ServiceVersion))
+    .WithMetrics(metrics =>
+    {
+        metrics
+            .AddMeter(AgentTelemetry.SourceName)
+            .AddMeter(TenantClaimsMiddleware.MeterName)  // Phase 3.B deprecated-header counter rides the same SDK
+            .AddAspNetCoreInstrumentation()
+            .AddHttpClientInstrumentation();
+        if (hasOtelEndpoint)
+        {
+            metrics.AddOtlpExporter(opts =>
+            {
+                opts.Endpoint = new Uri(otelOpts.Endpoint!);
+                opts.Protocol = OpenTelemetry.Exporter.OtlpExportProtocol.HttpProtobuf;
+            });
+        }
+    })
+    .WithTracing(tracing =>
+    {
+        tracing
+            .AddSource(AgentTelemetry.SourceName)
+            .AddAspNetCoreInstrumentation()
+            .AddHttpClientInstrumentation();
+        if (hasOtelEndpoint)
+        {
+            tracing.AddOtlpExporter(opts =>
+            {
+                opts.Endpoint = new Uri(otelOpts.Endpoint!);
+                opts.Protocol = OpenTelemetry.Exporter.OtlpExportProtocol.HttpProtobuf;
+            });
+        }
+    });
 
 // ---------------- Configuration: orchestrator options ----------------
 builder.Services

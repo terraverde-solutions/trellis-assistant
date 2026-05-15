@@ -16,6 +16,7 @@ Read first:
 - [`docs/phase-3e-design.md`](docs/phase-3e-design.md) — Phase 3.E design rationale (multi-tool dispatch per LLM turn: serial only / 1 step per tool_call / mid-iteration budget gate / synthetic BUDGET_EXHAUSTED system message / preserved Phase 3.A.2 in-loop wire encoding)
 - [`docs/phase-3f-design.md`](docs/phase-3f-design.md) — Phase 3.F design rationale (per-tenant tool exposure gating: IToolExposurePolicy + AllowedTenants UUID gate + RequiredRole single-string gate; AgentToolTenancy local record; tenant_role JWT claim extraction + X-Trellis-Tenant-Role header fallback; standalone path bypasses policy; fail-closed on null role)
 - [`docs/phase-3g-design.md`](docs/phase-3g-design.md) — Phase 3.G design rationale (middleware-level UUID validation: rejects non-UUID tenant_id at 401 before reaching endpoints; collapses 3× redundant `Guid.TryParse + defensive 400` branches downstream; upgrades 401 body to RFC 7807 ProblemDetails; closes the Phase 3.F untenanted-fallback bypass; pin #3 Guid-in-Items deferred to cross-repo Core widening)
+- [`docs/phase-3h-design.md`](docs/phase-3h-design.md) — Phase 3.H design rationale (OpenTelemetry tool-call observability: ActivitySource + 4 custom metrics + log-scope trace correlation; OTLP HTTP exporter opt-in via `OpenTelemetry:Endpoint`; cardinality discipline — NEVER tag with user_id; budget-exhausted distinct from failure counter)
 
 ## What this component is
 
@@ -28,6 +29,17 @@ The component design lives in [`59-trellis-assistant.md`](https://github.com/ter
 phase + guard-rails for what NOT to do yet.
 
 ## Status
+
+**Phase 3.H — OpenTelemetry tool-call observability scaffolded** on `kimi/phase3h-otel-tool-dispatch`. Closes the operator-visibility gap left by every prior Phase 3 surface — per-tool dispatch was reachable via `journalctl` log greps but had no aggregate counter / latency / failure-ratio surface. New surface (this phase):
+
+- `Observability/AgentTelemetry.cs` — static `Meter` + `ActivitySource` named `Trellis.Assistant.AgentExecution`. Three counters (`tool.dispatch.count`, `tool.dispatch.failure.count`, `tool.dispatch.budget_exhausted.count`) + one histogram (`tool.dispatch.duration_ms`). `Outcomes` constants holder (`success`/`failure`/`cancelled`/`budget_exhausted`).
+- `Observability/OpenTelemetryOptions.cs` — bound from `OpenTelemetry:*`. `Endpoint : string?` (null = no-op exporter), `ServiceName`, `ServiceVersion`. OTLP HTTP (not gRPC) per pin #4.
+- `Program.cs` — `services.AddOpenTelemetry().ConfigureResource(...).WithMetrics(...).WithTracing(...)`. Meter + ActivitySource ALWAYS register (test pins observe via `MeterListener`/`ActivityListener`); OTLP HTTP exporter conditionally registered when `Endpoint` is non-empty. ASP.NET Core + HttpClient instrumentation auto-instrument inbound `/api/*` + outbound Trainer/Ollama calls.
+- `AssistantAgentExecutor.DispatchOneToolCallAsync` — opens `agent.tool.dispatch` Activity (`ActivityKind.Internal`) with tags `tool.name` + `tenant.id` + `agent.run.id` + `step.index`. Per-dispatch log scope opens with `trace_id` + `span_id` so existing `LogInformation/LogWarning` lines carry the trace correlation. Metrics emit at each terminal path (success / schema-reject / tool-not-registered / cancellation / failure). Activity status `Ok` on success, `Error` on failure (with `StatusDescription`), `Unset` on cancellation.
+- `ExecuteLoopAsync` budget-exhausted mid-iteration branch — fires `ToolDispatchBudgetExhaustedCount` tagged with the SKIPPED tool's name. Distinct from failure counter per pin #1 (budget halt is operator-policy outcome, not tool fault — aggregating would mask budget-tuning signal).
+- `appsettings.json` — new `OpenTelemetry` section with `Endpoint: null` default (dev/test stay in-process). QA/production overrides via `/etc/trellis-assistant-qa.env` → `OpenTelemetry__Endpoint=http://otel-collector.trellis-qa:4318`.
+- Cardinality discipline (pin #3): NEVER tag metrics with `user_id` (unbounded across fleet). `tenant.id` bounded by customer count; `tool.name` bounded by registry size; `outcome` is fixed enum. `agent.run.id` + `step.index` live on activity tags only (tracing handles high cardinality; metrics never).
+- 6 new SkippableFact pins under `Trellis.Assistant.Tests/Observability/AgentTelemetryTests.cs` — success/duration/failure-counter/budget-exhausted/activity-tags/activity-error-status. NEGATIVE pin asserts `user.id` is NOT in the dispatch tags.
 
 **Phase 3.G — middleware-level UUID validation for tenantId scaffolded** on `kimi/phase3g-tenant-uuid-at-middleware`. Closes the Phase 3.F forward-flag (untenanted-fallback bypass) by moving UUID validation up to `TenantClaimsMiddleware`. New surface (this phase):
 
@@ -284,6 +296,17 @@ Steady-state QA redeploys: `trellis-deploy/scripts/qa/Deploy-Assistant-Standalon
 - Unit: `trellis-assistant-qa.service`
 - Auth: shared `trellisqa` HTTP Basic credential at the Hetzner edge (same as web-qa + trainer-qa); GB10-side nginx is auth-free
 - Bootstrap walkthrough: `trellis-deploy/scripts/qa/bootstrap-assistant.md`
+
+## Don't (Phase 3.H)
+
+- **Don't tag any metric with `user_id`.** Phase 3.H pin #3 — `user_id` is unbounded across the fleet's users; would explode cardinality at the collector. `tenant.id` is bounded (~10s–100s); `tool.name` is bounded (~3 in v0); `outcome` is fixed enum. Pinned by `ToolDispatch_Success_EmitsDispatchCount_WithExpectedTags`'s negative assertion. Adding `user_id` to any future tool-dispatch metric would silently break that contract — the test catches it at green-build time.
+- **Don't switch the OTLP exporter from HTTP to gRPC.** Phase 3.H pin #4 — QA collector firewall posture is built around ports-80/443 (trellis-deploy network policy). gRPC requires port 4317 open + a less-standard network policy. The collector itself re-exports to anywhere; the Assistant's choice is just the wire protocol.
+- **Don't pre-bucket the duration histogram.** Phase 3.H pin #2 — collector-derived p50/p95/p99 lets downstream tuning happen without a code change + redeploy. Pre-bucketing here would hardcode percentile boundaries that may not match Phase 4 SLO targets.
+- **Don't add an `agent.run.id` or `step.index` metric tag.** High-cardinality (one per agent run / per dispatch step). Lives on **activity tags only** — tracing systems handle high cardinality; metrics never tag with this. The dispatch metric's tag set is locked at `{tool.name, tenant.id, outcome}`.
+- **Don't aggregate budget-exhausted into the failure counter.** Phase 3.H pin #1 — budget halt is operator-policy outcome (the LLM emitted MORE tool_calls than the budget allowed), not a tool fault. Aggregating both as failures would mask budget-tuning signal. Pinned by `ToolDispatch_BudgetExhaustedMidIteration_EmitsBudgetExhaustedCounter_NotFailureCounter` (failure counter empty on the budget-halt path).
+- **Don't gate the Meter / ActivitySource registration on `hasOtelEndpoint`.** They must ALWAYS register so in-process test pins observe local events via `MeterListener`/`ActivityListener`. Only the OTLP exporter is gated. Putting the `AddMeter` / `AddSource` calls inside the `if (hasOtelEndpoint)` block would silently break the 6 test pins (no listeners → no captures → all assertions fail).
+- **Don't move `AgentTelemetry` to Trellis.Core.** Single-consumer rule (same posture Phase 3.A + 3.B + 3.D + 3.F took for their seams). Lift when Workflow or Server need to emit `tool.dispatch.*` metrics against their own tool catalogues.
+- **Don't add a dedicated pure-unit `AgentTelemetryUnitTests` class.** The 6 SkippableFact pins under PostgresFixture cover the contract end-to-end. A pure-unit class would re-test the Meter/ActivitySource registration without the agent-path's invocation context — net coverage cost not earned.
 
 ## Don't (Phase 3.G)
 
