@@ -362,6 +362,84 @@ public sealed class ConversationEndpointTests : IClassFixture<PostgresFixture>, 
             "whitespace + empty headers on either side are treated as absent — no surprise auth-bypass via space-padded values");
     }
 
+    // ---------------- Phase 3.G: middleware-level UUID validation ----------------
+
+    [SkippableTheory]
+    [InlineData("not-a-uuid")]
+    [InlineData("12345")]
+    [InlineData("abcdef")]
+    [InlineData("00000000-0000-0000-0000-zzzzzzzzzzzz")]
+    public async Task PostConversations_NonUuidTenantId_Returns401_FromMiddleware(string nonUuidTenant)
+    {
+        // Phase 3.G middleware-level UUID validation: non-UUID
+        // tenant_id is rejected at the request boundary with 401
+        // (auth-failure shape — invalid claim per Phase 3.A C1).
+        // Pre-3.G this slipped past the middleware (which only checked
+        // non-blank) and surfaced as 400/404 at downstream layers; the
+        // brief window of "non-UUID tenant accepted by middleware"
+        // was the security gap Phase 3.F's design doc forward-flagged.
+        // Pin all four representative non-UUID forms.
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        using var client = NewClient(tenantId: nonUuidTenant, userId: TestTenants.UserA);
+        var resp = await client.PostAsJsonAsync("/api/conversations",
+            new ConversationEndpoints.CreateConversationRequest(Channel: "api"));
+
+        resp.StatusCode.Should().Be(HttpStatusCode.Unauthorized,
+            $"non-UUID tenant_id '{nonUuidTenant}' must 401 at middleware before reaching the endpoint");
+    }
+
+    [SkippableFact]
+    public async Task PostConversations_NonUuidTenantId_ResponseShape_IsProblemDetails()
+    {
+        // Phase 3.G pin #2: 401 body is RFC 7807 ProblemDetails (not
+        // bespoke {"error": "..."}). Operators integrating with
+        // Trellis services parse type/title/status/detail from the
+        // problem+json content type; this pin protects the wire
+        // contract.
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        using var client = NewClient(tenantId: "not-a-uuid", userId: TestTenants.UserA);
+        var resp = await client.PostAsJsonAsync("/api/conversations",
+            new ConversationEndpoints.CreateConversationRequest(Channel: "api"));
+
+        resp.StatusCode.Should().Be(HttpStatusCode.Unauthorized);
+        resp.Content.Headers.ContentType?.MediaType.Should().Be("application/problem+json",
+            "Phase 3.G upgraded Write401Async to ProblemDetails — content-type is application/problem+json per RFC 7807");
+
+        var body = await resp.Content.ReadAsStringAsync();
+        body.Should().Contain("\"status\":401");
+        body.Should().Contain("\"title\":\"Unauthorized\"");
+        body.Should().Contain("tenant_id",
+            "Detail string identifies the rejected claim — operators can diagnose without strace");
+    }
+
+    [SkippableFact]
+    public async Task PostConversations_NonUuidTenantId_DeprecatedHeaderPath_AlsoReturns401()
+    {
+        // Phase 3.G pin #5: deprecated-header-path callers get the
+        // same UUID validation gate as JWT callers. In PRODUCTION, an
+        // unauthenticated request with X-Trellis-Tenant-Id headers
+        // takes the middleware's Path 2 (header-fallback) block —
+        // that path also Guid.TryParse's the tenant value and 401s on
+        // non-UUID. In the TEST ENVIRONMENT,
+        // TestAuthenticationHandler synthesizes a ClaimsPrincipal
+        // from the X-Trellis-* headers BEFORE TenantClaimsMiddleware
+        // runs, so middleware actually exercises Path 1's JWT gate.
+        // Either way the 401 fires for non-UUID; the assertion holds
+        // for both paths. Operators reading this test should know it
+        // pins the contract end-to-end without isolating which
+        // middleware branch ran.
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        using var client = NewClient(tenantId: "deprecated-non-uuid", userId: TestTenants.UserA);
+        var resp = await client.PostAsJsonAsync("/api/conversations",
+            new ConversationEndpoints.CreateConversationRequest(Channel: "api"));
+
+        resp.StatusCode.Should().Be(HttpStatusCode.Unauthorized,
+            "deprecated-header callers get the same UUID validation gate as JWT callers");
+    }
+
     // ---------------- Test #4 (concurrency) ----------------
 
     [SkippableFact]
@@ -1381,18 +1459,18 @@ public sealed class ConversationEndpointTests : IClassFixture<PostgresFixture>, 
     }
 
     [SkippableFact]
-    public async Task PostTurns_AgentPath_NonUuidTenant_Returns400()
+    public async Task PostTurns_AgentPath_NonUuidTenant_Returns401_FromMiddleware()
     {
-        // Phase 3.A C1 pin: agent path requires uuid-shaped tenantId.
-        // The TenantClaimsMiddleware lets non-blank strings through;
-        // the agent-path branch in the orchestrator surfaces a 400
-        // when Guid.Parse fails. Pin the wire-status mapping.
+        // Phase 3.G: TenantClaimsMiddleware validates UUID-shape at the
+        // request boundary + rejects 401 BEFORE the endpoint handler
+        // OR the orchestrator sees the request. Pre-3.G this test
+        // accepted 400 (orchestrator C1 throw) or 404 (cross-tenant
+        // lookup); 3.G moves the gate up so non-UUID is now 401
+        // (auth-failure shape — invalid claim). The orchestrator C1
+        // throw becomes unreachable for the UUID-malformed case (the
+        // Guid.Empty defense stays as a separate concern).
         Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
 
-        // First: create a conversation with a uuid tenant (so the row
-        // exists). Then attempt to POST /turns from a NON-uuid tenant
-        // header — the cross-tenant check would 404, but the agent-path
-        // C1 check should fire FIRST with 400.
         using var client = NewClient();
         var convResp = await client.PostAsJsonAsync("/api/conversations",
             new ConversationEndpoints.CreateConversationRequest(Channel: "api"));
@@ -1406,15 +1484,8 @@ public sealed class ConversationEndpointTests : IClassFixture<PostgresFixture>, 
                 Tools = new[] { "echo" },
             });
 
-        // Either 400 (C1 check fires before cross-tenant lookup) or 404
-        // (cross-tenant check fires first because the conversation
-        // belongs to TenantA — though a non-uuid tenant won't match
-        // anyway). 400 is the canonical surface for the C1 violation;
-        // 404 is also acceptable per the existence-probing-leak prevention
-        // contract. Pin one of those, not 500.
-        ((int)turnResp.StatusCode).Should().Match(
-            code => code == 400 || code == 404,
-            "non-uuid tenant on agent path must surface as 400 (C1 violation) or 404 (cross-tenant) — never 500");
+        turnResp.StatusCode.Should().Be(HttpStatusCode.Unauthorized,
+            "Phase 3.G middleware rejects non-UUID tenant_id at 401 before the orchestrator runs");
     }
 
     [SkippableFact]

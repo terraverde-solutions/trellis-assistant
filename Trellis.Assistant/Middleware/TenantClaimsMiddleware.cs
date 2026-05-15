@@ -153,6 +153,32 @@ public sealed class TenantClaimsMiddleware
                 return;
             }
 
+            // Phase 3.G: validate tenant_id at the middleware boundary.
+            // Production tenantIds are uuid-shaped per Phase 3.A C1
+            // contract. Pre-Phase-3.G the orchestrator's tenancy-gate
+            // path silently bypassed the Phase 3.F policy on non-UUID
+            // input, falling through to untenanted Descriptors before
+            // the agent-path 400 fired downstream — a brief security
+            // gap window. Rejecting here closes that gap + collapses
+            // multiple TryParse defensive branches at downstream
+            // endpoints into known-safe Guid.Parse calls.
+            //
+            // Note: HttpContext.Items still carries the STRING form
+            // (not Guid). IAssistantConversationStore (Trellis.Core)
+            // takes string tenantId across every method; flipping the
+            // wire to Guid would require a cross-repo Core widening +
+            // ToString conversion at every downstream call site.
+            // Deferred as a future cleanup; the validation here gives
+            // downstream consumers the "string is UUID-parseable"
+            // guarantee, which is what they actually need.
+            if (!Guid.TryParse(tenantClaim, out _))
+            {
+                await Write401Async(context,
+                    "JWT validated but 'tenant_id' claim is not a valid UUID per Phase 3.A C1 contract.")
+                    .ConfigureAwait(false);
+                return;
+            }
+
             context.Items[TenantIdKey] = tenantClaim;
             context.Items[UserIdKey] = userClaim;
             // Phase 3.F: optional tenant_role claim. Null when absent —
@@ -181,6 +207,18 @@ public sealed class TenantClaimsMiddleware
             // principal (when headers ARE present), we proceed past
             // UseAuthorization. Same wire shape either way.
             await _next(context).ConfigureAwait(false);
+            return;
+        }
+
+        // Phase 3.G: same UUID validation as the JWT path. Pin #5:
+        // the deprecated X-Trellis-Tenant-Id header fallback gets the
+        // same gating so legacy callers can't bypass the UUID
+        // contract by virtue of being on the deprecated path.
+        if (!Guid.TryParse(tenant, out _))
+        {
+            await Write401Async(context,
+                "Deprecated X-Trellis-Tenant-Id header is not a valid UUID per Phase 3.A C1 contract.")
+                .ConfigureAwait(false);
             return;
         }
 
@@ -223,12 +261,31 @@ public sealed class TenantClaimsMiddleware
         await _next(context).ConfigureAwait(false);
     }
 
-    private static async Task Write401Async(HttpContext context, string error)
+    private static async Task Write401Async(HttpContext context, string detail)
     {
+        // Phase 3.G pin #2: RFC 7807 ProblemDetails shape. Pre-3.G this
+        // emitted a bespoke {"error": "..."} JSON; the upgrade
+        // standardizes auth-failure responses + matches the shape
+        // Macro 3's HTTP error contract uses for downstream Trellis
+        // services. Existing 401 tests assert status code only; body
+        // shape upgrade is back-compat-safe at the wire.
+        //
+        // Content-type passed to WriteAsJsonAsync explicitly — the
+        // parameter-less overload defaults to application/json, which
+        // overrides the prior Response.ContentType assignment. Using
+        // the contentType-accepting overload anchors the wire shape.
         context.Response.StatusCode = StatusCodes.Status401Unauthorized;
-        context.Response.ContentType = "application/json";
         await context.Response
-            .WriteAsync("{\"error\":\"" + error + "\"}")
+            .WriteAsJsonAsync(
+                new
+                {
+                    type = "https://tools.ietf.org/html/rfc7235#section-3.1",
+                    title = "Unauthorized",
+                    status = StatusCodes.Status401Unauthorized,
+                    detail,
+                },
+                options: null,
+                contentType: "application/problem+json")
             .ConfigureAwait(false);
     }
 }
