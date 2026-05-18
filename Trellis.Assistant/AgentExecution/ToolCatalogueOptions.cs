@@ -49,6 +49,25 @@ public sealed class ToolCatalogueOptions
     public bool ExposeEcho { get; set; } = false;
 
     /// <summary>
+    /// Phase 3.I: <c>WorkflowScheduleTool</c> exposure gate. Mirrors
+    /// <see cref="ExposeEcho"/>'s pattern — when <c>true</c>, the tool
+    /// shows up in the LLM-visible catalogue (subject to per-tenant
+    /// PerTool gating layered on top); when <c>false</c>, the tool stays
+    /// registered + dispatchable via <see cref="IToolRegistry.GetTool"/>
+    /// (operator-targeted standalone <c>POST /api/agent-runs</c> with
+    /// explicit toolNames still works) but the LLM never sees it.
+    ///
+    /// <para>
+    /// Default <c>false</c> (production-safe per Phase 3.I brief): the
+    /// tool is side-effecting (kicks off real workflow runs) and untested
+    /// in production. Opt-in flag pattern lets QA validate before
+    /// flipping it on by default. Test environments override to
+    /// <c>true</c> via WebApplicationFactory configuration overlay.
+    /// </para>
+    /// </summary>
+    public bool ExposeWorkflowSchedule { get; set; } = false;
+
+    /// <summary>
     /// Phase 3.F per-tenant tool gating. Map keyed by tool name
     /// (<see cref="Trellis.Core.Models.AgentToolDescriptor.Name"/>); each
     /// rule combines an <see cref="ToolExposureRule.AllowedTenants"/>

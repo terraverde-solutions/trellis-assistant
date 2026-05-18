@@ -40,6 +40,8 @@ public sealed class AssistantWebApplicationFactory : WebApplicationFactory<Progr
     private readonly string _connectionString;
     private readonly StubAgentLlmClient _agentLlmStub = new();
     private readonly StubSearchClient _searchClientStub = new();
+    private readonly StubWorkflowClient _workflowClientStub = new();
+    private readonly StubInternalTokenIssuer _internalTokenIssuerStub = new();
 
     /// <summary>
     /// Test-controlled stub for the agent-execution LLM. Tests use the
@@ -59,6 +61,22 @@ public sealed class AssistantWebApplicationFactory : WebApplicationFactory<Progr
     /// chain that PR #10's original E2E test missed.
     /// </summary>
     public StubSearchClient SearchClientStub => _searchClientStub;
+
+    /// <summary>
+    /// Phase 3.I fix-up: test-controlled stub for the workflow schedule
+    /// client. Tests set <see cref="StubWorkflowClient.NextResult"/>
+    /// before driving the endpoint; the executor dispatches
+    /// WorkflowScheduleTool → this stub → canned response. Mirrors the
+    /// <see cref="SearchClientStub"/> pattern.
+    /// </summary>
+    public StubWorkflowClient WorkflowClientStub => _workflowClientStub;
+
+    /// <summary>
+    /// Phase 3.I fix-up: stub for the client-credentials token issuer.
+    /// Returns a fixed token; the workflow client stub above bypasses
+    /// the actual network path so the token is never sent.
+    /// </summary>
+    public StubInternalTokenIssuer InternalTokenIssuerStub => _internalTokenIssuerStub;
 
     public AssistantWebApplicationFactory(string connectionString)
     {
@@ -111,6 +129,20 @@ public sealed class AssistantWebApplicationFactory : WebApplicationFactory<Progr
                 // isolation with a stub handler).
                 ["Assistant:Trainer:BaseUrl"] = "http://test-host-unreachable:5114/",
                 ["Assistant:Trainer:RequestTimeoutSeconds"] = "30",
+                // Phase 3.I fix-up: workflow client + internal token
+                // issuer config. The stubs below bypass the network so
+                // these values just need to keep startup resolution
+                // clean. ExposeWorkflowSchedule=true so the LLM sees
+                // the tool in the integration tests; production default
+                // is false.
+                ["Assistant:Workflow:BaseUrl"] = "http://test-host-unreachable:5118/",
+                ["Assistant:Workflow:RequestTimeoutSeconds"] = "10",
+                ["Assistant:Auth:InternalClient:TokenEndpoint"] = "http://test-host-unreachable:5119/connect/token",
+                ["Assistant:Auth:InternalClient:ClientId"] = "trellis-assistant-internal-test",
+                ["Assistant:Auth:InternalClient:ClientSecret"] = "test-secret",
+                ["Assistant:Auth:InternalClient:RequestTimeoutSeconds"] = "5",
+                ["Assistant:Auth:InternalClient:RefreshSkewSeconds"] = "60",
+                ["Assistant:Tools:ExposeWorkflowSchedule"] = "true",
                 // Phase 3.C: expose EchoTool in test environments so
                 // existing AssistantAgentExecutor + ConversationEndpoint
                 // tests that exercise the echo dispatch path still see
@@ -154,6 +186,18 @@ public sealed class AssistantWebApplicationFactory : WebApplicationFactory<Progr
             services.RemoveAll<Func<ISearchClient>>();
             services.AddSingleton<Func<ISearchClient>>(
                 sp => () => sp.GetRequiredService<ISearchClient>());
+
+            // Phase 3.I fix-up: replace the production HttpWorkflowClient
+            // + IInternalTokenIssuer with stubs so the WorkflowScheduleTool
+            // dispatch path resolves in-process. Same shape as the search
+            // client replacement above.
+            services.RemoveAll<IWorkflowClient>();
+            services.AddSingleton<IWorkflowClient>(_workflowClientStub);
+            services.RemoveAll<Func<IWorkflowClient>>();
+            services.AddSingleton<Func<IWorkflowClient>>(
+                sp => () => sp.GetRequiredService<IWorkflowClient>());
+            services.RemoveAll<IInternalTokenIssuer>();
+            services.AddSingleton<IInternalTokenIssuer>(_internalTokenIssuerStub);
 
             // Macro 3 PR 2: replace JWT bearer with the test auth
             // scheme that synthesizes claims from headers. Existing

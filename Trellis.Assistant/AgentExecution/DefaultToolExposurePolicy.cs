@@ -64,6 +64,22 @@ public sealed class DefaultToolExposurePolicy : IToolExposurePolicy
             return true;
         }
 
+        // WorkflowScheduleTool special case (Phase 3.I). Same shape as
+        // EchoTool — opt-in flag is the first gate. When flipped on,
+        // falls through to the PerTool path so per-tenant gating
+        // (AllowedTenants + RequiredRole) layers on top.
+        if (name == WorkflowScheduleTool.ToolName)
+        {
+            if (!opts.ExposeWorkflowSchedule)
+            {
+                _logger.LogDebug(
+                    "Tool {Name} hidden from tenant {TenantId} (role={Role}, reason=ExposeWorkflowSchedule=false)",
+                    name, tenancy.TenantId, tenancy.TenantRole ?? "(none)");
+                return false;
+            }
+            // Fall through to PerTool checks below.
+        }
+
         // Non-Echo tools: check the per-tool rule.
         if (!opts.PerTool.TryGetValue(name, out var rule))
         {

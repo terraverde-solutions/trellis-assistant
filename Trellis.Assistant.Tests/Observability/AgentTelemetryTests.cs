@@ -234,6 +234,68 @@ public sealed class AgentTelemetryTests : IClassFixture<PostgresFixture>, IAsync
         activity.GetTagItem("dispatch.reject_reason").Should().Be("schema_validation");
     }
 
+    [SkippableFact]
+    public async Task ToolDispatch_CancellationToken_RecordsOutcomeCancelled()
+    {
+        // Phase 3.I Thread 1: cancellation is operator-driven, NOT a
+        // tool fault. The dispatch counter records outcome=cancelled +
+        // the FAILURE counter stays empty so failure-ratio dashboards
+        // don't surface cancellations as bugs. The activity gets
+        // ActivityStatusCode.Unset (cancellation is not an error
+        // condition; downstream operators can filter by outcome tag
+        // for cancelled-vs-failed signal).
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        using var metricCapture = MetricCapture.Start(_testOrgId);
+        using var activityCapture = ActivityCapture.Start(_testOrgId);
+
+        using var cts = new CancellationTokenSource();
+        // Deterministic synchronization: HangingTool signals when it
+        // enters RunAsync; the test cancels at that point. Avoids the
+        // race where a CancelAfter timer fires before the executor
+        // reaches DispatchOneToolCallAsync — in that race the LLM-call
+        // catch wraps the OCE and we never get to the dispatch's
+        // cancellation outcome branch.
+        var hangingTool = new HangingTool(onEntered: () => cts.Cancel());
+        var executor = NewExecutorWithExtraTool(
+            new StubAgentLlmClient()
+                .EnqueueToolCall(HangingTool.ToolName, "{}"),
+            hangingTool);
+
+        // The OCE bubbles out of the executor's outer catch as
+        // AgentRunStatus.Cancelled. Inside DispatchOneToolCallAsync the
+        // tool's OCE is caught + threw=true + the cancelled-outcome
+        // metric path fires before returning.
+        var act = () => executor.RunAsync(
+            AgentRunRequest.Create(
+                orgId: _testOrgId,
+                userPrompt: "cancel mid-tool",
+                availableTools: new List<AgentToolDescriptor> { hangingTool.Descriptor }),
+            cts.Token);
+        await act.Should().NotThrowAsync(
+            "the executor's outer OCE catch converts cancellation to a Cancelled terminal status — it does not propagate");
+
+        // Dispatch counter fired with outcome=cancelled.
+        var dispatches = metricCapture.GetMeasurements("trellis.assistant.tool.dispatch.count");
+        dispatches.Should().HaveCount(1,
+            "cancellation mid-dispatch still records a single dispatch event with the cancelled outcome");
+        dispatches[0].Tags.Should().ContainKey("outcome").WhoseValue.Should().Be(
+            AgentTelemetry.Outcomes.Cancelled,
+            "outcome tag distinguishes cancelled from succeeded/failed/budget_exhausted");
+        dispatches[0].Tags.Should().ContainKey("tool.name").WhoseValue.Should().Be(HangingTool.ToolName);
+
+        // Failure counter MUST stay empty — cancellation is operator-driven,
+        // not a tool fault. Pin #1 cardinality discipline.
+        var failures = metricCapture.GetMeasurements("trellis.assistant.tool.dispatch.failure.count");
+        failures.Should().BeEmpty(
+            "cancellation is operator-driven (caller cancelled the token), NOT a tool failure — the failure counter must stay empty so failure-ratio alerts aren't tripped by user disconnects");
+
+        // Activity status stays Unset on cancellation (Phase 3.H pin).
+        var activity = activityCapture.GetActivities("agent.tool.dispatch").Single();
+        activity.Status.Should().Be(ActivityStatusCode.Unset,
+            "cancellation is not an error condition — the activity's outcome tag conveys what happened");
+    }
+
     // ---------------- helpers ----------------
 
     private AssistantAgentExecutor NewExecutor(IAgentLlmClient llm)
@@ -258,6 +320,72 @@ public sealed class AgentTelemetryTests : IClassFixture<PostgresFixture>, IAsync
     private sealed class AllowAllExposurePolicy : IToolExposurePolicy
     {
         public bool IsExposedTo(IAgentTool tool, AgentToolTenancy tenancy) => true;
+    }
+
+    /// <summary>
+    /// Variant builder that registers an extra IAgentTool alongside the
+    /// default EchoTool. Used by the cancellation pin to dispatch
+    /// against a tool that hangs until the CT fires.
+    /// </summary>
+    private AssistantAgentExecutor NewExecutorWithExtraTool(IAgentLlmClient llm, IAgentTool extra)
+    {
+        var allTools = new List<IAgentTool> { new EchoTool(), extra };
+        var schemaValidator = new JsonSchemaNetValidator();
+        var catalogueOptions = Options.Create(new ToolCatalogueOptions { ExposeEcho = true });
+        var exposurePolicy = new AllowAllExposurePolicy();
+        var registry = new ToolRegistry(allTools, schemaValidator, catalogueOptions, exposurePolicy);
+        var gate = new DefaultBudgetGate();
+        var store = new PostgresAgentRunStore(_db!);
+        var options = Options.Create(new AssistantAgentExecutorOptions
+        {
+            Model = "stub-model",
+            SystemPrompt = "You are a stub.",
+        });
+        return new AssistantAgentExecutor(
+            store, llm, registry, gate, schemaValidator, options,
+            NullLogger<AssistantAgentExecutor>.Instance);
+    }
+
+    /// <summary>
+    /// Tool that delays until cancellation fires — Task.Delay with the
+    /// CT throws OCE on cancel, which lands in
+    /// DispatchOneToolCallAsync's OCE branch (threw=true, errorMessage
+    /// set to "Tool dispatch cancelled mid-execution.") then proceeds
+    /// to the outcome-classification block that fires the
+    /// outcome=cancelled metric path.
+    /// </summary>
+    private sealed class HangingTool : IAgentTool
+    {
+        public const string ToolName = "hanging_tool";
+
+        private readonly Action? _onEntered;
+
+        public HangingTool(Action? onEntered = null)
+        {
+            _onEntered = onEntered;
+        }
+
+        public AgentToolDescriptor Descriptor { get; } = new()
+        {
+            Name = ToolName,
+            Description = "Test-only tool that hangs until cancellation fires.",
+            ParameterSchema = """{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":true}""",
+            Category = AgentToolCategory.Inspect,
+        };
+
+        public async Task<AgentToolOutput> RunAsync(
+            AgentToolInput input, CancellationToken cancellationToken = default)
+        {
+            // Signal entry — the test cancels its CTS from here, giving
+            // the executor a guaranteed dispatch-mid-flight cancellation
+            // path instead of racing a CancelAfter timer against the
+            // executor's startup.
+            _onEntered?.Invoke();
+            await Task.Delay(TimeSpan.FromSeconds(10), cancellationToken).ConfigureAwait(false);
+            // Unreachable unless the test budget is exceeded; the CT fires
+            // before this returns.
+            return new AgentToolOutput { Success = true, ResultJson = "{}" };
+        }
     }
 
     /// <summary>
