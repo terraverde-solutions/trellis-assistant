@@ -678,6 +678,65 @@ public sealed class ConversationEndpointTests : IClassFixture<PostgresFixture>, 
             "the LLM's tool_call arguments flowed through MapToSearchQuery → ISearchClient.SearchAsync with the query preserved");
     }
 
+    [SkippableFact]
+    public async Task ConversationTurn_AskingToRunWorkflow_InvokesWorkflowScheduleAndReturnsAugmentedReply()
+    {
+        // Phase 3.I fix-up B2: agent-loop E2E for WorkflowScheduleTool —
+        // brief Pin 1 (missed in the first round). Same shape as the
+        // SearchDocuments E2E above:
+        //   stub LLM emits tool_call("workflow_schedule", {...}) →
+        //   executor dispatches WorkflowScheduleTool →
+        //   IWorkflowClient (stubbed) returns canned 201 body →
+        //   second LLM turn returns augmented text →
+        //   3-turn persistence [user, tool, assistant].
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        var definitionId = Guid.Parse("33333333-3333-3333-3333-333333333333");
+        var runId = "55555555-5555-5555-5555-555555555555";
+        _factory!.WorkflowClientStub.NextResult = new WorkflowScheduleResult
+        {
+            Success = true,
+            ResponseBodyJson = $$"""{"id":"{{runId}}","status":1}""",
+        };
+        _factory.AgentLlmStub
+            .EnqueueToolCall("workflow_schedule",
+                "{\"workflow_definition_id\":\"" + definitionId.ToString("D") + "\"}")
+            .EnqueueAssistantText($"Scheduled workflow run {runId}.");
+
+        using var client = NewClient();
+        var convResp = await client.PostAsJsonAsync("/api/conversations",
+            new ConversationEndpoints.CreateConversationRequest(Channel: "api"));
+        var conv = await convResp.Content.ReadFromJsonAsync<ConversationEndpoints.CreateConversationResponse>();
+
+        var turnResp = await client.PostAsJsonAsync(
+            $"/api/conversations/{conv!.Id}/turns",
+            new ConversationEndpoints.AppendTurnRequest("Kick off the onboarding workflow."));
+        turnResp.StatusCode.Should().Be(HttpStatusCode.OK);
+
+        var turnBody = await turnResp.Content.ReadFromJsonAsync<ConversationEndpoints.AppendTurnResponse>();
+        turnBody!.AssistantTurn.Content.Should().Contain(runId,
+            "the second LLM call's text — produced AFTER the workflow run id was inserted into history — surfaces the new run id");
+        turnBody.ToolTurns.Should().NotBeNull();
+        turnBody.ToolTurns!.Should().HaveCount(1, "exactly one workflow_schedule dispatch was scripted");
+        turnBody.ToolTurns![0].ToolName.Should().Be("workflow_schedule");
+        turnBody.ToolTurns![0].Content.Should().Contain(runId,
+            "qwen's 201 Created body flowed through HttpWorkflowClient → WorkflowScheduleTool → ToolTurn.Content verbatim");
+
+        // Position contiguity: user=0, tool=1, assistant=2.
+        turnBody.UserTurn.Position.Should().Be(0);
+        turnBody.ToolTurns![0].Position.Should().Be(1);
+        turnBody.AssistantTurn.Position.Should().Be(2);
+
+        // Workflow client was dispatched exactly once with the LLM's
+        // definition id preserved.
+        _factory.WorkflowClientStub.CallCount.Should().Be(1);
+        _factory.WorkflowClientStub.LastDefinitionId.Should().Be(definitionId,
+            "the LLM's tool_call arguments flowed through to ScheduleByIdAsync with the workflow_definition_id preserved");
+
+        // 2 LLM calls: dispatch + synthesis.
+        _factory.AgentLlmStub.Calls.Should().HaveCount(2);
+    }
+
     // ---------------- Phase 3.F: per-tenant tool exposure gating ----------------
 
     [SkippableFact]

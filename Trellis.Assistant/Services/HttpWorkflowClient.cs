@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Http.Headers;
+using System.Security.Claims;
 using System.Text;
 using System.Text.Json;
 using Microsoft.AspNetCore.Http;
@@ -8,45 +9,59 @@ namespace Trellis.Assistant.Services;
 
 /// <summary>
 /// Phase 3.I production <see cref="IWorkflowClient"/> against
-/// trellis-workflow's loopback <c>POST /api/workflows/runs</c>. Wired in
+/// trellis-workflow's <c>POST /api/workflows/runs</c>. Wired in
 /// <c>Program.cs</c> via
 /// <c>AddHttpClient&lt;IWorkflowClient, HttpWorkflowClient&gt;</c>;
-/// HttpClient.BaseAddress + Timeout configured from
+/// BaseAddress + Timeout configured from
 /// <see cref="WorkflowScheduleOptions"/> using the LATE-RESOLUTION
 /// pattern (config read inside the factory lambda at DI resolution
-/// time, so WebApplicationFactory overlays + future runtime config
-/// changes are visible).
+/// time).
 ///
 /// <para>
-/// JWT propagation: reads the inbound request's
-/// <c>Authorization: Bearer ...</c> header via
-/// <see cref="IHttpContextAccessor"/> + attaches it verbatim to the
-/// outbound qwen call. qwen's <c>TenantClaimsMiddleware</c> re-parses
-/// the token to extract tenant_id, so the schedule call lands in the
-/// correct tenant's scope. No HttpContext (e.g. called from a
-/// non-HTTP context or from a test that doesn't set one up) → no
-/// header attached → qwen rejects 401 → tool surfaces
-/// <see cref="WorkflowScheduleErrorCode.AuthFailed"/> to the LLM.
+/// AUTH (Phase 3.I fix-up): the Assistant mints its own service token
+/// per outbound call via <see cref="IInternalTokenIssuer"/>
+/// (client-credentials grant; <c>aud=trellis-workflow</c>). The user's
+/// tenant identity is forwarded out-of-band as the
+/// <c>X-Trellis-Tenant-Id</c> header — read from
+/// <c>HttpContext.User.FindFirst("tenant_id")</c>. qwen's
+/// TenantClaimsMiddleware honors this header on requests from trusted
+/// internal callers (gated by the CC client_id, per paired qwen brief).
+/// Verbatim-forwarding the inbound user JWT was the prior shape; it
+/// 401'd every call because the user JWT carries
+/// <c>aud=trellis-assistant</c>, not <c>aud=trellis-workflow</c>.
 /// </para>
 ///
 /// <para>
-/// Failure mapping (per Phase 3.I brief): 201 Created → Success; 401 →
-/// AuthFailed; 404 → DefinitionNotFound; other 4xx → BadRequest with
-/// ProblemDetails.detail; 5xx + transport + timeout → Transient. The
-/// distinction between caller cancellation
-/// (<see cref="OperationCanceledException"/> with CT requested → rethrow)
-/// and qwen-side timeout (<see cref="TaskCanceledException"/> with CT
-/// NOT requested → Transient) matches <see cref="HttpSearchClient"/>'s
-/// pattern.
+/// Failure mapping: 201 Created → Success; 401 → AuthFailed; 404 →
+/// DefinitionNotFound; other 4xx → BadRequest with ProblemDetails.detail;
+/// 5xx + transport + qwen-timeout → Transient. Token-issuance failures
+/// (Auth service unreachable / 5xx / rejected credentials) also surface
+/// as AuthFailed at the LLM layer — operator-actionable, NOT a
+/// transient the LLM should retry. The distinction between caller
+/// cancellation (<see cref="OperationCanceledException"/> with CT
+/// requested → rethrow) and qwen-side timeout
+/// (<see cref="TaskCanceledException"/> with CT NOT requested →
+/// Transient) matches <see cref="HttpSearchClient"/>'s pattern.
 /// </para>
 /// </summary>
 public sealed class HttpWorkflowClient : IWorkflowClient
 {
-    /// <summary>
-    /// Schedule-by-id endpoint path (relative to BaseAddress). qwen Phase
-    /// 4.A canonical route per the Phase 3.I brief.
-    /// </summary>
     public const string SchedulePath = "api/workflows/runs";
+
+    /// <summary>
+    /// Target resource value passed to <see cref="IInternalTokenIssuer"/>
+    /// — the Auth service mints a token with <c>aud</c> equal to this.
+    /// Sibling siblings define their own audience; the Assistant must
+    /// match the sibling's expectation.
+    /// </summary>
+    public const string TargetResource = "trellis-workflow";
+
+    /// <summary>
+    /// Out-of-band tenant forwarding header. qwen's
+    /// <c>TenantClaimsMiddleware</c> honors this on requests from
+    /// trusted CC client_ids per paired qwen brief.
+    /// </summary>
+    public const string TenantIdHeader = "X-Trellis-Tenant-Id";
 
     private static readonly JsonSerializerOptions JsonOpts = new()
     {
@@ -56,15 +71,18 @@ public sealed class HttpWorkflowClient : IWorkflowClient
 
     private readonly HttpClient _http;
     private readonly IHttpContextAccessor _httpContextAccessor;
+    private readonly IInternalTokenIssuer _tokenIssuer;
     private readonly ILogger<HttpWorkflowClient> _logger;
 
     public HttpWorkflowClient(
         HttpClient http,
         IHttpContextAccessor httpContextAccessor,
+        IInternalTokenIssuer tokenIssuer,
         ILogger<HttpWorkflowClient> logger)
     {
         _http = http ?? throw new ArgumentNullException(nameof(http));
         _httpContextAccessor = httpContextAccessor ?? throw new ArgumentNullException(nameof(httpContextAccessor));
+        _tokenIssuer = tokenIssuer ?? throw new ArgumentNullException(nameof(tokenIssuer));
         _logger = logger;
     }
 
@@ -83,12 +101,59 @@ public sealed class HttpWorkflowClient : IWorkflowClient
             };
         }
 
+        // Pre-flight: extract tenant_id from the inbound user JWT
+        // BEFORE minting a service token. If no inbound JWT context, the
+        // tool is being dispatched from a path that can't supply tenant
+        // identity — surface a clear failure to the LLM (the tool is
+        // only meaningful from a JWT-authenticated agent path).
+        string tenantIdValue;
+        try
+        {
+            tenantIdValue = RequireTenantIdFromInboundContext();
+        }
+        catch (InvalidOperationException ex)
+        {
+            _logger.LogWarning("Workflow schedule: {Message}", ex.Message);
+            return new WorkflowScheduleResult
+            {
+                Success = false,
+                ErrorCode = WorkflowScheduleErrorCode.AuthFailed,
+                ErrorMessage = ex.Message,
+            };
+        }
+
+        // Mint the service token. Auth failures here (Auth unreachable
+        // / 5xx / credentials rejected) surface as AuthFailed to the
+        // LLM — operator-actionable, NOT a transient retry candidate.
+        string internalToken;
+        try
+        {
+            internalToken = await _tokenIssuer
+                .GetAccessTokenAsync(TargetResource, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (InternalTokenIssuanceException ex)
+        {
+            _logger.LogWarning(ex, "Workflow schedule: internal token issuance failed.");
+            return new WorkflowScheduleResult
+            {
+                Success = false,
+                ErrorCode = WorkflowScheduleErrorCode.AuthFailed,
+                ErrorMessage = "Assistant could not authenticate to Workflow service.",
+            };
+        }
+
         var requestBody = BuildRequestBody(workflowDefinitionId, initialInputJson);
         using var request = new HttpRequestMessage(HttpMethod.Post, SchedulePath)
         {
             Content = new StringContent(requestBody, Encoding.UTF8, "application/json"),
         };
-        TryPropagateBearerToken(request);
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", internalToken);
+        request.Headers.TryAddWithoutValidation(TenantIdHeader, tenantIdValue);
 
         _logger.LogInformation(
             "Workflow schedule: definition={DefinitionId} hasInput={HasInput}",
@@ -264,41 +329,29 @@ public sealed class HttpWorkflowClient : IWorkflowClient
     }
 
     /// <summary>
-    /// Propagate the inbound user JWT to the outbound qwen call. Reads
-    /// <c>Authorization</c> from the current HttpContext's request
-    /// headers; copies the value verbatim onto the outbound request.
-    /// No-op when no HttpContext is current (out-of-band call from a
-    /// background service / test) or when no Authorization header is
-    /// present (anonymous caller — qwen will 401, surfaced as
-    /// <see cref="WorkflowScheduleErrorCode.AuthFailed"/>).
+    /// Read the tenant_id claim from the inbound user JWT
+    /// (HttpContext.User). Throws when no HttpContext is current or
+    /// the claim is missing — the workflow_schedule tool is only
+    /// meaningful from a JWT-authenticated agent path, and surfacing
+    /// a clear failure beats sending a request with no tenant
+    /// scope. The schedule call must NEVER reach qwen without a
+    /// tenant identifier — qwen would refuse it (single-tenant
+    /// scope is a security invariant), but failing fast at the
+    /// Assistant boundary keeps logs cleaner.
     /// </summary>
-    private void TryPropagateBearerToken(HttpRequestMessage request)
+    private string RequireTenantIdFromInboundContext()
     {
-        var httpContext = _httpContextAccessor.HttpContext;
-        if (httpContext is null)
+        var httpContext = _httpContextAccessor.HttpContext
+            ?? throw new InvalidOperationException(
+                "workflow_schedule requires an inbound HttpContext with a user JWT; called from a context without one.");
+
+        var claim = httpContext.User?.FindFirst("tenant_id")?.Value;
+        if (string.IsNullOrWhiteSpace(claim))
         {
-            return;
+            throw new InvalidOperationException(
+                "workflow_schedule requires a tenant_id claim on the inbound user JWT; claim missing or empty.");
         }
-        if (!httpContext.Request.Headers.TryGetValue("Authorization", out var values)
-            || values.Count == 0)
-        {
-            return;
-        }
-        var raw = values[0];
-        if (string.IsNullOrWhiteSpace(raw))
-        {
-            return;
-        }
-        // AuthenticationHeaderValue.TryParse handles "Bearer <token>" cleanly;
-        // fallback to raw assignment if a non-standard shape slips through.
-        if (AuthenticationHeaderValue.TryParse(raw, out var parsed))
-        {
-            request.Headers.Authorization = parsed;
-        }
-        else
-        {
-            request.Headers.TryAddWithoutValidation("Authorization", raw);
-        }
+        return claim;
     }
 
     private static string? TryExtractProblemDetailsDetail(string body)

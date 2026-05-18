@@ -1,4 +1,9 @@
+using System.Net;
+using System.Security.Claims;
+using System.Text;
 using FluentAssertions;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Logging.Abstractions;
 using Trellis.Assistant.AgentExecution;
 using Trellis.Assistant.Services;
 using Trellis.Core.Models;
@@ -107,6 +112,56 @@ public sealed class WorkflowScheduleToolTests
     }
 
     [Fact]
+    public async Task RunAsync_SchemaBypass_MissingWorkflowDefinitionId_NoOutboundHttp()
+    {
+        // Phase 3.I fix-up Pin 2 (real-handler probe variant): pin the
+        // invariant against the actual HTTP wire, not just the
+        // IWorkflowClient interface. A real HttpWorkflowClient wired
+        // through a recording HttpMessageHandler — if the tool ever
+        // reaches the network path on missing-required-arg, the
+        // handler increments + the test fails. Companion to the
+        // interface-level pin above.
+        var handlerCalls = 0;
+        var probeHandler = new ProbeHandler(req =>
+        {
+            handlerCalls++;
+            return new HttpResponseMessage(HttpStatusCode.OK);
+        });
+        var httpClient = new HttpClient(probeHandler)
+        {
+            BaseAddress = new Uri("http://test-probe-host/"),
+            Timeout = TimeSpan.FromSeconds(5),
+        };
+        var ctx = new DefaultHttpContext
+        {
+            User = new ClaimsPrincipal(new ClaimsIdentity(new[]
+            {
+                new Claim("tenant_id", "11111111-1111-1111-1111-111111111111"),
+            }, "TestAuth")),
+        };
+        var accessor = new HttpContextAccessor { HttpContext = ctx };
+        var stubIssuer = new ProbeStubIssuer();
+        var realClient = new HttpWorkflowClient(
+            httpClient, accessor, stubIssuer, NullLogger<HttpWorkflowClient>.Instance);
+        var tool = new WorkflowScheduleTool(() => realClient);
+
+        var output = await tool.RunAsync(new AgentToolInput
+        {
+            AgentRunId = Guid.NewGuid(),
+            StepIndex = 0,
+            ParametersJson = """{"initial_input_json":{"a":1}}""",
+            OrgId = Guid.Parse(TestFixtures.TestTenants.TenantA),
+            UserId = TestFixtures.TestTenants.UserA,
+        });
+
+        output.Success.Should().BeFalse();
+        handlerCalls.Should().Be(0,
+            "schema validation must short-circuit before any outbound HTTP — pinned at the real HttpMessageHandler layer");
+        stubIssuer.CallCount.Should().Be(0,
+            "tool short-circuits before even minting a service token — no Auth-service traffic either");
+    }
+
+    [Fact]
     public async Task RunAsync_QwenReturns404_LlmGetsDefinitionNotFoundEnvelope()
     {
         // Phase 3.I pin 3: 404 surfaces as a structured envelope the
@@ -164,6 +219,39 @@ public sealed class WorkflowScheduleToolTests
         output.Success.Should().BeFalse();
         output.ResultJson.Should().Contain("\"error\":\"transient\"");
         output.ErrorMessage.Should().Contain("timed out");
+    }
+
+    [Fact]
+    public async Task RunAsync_QwenReturnsBadRequest_LlmGetsBadRequestEnvelope()
+    {
+        // Phase 3.I fix-up Pin 4 (BadRequest category, missed first
+        // round): 4xx other than 401/404 → bad_request envelope.
+        // ProblemDetails detail from qwen passes through to the
+        // LLM-visible message so the LLM can read the failure reason +
+        // decide whether to retry with corrected args.
+        var tool = NewTool(out var stub);
+        stub.Result = new WorkflowScheduleResult
+        {
+            Success = false,
+            ErrorCode = WorkflowScheduleErrorCode.BadRequest,
+            ErrorMessage = "422: input schema mismatch with workflow definition",
+        };
+
+        var output = await tool.RunAsync(new AgentToolInput
+        {
+            AgentRunId = Guid.NewGuid(),
+            StepIndex = 0,
+            ParametersJson = "{\"workflow_definition_id\":\"" + SampleDefinitionId.ToString("D") + "\"}",
+            OrgId = Guid.Parse(TestFixtures.TestTenants.TenantA),
+            UserId = TestFixtures.TestTenants.UserA,
+        });
+
+        output.Success.Should().BeFalse();
+        output.ResultJson.Should().Contain("\"error\":\"bad_request\"",
+            "structured-error envelope uses the snake_case error key so the LLM can pattern-match");
+        output.ResultJson.Should().Contain("422",
+            "qwen's ProblemDetails detail flows verbatim to the LLM so it can read the failure reason");
+        output.ErrorMessage.Should().Contain("schema mismatch");
     }
 
     [Fact]
@@ -252,6 +340,30 @@ public sealed class WorkflowScheduleToolTests
             LastDefinitionId = workflowDefinitionId;
             LastInitialInputJson = initialInputJson;
             return Task.FromResult(Result);
+        }
+    }
+
+    /// <summary>
+    /// Recording HttpMessageHandler used by the B4 real-handler probe
+    /// pin. Pins the no-outbound-HTTP invariant against the actual
+    /// wire, not the IWorkflowClient interface.
+    /// </summary>
+    private sealed class ProbeHandler : HttpMessageHandler
+    {
+        private readonly Func<HttpRequestMessage, HttpResponseMessage> _respond;
+        public ProbeHandler(Func<HttpRequestMessage, HttpResponseMessage> respond) { _respond = respond; }
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request, CancellationToken cancellationToken)
+            => Task.FromResult(_respond(request));
+    }
+
+    private sealed class ProbeStubIssuer : IInternalTokenIssuer
+    {
+        public int CallCount { get; private set; }
+        public Task<string> GetAccessTokenAsync(string targetResource, CancellationToken ct)
+        {
+            CallCount++;
+            return Task.FromResult("probe-token");
         }
     }
 }

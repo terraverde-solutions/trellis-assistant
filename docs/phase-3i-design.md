@@ -1,6 +1,6 @@
 # Phase 3.I design — outcome=cancelled OTel pin + WorkflowScheduleTool
 
-**Status:** scaffolded on `kimi/phase-3i-cancellation-pin-plus-workflow-schedule-tool`. Two threads bundled into one PR:
+**Status:** scaffolded on `kimi/phase-3i-cancellation-pin-plus-workflow-schedule-tool`. **PR #16 fix-up applied** post-review: client-credentials token issuer added; verbatim user-JWT forwarding removed (was the 401-every-call defect); 3 test gaps closed. Two threads bundled into one PR:
 
 - **Thread 1 (small):** test-only pin closing the Phase 3.H non-blocking suggestion — verifies that mid-dispatch cancellation records `outcome=cancelled` on the metric (distinct from `failed` / `succeeded` / `budget_exhausted`) AND leaves the failure counter empty. Cancellation is operator-driven (caller dropped the token), not a tool fault — conflating it with failure would trip failure-ratio dashboards on every user disconnect.
 - **Thread 2 (new tool):** third production tool. `WorkflowScheduleTool` lets the LLM schedule a workflow run via trellis-workflow's `POST /api/workflows/runs` (qwen Phase 4.A). Schedule-by-id branch ONLY — the inline-JSON branch takes a full `WorkflowDefinitionJson` blob an LLM has no business emitting (hallucination + injection risk per the brief).
@@ -69,11 +69,35 @@ The LLM sees this body verbatim via `AgentToolOutput.ResultJson`.
 
 `ErrorMessage` (operator-facing, AgentStep.ErrorMessage column) carries the same description in unstructured form. The LLM-visible structured envelope lives in `ResultJson`.
 
-### JWT propagation
+### Auth (fix-up: client-credentials token exchange)
 
-`HttpWorkflowClient` reads `Authorization` from the current `HttpContext`'s request headers via `IHttpContextAccessor` and copies it verbatim onto the outbound qwen request. qwen's `TenantClaimsMiddleware` re-parses the token to extract `tenant_id` — so the schedule call lands in the same tenant scope as the original Assistant request. No HttpContext (out-of-band call) → no header attached → qwen 401 → tool surfaces `AuthFailed` to the LLM.
+**Original (broken) shape:** verbatim-forward the inbound user JWT to qwen. Defect: the user JWT carries `aud=trellis-assistant` but qwen validates `aud=trellis-workflow` — every call 401s. Caught by hub review against `appsettings.json:17`, `Trellis.Workflow.Api/Program.cs:35,58-59`, and `HttpWorkflowClient.cs:275-300`.
 
-`services.AddHttpContextAccessor()` registered in `Program.cs`. Pinned by `ScheduleByIdAsync_HttpContextWithBearer_PropagatesAuthorizationHeader` + `ScheduleByIdAsync_NoHttpContext_OmitsAuthorizationHeader`.
+**Fixed (Path A) shape:** the Assistant mints its own service token per outbound call via OAuth2 client-credentials.
+
+- `IInternalTokenIssuer` (`Services/IInternalTokenIssuer.cs`) — one method: `GetAccessTokenAsync(targetResource, ct)`. Per-resource cache keyed on `targetResource`, refresh-skew window before `exp` (default 60s margin), stampede control via per-resource `SemaphoreSlim`. Failures surface as `InternalTokenIssuanceException`.
+- `OpenIddictInternalTokenIssuer` — production implementation. POSTs `grant_type=client_credentials&client_id=…&client_secret=…&resource=<aud>` to `Assistant:Auth:InternalClient:TokenEndpoint`. Parses `{ access_token, expires_in, token_type }`. Caches until `exp - RefreshSkewSeconds`. Singleton in DI (cache must persist) — registered via named-HttpClient + manual singleton factory matching Trellis.Core's `JwtClientCredentialsTokenStore` pattern (Macro 2 PR 6).
+- `HttpWorkflowClient`:
+  - Mints `aud=trellis-workflow` token via `_tokenIssuer.GetAccessTokenAsync(TargetResource, ct)`.
+  - Sets outbound `Authorization: Bearer <minted-token>`.
+  - Reads `tenant_id` claim from `HttpContext.User`; throws if absent (the tool is only meaningful from a JWT-authenticated agent path).
+  - Forwards the tenant identity out-of-band as `X-Trellis-Tenant-Id: <claim>`.
+- Token-issuance failures (Auth unreachable / 5xx / rejected credentials) surface to the LLM as `WorkflowScheduleErrorCode.AuthFailed` — operator-actionable, NOT a transient the LLM should retry-loop against.
+
+Config bound from `Assistant:Auth:InternalClient`:
+```json
+{
+  "TokenEndpoint": "http://127.0.0.1:5119/connect/token",
+  "ClientId": "trellis-assistant-internal",
+  "ClientSecret": "",
+  "RequestTimeoutSeconds": 5,
+  "RefreshSkewSeconds": 60
+}
+```
+
+Production deploys override `ClientId` + `ClientSecret` via env var (`Assistant__Auth__InternalClient__ClientId` / `…__ClientSecret`); secrets MUST NOT be inlined in appsettings.json.
+
+**Forward-flag (paired qwen brief required for production functionality):** qwen's `TenantClaimsMiddleware` currently reads tenant_id ONLY from the JWT claim. The `X-Trellis-Tenant-Id` header forwarding is meaningless until qwen accepts it. Hub is drafting a paired qwen brief adding header-based tenant_id support gated on the CC client_id (only honored when the request comes from a known internal client like `trellis-assistant-internal`). The Assistant-side change is shipped under the assumption qwen-side acceptance lands separately; until then, the production wire is auth'd correctly (qwen validates the service token) but tenant context isn't yet plumbed at qwen's middleware.
 
 ### Exposure gating (opt-in)
 
@@ -92,7 +116,7 @@ Test environments override via `WebApplicationFactory` config overlay. Standalon
 | Brief | Actual | Resolution |
 |---|---|---|
 | File path `Trellis.Assistant/Tools/WorkflowScheduleTool.cs` | Existing tools live in `AgentExecution/` (SearchDocumentsTool + ChatRecentTool + EchoTool) | Placed in `AgentExecution/` to match the established layout; same for `Services/HttpWorkflowClient.cs` matching `HttpSearchClient.cs` |
-| "Assistant's existing BearerAuthHandler pattern (search the repo)" | No such pattern in `Trellis.Assistant`. Trellis.Core has `BearerAuthHandler` (legacy, service-to-service) + `JwtClientCredentialsHandler` (Macro 2 PR 6) + `InteractiveJwtHandler` (Phone Chat) — none of which match this use case (propagating an inbound user JWT). | Wrote a minimal propagation path directly in `HttpWorkflowClient` using `IHttpContextAccessor`. A `DelegatingHandler` would be cleaner separation-of-concerns but adds ~30 LoC for a single consumer — revisit when a second tool needs the same propagation. |
+| First-round: "verbatim user-JWT forwarding via IHttpContextAccessor" | User JWT carries `aud=trellis-assistant`; qwen validates `aud=trellis-workflow`. Verbatim forwarding 401s every call. | **Fix-up applied:** replaced with client-credentials token exchange (see Auth section). Assistant mints `aud=trellis-workflow` token; tenant identity forwarded out-of-band as `X-Trellis-Tenant-Id`. |
 | `WorkflowScheduleResponse.cs` DTO | Brief said "return as JsonElement unchanged" — pass-through (a) per Phase 3.B precedent obsoletes the DTO | DTO not created; the tool returns the body bytes verbatim via `AgentToolOutput.ResultJson`. |
 
 ## Wire-shape changes (operator-visible)
@@ -109,6 +133,28 @@ No status-code changes; no breaking API changes. Phase 3.I is additive-only.
 
 **Cancellation pin** (1):
 - `ToolDispatch_CancellationToken_RecordsOutcomeCancelled` — pinned per Thread 1 brief.
+
+**Fix-up: token-issuer pin tests** (5 in `OpenIddictInternalTokenIssuerTests.cs`):
+- `GetAccessTokenAsync_HappyPath_CachesUntilExpiry` — first call mints, second call within skew returns cached.
+- `GetAccessTokenAsync_AfterExpirySkew_RefreshesAutomatically` — FakeTimeProvider advanced past `exp - skew` triggers fresh mint.
+- `GetAccessTokenAsync_AuthEndpointReturns500_ThrowsInternalTokenIssuanceException` — 5xx maps to throw.
+- `GetAccessTokenAsync_AuthEndpointTransportError_ThrowsInternalTokenIssuanceException` — transport failure maps to throw.
+- `GetAccessTokenAsync_ConcurrentCallsDuringRefresh_OnlyOneOutboundCall` — 32 concurrent callers serialize through per-resource semaphore, exactly 1 outbound mint.
+
+**Fix-up: HttpWorkflowClient auth/tenant pin tests** (3 new in `HttpWorkflowClientTests.cs`):
+- `ScheduleByIdAsync_201Created_OutboundCarriesServiceTokenAndTenantHeader` — outbound has minted service token + `X-Trellis-Tenant-Id` from inbound JWT claim.
+- `ScheduleByIdAsync_NoHttpContext_ReturnsAuthFailed_WithoutHttpCall` — no inbound JWT context → AuthFailed, no outbound HTTP.
+- `ScheduleByIdAsync_HttpContextMissingTenantClaim_ReturnsAuthFailed_WithoutHttpCall` — inbound JWT missing tenant_id → AuthFailed.
+- `ScheduleByIdAsync_TokenIssuerThrows_ReturnsAuthFailed_WithoutHttpCall` — `InternalTokenIssuanceException` → AuthFailed envelope, no outbound HTTP.
+
+**Fix-up: agent-loop E2E** (1 new in `ConversationEndpointTests.cs`):
+- `ConversationTurn_AskingToRunWorkflow_InvokesWorkflowScheduleAndReturnsAugmentedReply` — closes brief Pin 1. Stub LLM emits `workflow_schedule` tool_call; stub workflow client returns 201; agent loop produces final assistant text carrying the run id. 3-turn persistence verified.
+
+**Fix-up: BadRequest envelope** (1 new in `WorkflowScheduleToolTests.cs`):
+- `RunAsync_QwenReturnsBadRequest_LlmGetsBadRequestEnvelope` — closes brief Pin 4 category. 4xx other than 401/404 → `error: "bad_request"` + ProblemDetails detail surfaced.
+
+**Fix-up: real-handler probe** (1 new in `WorkflowScheduleToolTests.cs`):
+- `RunAsync_SchemaBypass_MissingWorkflowDefinitionId_NoOutboundHttp` — pins the no-outbound-HTTP invariant against the actual `HttpMessageHandler`, not just the `IWorkflowClient` interface. Closes brief B4.
 
 **WorkflowScheduleTool pin tests** (9 in `WorkflowScheduleToolTests.cs`):
 - `Descriptor_HasExpectedShape` — Name + Category=Act + Description + Schema contains workflow_definition_id.

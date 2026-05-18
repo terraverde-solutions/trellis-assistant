@@ -107,11 +107,45 @@ builder.Services
     .Bind(builder.Configuration.GetSection(WorkflowScheduleOptions.SectionName))
     .ValidateDataAnnotations();
 
-// Phase 3.I: IHttpContextAccessor for the WorkflowScheduleTool's JWT
-// propagation. HttpWorkflowClient reads the inbound Authorization
-// header from the current HttpContext + attaches it to the outbound
-// qwen call so workflow's TenantClaimsMiddleware sees the same tenant.
+// Phase 3.I fix-up: internal token issuer options. Bound from
+// "Assistant:Auth:InternalClient" (ClientId, ClientSecret,
+// TokenEndpoint, RequestTimeoutSeconds, RefreshSkewSeconds).
+// Production deploys override ClientId + ClientSecret via env var.
+builder.Services
+    .AddOptions<InternalTokenIssuerOptions>()
+    .Bind(builder.Configuration.GetSection(InternalTokenIssuerOptions.SectionName))
+    .ValidateDataAnnotations();
+
+// Phase 3.I: IHttpContextAccessor for tenant_id extraction from the
+// inbound user JWT. HttpWorkflowClient reads HttpContext.User
+// claims + forwards tenant_id as X-Trellis-Tenant-Id (out-of-band)
+// alongside the Assistant's own service token in Authorization.
 builder.Services.AddHttpContextAccessor();
+
+// Phase 3.I fix-up: internal-service token issuer. SINGLETON — the
+// cache must persist across calls. Named-HttpClient registration
+// (rather than typed-client + automatic transient registration) so
+// the issuer holds onto a stable HttpClient for the host's lifetime.
+// Matches the Trellis.Core JwtClientCredentialsTokenStore (Macro 2 PR
+// 6) pattern: singleton store + IHttpClientFactory.CreateClient at
+// resolution time. Token cache lives in the issuer; HttpClient handler
+// is captured once (acceptable for a low-frequency token endpoint —
+// the token caches for minutes between mints).
+builder.Services.AddSingleton(TimeProvider.System);
+builder.Services.AddHttpClient("internal-token-issuer").ConfigureHttpClient((sp, http) =>
+{
+    var opts = sp.GetRequiredService<IOptionsMonitor<InternalTokenIssuerOptions>>().CurrentValue;
+    http.Timeout = TimeSpan.FromSeconds(opts.RequestTimeoutSeconds);
+});
+builder.Services.AddSingleton<IInternalTokenIssuer>(sp =>
+{
+    var httpFactory = sp.GetRequiredService<IHttpClientFactory>();
+    return new OpenIddictInternalTokenIssuer(
+        httpFactory.CreateClient("internal-token-issuer"),
+        sp.GetRequiredService<IOptionsMonitor<InternalTokenIssuerOptions>>(),
+        sp.GetRequiredService<TimeProvider>(),
+        sp.GetRequiredService<ILogger<OpenIddictInternalTokenIssuer>>());
+});
 
 // Phase 3.C: tool catalogue exposure flags. Bound from "Assistant:Tools".
 // Per-tool boolean knobs control which registered tools the LLM sees in
