@@ -99,6 +99,20 @@ builder.Services
     .Bind(builder.Configuration.GetSection(TrainerSearchOptions.SectionName))
     .ValidateDataAnnotations();
 
+// Phase 3.I: workflow schedule options. Bound from "Assistant:Workflow"
+// (BaseUrl, RequestTimeoutSeconds). Same shape + LATE-RESOLUTION
+// posture as TrainerSearchOptions above.
+builder.Services
+    .AddOptions<WorkflowScheduleOptions>()
+    .Bind(builder.Configuration.GetSection(WorkflowScheduleOptions.SectionName))
+    .ValidateDataAnnotations();
+
+// Phase 3.I: IHttpContextAccessor for the WorkflowScheduleTool's JWT
+// propagation. HttpWorkflowClient reads the inbound Authorization
+// header from the current HttpContext + attaches it to the outbound
+// qwen call so workflow's TenantClaimsMiddleware sees the same tenant.
+builder.Services.AddHttpContextAccessor();
+
 // Phase 3.C: tool catalogue exposure flags. Bound from "Assistant:Tools".
 // Per-tool boolean knobs control which registered tools the LLM sees in
 // the function-calling tool array. Tools stay dispatchable via
@@ -311,6 +325,29 @@ builder.Services.AddHttpClient<ISearchClient, HttpSearchClient>((sp, http) =>
 builder.Services.AddSingleton<Func<ISearchClient>>(sp =>
     () => sp.GetRequiredService<ISearchClient>());
 
+// Phase 3.I: workflow schedule client. Typed HttpClient with the
+// LATE-RESOLUTION rule — BaseAddress + Timeout read inside the factory
+// lambda at DI resolution time. IOptionsMonitor<WorkflowScheduleOptions>
+// gives fresh values per resolution (supports a future reload-on-change
+// scenario without an app restart).
+builder.Services.AddHttpClient<IWorkflowClient, HttpWorkflowClient>((sp, http) =>
+{
+    var opts = sp.GetRequiredService<IOptionsMonitor<WorkflowScheduleOptions>>().CurrentValue;
+    if (string.IsNullOrWhiteSpace(opts.BaseUrl))
+    {
+        throw new InvalidOperationException(
+            "Assistant:Workflow:BaseUrl is not configured. Set it in appsettings.user.json (Dev) or /etc/trellis-assistant-qa.env (QA).");
+    }
+    http.BaseAddress = new Uri(opts.BaseUrl);
+    http.Timeout = TimeSpan.FromSeconds(opts.RequestTimeoutSeconds);
+});
+
+// Captive-dep fix for the Singleton WorkflowScheduleTool consuming
+// the effectively-transient IWorkflowClient — same pattern as the
+// ISearchClient wrapper above.
+builder.Services.AddSingleton<Func<IWorkflowClient>>(sp =>
+    () => sp.GetRequiredService<IWorkflowClient>());
+
 // Phase 3.B: JSON Schema validator. Singleton — caches parsed schemas
 // across the host's lifetime per tool. v0 has <10 tools; cache size is
 // trivially bounded.
@@ -341,6 +378,10 @@ builder.Services.AddSingleton<IAgentTool, SearchDocumentsTool>();
 // only because ISearchClient is transient (typed-HttpClient), not
 // scoped — same-tier consumers, different lifetime mismatch.
 builder.Services.AddSingleton<IAgentTool, ChatRecentTool>();
+// Phase 3.I: WorkflowScheduleTool. Singleton with the Func<IWorkflowClient>
+// factory pattern. Exposure default = false (opt-in via
+// Assistant:Tools:ExposeWorkflowSchedule).
+builder.Services.AddSingleton<IAgentTool, WorkflowScheduleTool>();
 builder.Services.AddSingleton<IToolRegistry, ToolRegistry>();
 builder.Services.AddSingleton<IAgentBudgetGate, DefaultBudgetGate>();
 // Register the concrete class + alias the interface to the same scope.

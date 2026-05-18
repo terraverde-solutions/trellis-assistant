@@ -41,6 +41,64 @@ public sealed class DefaultToolExposurePolicyTests
     }
 
     [Fact]
+    public void WorkflowScheduleTool_DefaultExposeFalse_Hidden()
+    {
+        // Phase 3.I negative-space pin (the brief's #5): the default
+        // ToolCatalogueOptions has ExposeWorkflowSchedule=false, so the
+        // tool stays hidden from any tenant regardless of role. Mirrors
+        // EchoTool's ExposeEcho=false posture — production-safe default.
+        var policy = NewPolicy(new ToolCatalogueOptions());
+        var tenancy = new AgentToolTenancy(TenantA, "user-a", TenantRole: null);
+
+        policy.IsExposedTo(NewWorkflowScheduleTool(), tenancy).Should().BeFalse(
+            "default is false; opt-in flag pattern keeps the side-effecting tool hidden until QA validates");
+    }
+
+    [Fact]
+    public void WorkflowScheduleTool_ExposeWorkflowScheduleTrue_Exposed()
+    {
+        var policy = NewPolicy(new ToolCatalogueOptions { ExposeWorkflowSchedule = true });
+        var tenancy = new AgentToolTenancy(TenantA, "user-a", TenantRole: null);
+
+        policy.IsExposedTo(NewWorkflowScheduleTool(), tenancy).Should().BeTrue();
+    }
+
+    [Fact]
+    public void WorkflowScheduleTool_ExposeTrue_PerToolGateStillApplies()
+    {
+        // Phase 3.I: once the opt-in flag is on, per-tenant PerTool
+        // gating layers on top so admins can limit which tenants see
+        // the tool. Pins that the special-case branch falls through to
+        // the existing PerTool path rather than short-circuiting "true".
+        var policy = NewPolicy(new ToolCatalogueOptions
+        {
+            ExposeWorkflowSchedule = true,
+            PerTool = new()
+            {
+                ["workflow_schedule"] = new ToolExposureRule
+                {
+                    AllowedTenants = new() { TenantA },
+                },
+            },
+        });
+        var tenantAUser = new AgentToolTenancy(TenantA, "user-a", TenantRole: null);
+        var tenantBUser = new AgentToolTenancy(TenantB, "user-b", TenantRole: null);
+
+        policy.IsExposedTo(NewWorkflowScheduleTool(), tenantAUser).Should().BeTrue();
+        policy.IsExposedTo(NewWorkflowScheduleTool(), tenantBUser).Should().BeFalse(
+            "ExposeWorkflowSchedule=true doesn't bypass PerTool's AllowedTenants gate — both gates AND");
+    }
+
+    private static WorkflowScheduleTool NewWorkflowScheduleTool()
+    {
+        // The tool ctor takes a Func<IWorkflowClient>; never invoked in
+        // policy tests (policy never calls RunAsync). A throwing factory
+        // pins the policy ISN'T running the tool.
+        return new WorkflowScheduleTool(() => throw new InvalidOperationException(
+            "policy tests must not invoke the workflow client"));
+    }
+
+    [Fact]
     public void NonEchoTool_NoRule_DefaultExposed()
     {
         // Phase 3.F pin #1: tools without a PerTool entry are exposed

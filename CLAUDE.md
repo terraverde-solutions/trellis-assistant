@@ -17,6 +17,7 @@ Read first:
 - [`docs/phase-3f-design.md`](docs/phase-3f-design.md) — Phase 3.F design rationale (per-tenant tool exposure gating: IToolExposurePolicy + AllowedTenants UUID gate + RequiredRole single-string gate; AgentToolTenancy local record; tenant_role JWT claim extraction + X-Trellis-Tenant-Role header fallback; standalone path bypasses policy; fail-closed on null role)
 - [`docs/phase-3g-design.md`](docs/phase-3g-design.md) — Phase 3.G design rationale (middleware-level UUID validation: rejects non-UUID tenant_id at 401 before reaching endpoints; collapses 3× redundant `Guid.TryParse + defensive 400` branches downstream; upgrades 401 body to RFC 7807 ProblemDetails; closes the Phase 3.F untenanted-fallback bypass; pin #3 Guid-in-Items deferred to cross-repo Core widening)
 - [`docs/phase-3h-design.md`](docs/phase-3h-design.md) — Phase 3.H design rationale (OpenTelemetry tool-call observability: ActivitySource + 4 custom metrics + log-scope trace correlation; OTLP HTTP exporter opt-in via `OpenTelemetry:Endpoint`; cardinality discipline — NEVER tag with user_id; budget-exhausted distinct from failure counter)
+- [`docs/phase-3i-design.md`](docs/phase-3i-design.md) — Phase 3.I design rationale (cancellation-outcome OTel pin closing Phase 3.H non-blocking suggestion + WorkflowScheduleTool prototype: schedule-by-id branch only, JWT propagation via IHttpContextAccessor, LLM-readable failure envelopes — auth_failed/definition_not_found/transient/bad_request — opt-in `ExposeWorkflowSchedule` flag default false)
 
 ## What this component is
 
@@ -29,6 +30,20 @@ The component design lives in [`59-trellis-assistant.md`](https://github.com/ter
 phase + guard-rails for what NOT to do yet.
 
 ## Status
+
+**Phase 3.I — cancellation-outcome OTel pin + WorkflowScheduleTool prototype scaffolded** on `kimi/phase-3i-cancellation-pin-plus-workflow-schedule-tool`. Two threads bundled:
+
+- **Thread 1 (cancellation pin):** test-only pin closing the Phase 3.H non-blocking suggestion. `ToolDispatch_CancellationToken_RecordsOutcomeCancelled` in `AgentTelemetryTests.cs` verifies `outcome=cancelled` on the dispatch counter AND `ToolDispatchFailureCount` stays empty AND Activity status is Unset. Cancellation is operator-driven, NOT a tool fault — conflating it with failure would trip failure-ratio dashboards on every user disconnect. Production-side path was already in place (Phase 3.H), what was missing was a direct wire-shape pin. Synchronization via a `HangingTool.onEntered` callback (not `CancelAfter` timer) — deterministic, avoids racing the executor's startup.
+
+- **Thread 2 (WorkflowScheduleTool):** third production tool. LLM-callable schedule via trellis-workflow's `POST /api/workflows/runs` (qwen Phase 4.A). New surface:
+  - `AgentExecution/WorkflowScheduleTool.cs` — schedule-by-id branch ONLY. Tool args `{workflow_definition_id, initial_input_json?}`. Category `AgentToolCategory.Act` (side-effecting; planner-LLM steering prefers Search/Inspect for investigation). Inline-JSON branch deliberately NOT exposed (too much surface for hallucination + injection).
+  - `Services/IWorkflowClient.cs` + `HttpWorkflowClient.cs` + `WorkflowScheduleOptions.cs` — narrow client (one method: `ScheduleByIdAsync`). Loopback-trust against `127.0.0.1:5118` in dev. 10s default timeout. `BuildRequestBody` pure-function for unit-testable wire shape.
+  - Structured LLM-readable failure envelopes via `WorkflowScheduleErrorCode`: `auth_failed` (401, do NOT retry), `definition_not_found` (404, ask user), `bad_request` (other 4xx, surface detail), `transient` (5xx/timeout/transport, retry-with-backoff).
+  - JWT propagation: `HttpWorkflowClient` reads the inbound `Authorization` header via `IHttpContextAccessor` + attaches it verbatim to the outbound qwen call. qwen's `TenantClaimsMiddleware` re-parses for tenant_id. `services.AddHttpContextAccessor()` registered in Program.cs.
+  - `ToolCatalogueOptions.ExposeWorkflowSchedule` bool — opt-in flag, **default false** (production-safe; tool is side-effecting + untested in prod). `DefaultToolExposurePolicy` special-cases workflow_schedule against the flag; when on, falls through to PerTool gating so per-tenant rollout layers on top.
+  - 25 new pin tests: 9 WorkflowScheduleTool + 12 HttpWorkflowClient + 3 exposure-gate + 1 cancellation = 25 (273 total passing, 4 Ollama-gated skips).
+
+**LoC overrun note:** brief estimated ~600-800 LoC; actual landed at +1511 (production +806, tests +705). HttpWorkflowClient's failure mapping + JWT propagation drove the production overshoot; the corresponding 12 failure-mapping pins drove the test overshoot. Work bounded — every pin green, no half-finished pieces. Pre-merge surface in PR per the in-flight surface rule.
 
 **Phase 3.H — OpenTelemetry tool-call observability scaffolded** on `kimi/phase3h-otel-tool-dispatch`. Closes the operator-visibility gap left by every prior Phase 3 surface — per-tool dispatch was reachable via `journalctl` log greps but had no aggregate counter / latency / failure-ratio surface. New surface (this phase):
 
@@ -296,6 +311,17 @@ Steady-state QA redeploys: `trellis-deploy/scripts/qa/Deploy-Assistant-Standalon
 - Unit: `trellis-assistant-qa.service`
 - Auth: shared `trellisqa` HTTP Basic credential at the Hetzner edge (same as web-qa + trainer-qa); GB10-side nginx is auth-free
 - Bootstrap walkthrough: `trellis-deploy/scripts/qa/bootstrap-assistant.md`
+
+## Don't (Phase 3.I)
+
+- **Don't expose the inline-JSON schedule branch of `POST /api/workflows/runs`.** Phase 3.I pin: schedule-by-id only. The inline `WorkflowDefinitionJson` blob is a full workflow DAG; an LLM hallucinating one creates runs that fail or worse, execute unintended steps. If a future need surfaces with a constrained sub-shape, that's a separate brief.
+- **Don't default `ExposeWorkflowSchedule=true`.** Production-safe per Phase 3.I brief — the tool is side-effecting (real workflow runs) + untested in prod. QA validates before flipping the default. Once on, PerTool's `AllowedTenants` + `RequiredRole` gate layers on top for per-tenant rollout.
+- **Don't reshape qwen's 201 body inside `WorkflowScheduleTool`.** Pass-through (a) per Phase 3.B precedent — the LLM sees qwen-canonical PascalCase fields directly. If qwen renames a field, re-bake the tool descriptor's example rather than introducing a translation layer.
+- **Don't move `HttpWorkflowClient`'s JWT propagation into a shared `DelegatingHandler`.** Single-consumer rule (same posture Phase 3.B + 3.D + 3.F + 3.H took for their seams). Lift when a second tool needs the same inbound-JWT-propagation shape.
+- **Don't tag the cancellation outcome as a failure.** Phase 3.I Thread 1 pin discipline: `outcome=cancelled` is distinct from `outcome=failure` AND `ToolDispatchFailureCount` doesn't increment on cancellation. Operator-driven cancellation (caller dropped the token) isn't a tool fault; conflating would trip failure-ratio dashboards on user disconnects. Pinned by `ToolDispatch_CancellationToken_RecordsOutcomeCancelled`.
+- **Don't add scheduling-futures (cron, delayed) to `WorkflowScheduleTool`.** Hangfire upstream already handles delayed runs; the tool is fire-now. If a future need surfaces, surface a brief.
+- **Don't cache `WorkflowDefinition` metadata Assistant-side.** Out of scope per Phase 3.I brief. If a future tool needs to inspect or validate definitions ahead of scheduling, that's a separate tool (`workflow_describe` or similar) with its own brief.
+- **Don't reuse trellis-web's HttpWorkflowClient code.** Phase 3.I brief: copy the *pattern* (structured failure mapping + 4xx ProblemDetails + 5xx warning + timeout-distinct-from-cancellation), NOT the code. Trellis-web's variant has UI-side concerns (user-facing error rendering); this client's failure mapping is LLM-readable + operator-actionable.
 
 ## Don't (Phase 3.H)
 
