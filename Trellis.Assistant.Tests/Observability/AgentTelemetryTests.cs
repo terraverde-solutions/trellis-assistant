@@ -296,6 +296,106 @@ public sealed class AgentTelemetryTests : IClassFixture<PostgresFixture>, IAsync
             "cancellation is not an error condition — the activity's outcome tag conveys what happened");
     }
 
+    // ---------------- Phase 3.J Thread B pins ----------------
+
+    [SkippableFact]
+    public async Task LlmCall_RecordsTokensUsedHistogram_TaggedModelAndTenant()
+    {
+        // Phase 3.J Thread B: TokensUsed histogram fires per LLM call
+        // (after each successful ChatWithToolsAsync return) so operators
+        // can spot runaway loops mid-flight. Tags: model + tenant.id;
+        // NEVER user.id (pin #3 cardinality discipline).
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        using var capture = MetricCapture.Start(_testOrgId);
+        var executor = NewExecutor(
+            new StubAgentLlmClient()
+                .EnqueueAssistantText("done.", tokensUsed: 123));
+
+        await executor.RunAsync(AgentRunRequest.Create(
+            orgId: _testOrgId,
+            userPrompt: "tokens-used pin",
+            availableTools: new List<AgentToolDescriptor> { new EchoTool().Descriptor }));
+
+        var tokens = capture.GetMeasurements("trellis.assistant.tokens.used");
+        tokens.Should().HaveCountGreaterThanOrEqualTo(1,
+            "TokensUsed fires at least once per successful LLM call");
+        tokens[0].Value.Should().BeGreaterThanOrEqualTo(0,
+            "token count is non-negative; stub enqueued tokensUsed=123 so >= 0 holds trivially");
+        var tags = tokens[0].Tags;
+        tags.Should().ContainKey("model").WhoseValue.Should().Be("stub-model",
+            "TokensUsed is tagged with the configured model so operators can break out token cost per model");
+        tags.Should().ContainKey("tenant.id").WhoseValue.Should().Be(_testOrgId.ToString("D"),
+            "tenant.id is bounded by customer count and required for multi-tenant cost attribution");
+        tags.Should().NotContainKey("user.id",
+            "Phase 3.H pin #3: never tag metrics with user.id (unbounded cardinality across the fleet)");
+    }
+
+    [SkippableFact]
+    public async Task LlmCall_RecordsLatencyHistogram()
+    {
+        // Phase 3.J Thread B: LlmCallDurationMs measured by Stopwatch
+        // around the ChatWithToolsAsync await. Stub returns
+        // synchronously so the elapsed will be near-zero, but the
+        // contract is value >= 0 (non-negative wall-clock ms).
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        using var capture = MetricCapture.Start(_testOrgId);
+        var executor = NewExecutor(
+            new StubAgentLlmClient()
+                .EnqueueAssistantText("latency pin done."));
+
+        await executor.RunAsync(AgentRunRequest.Create(
+            orgId: _testOrgId,
+            userPrompt: "latency pin",
+            availableTools: new List<AgentToolDescriptor> { new EchoTool().Descriptor }));
+
+        var latency = capture.GetMeasurements("trellis.assistant.llm.call.duration_ms");
+        latency.Should().HaveCountGreaterThanOrEqualTo(1,
+            "LlmCallDurationMs fires at least once per successful LLM call");
+        latency[0].Value.Should().BeGreaterThanOrEqualTo(0,
+            "duration is non-negative wall-clock ms; stub returns fast but >= 0 holds");
+        latency[0].Tags.Should().ContainKey("model").WhoseValue.Should().Be("stub-model");
+        latency[0].Tags.Should().ContainKey("tenant.id").WhoseValue.Should().Be(_testOrgId.ToString("D"));
+        latency[0].Tags.Should().NotContainKey("user.id",
+            "Phase 3.H pin #3: never tag metrics with user.id");
+    }
+
+    [SkippableFact]
+    public async Task AgentRun_OnCompletion_RecordsRunDurationWithOutcomeTag()
+    {
+        // Phase 3.J Thread B: AgentRunDurationMs fires exactly once per
+        // agent run, at the end of ExecuteLoopAsync just before the
+        // executor returns LoopResult. Happy path → terminal status
+        // Succeeded → outcome="succeeded". Tagged with tenant.id +
+        // outcome; NEVER user.id.
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        using var capture = MetricCapture.Start(_testOrgId);
+        var executor = NewExecutor(
+            new StubAgentLlmClient()
+                .EnqueueAssistantText("happy path."));
+
+        await executor.RunAsync(AgentRunRequest.Create(
+            orgId: _testOrgId,
+            userPrompt: "run-duration pin",
+            availableTools: new List<AgentToolDescriptor> { new EchoTool().Descriptor }));
+
+        var runDuration = capture.GetMeasurements("trellis.assistant.agent.run.duration_ms");
+        runDuration.Should().HaveCount(1,
+            "AgentRunDurationMs fires exactly once per agent run, at terminal");
+        runDuration[0].Value.Should().BeGreaterThanOrEqualTo(0,
+            "duration is non-negative wall-clock ms");
+        var tags = runDuration[0].Tags;
+        tags.Should().ContainKey("outcome").WhoseValue.Should().Be("succeeded",
+            "happy path → terminal AgentRunStatus.Succeeded → outcome=succeeded per Outcomes.Map");
+        tags.Should().ContainKey("tenant.id").WhoseValue.Should().Be(_testOrgId.ToString("D"));
+        tags.Should().NotContainKey("user.id",
+            "Phase 3.H pin #3: never tag metrics with user.id");
+        tags.Should().NotContainKey("agent.run.id",
+            "Phase 3.H pin #3: agent.run.id is high-cardinality, activity-only");
+    }
+
     // ---------------- helpers ----------------
 
     private AssistantAgentExecutor NewExecutor(IAgentLlmClient llm)

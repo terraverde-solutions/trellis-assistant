@@ -424,6 +424,7 @@ public sealed class AssistantAgentExecutor : IAgentExecutor
 
                 // ---- Call LLM ----
                 AgentLlmResponse llmResponse;
+                var llmStopwatch = Stopwatch.StartNew();
                 try
                 {
                     llmResponse = await _llm
@@ -433,16 +434,38 @@ public sealed class AssistantAgentExecutor : IAgentExecutor
                             resolvableTools,
                             cancellationToken)
                         .ConfigureAwait(false);
+                    llmStopwatch.Stop();
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException)
                 {
+                    llmStopwatch.Stop();
                     terminalStatus = AgentRunStatus.Failed;
                     terminalErrorMessage = $"LLM call failed: {ex.Message}";
                     _logger.LogWarning(ex,
                         "AgentRun {RunId} LLM call threw — terminating with Failed.", runId);
+                    // Phase 3.J Thread B: do NOT emit LlmCallDurationMs /
+                    // TokensUsed on the failure path — the LLM call didn't
+                    // complete, so the timing data is incomplete and the
+                    // token count is undefined. Operators see the failure
+                    // via the run-duration histogram's outcome=failed tag.
                     break;
                 }
                 totalTokens += llmResponse.TokensUsed;
+
+                // Phase 3.J Thread B: per-LLM-call metering. Emit AFTER
+                // the call returns successfully (failure path above
+                // breaks out without recording — token/latency on a
+                // partial call would skew the histograms). Tags per pin
+                // #3: model + tenant.id; NO user.id, NO agent.run.id,
+                // NO step.index (those live on activity tags only).
+                var llmTenantIdTag = new KeyValuePair<string, object?>(
+                    "tenant.id", orgId.ToString("D"));
+                var llmModelTag = new KeyValuePair<string, object?>(
+                    "model", _options.Model);
+                AgentTelemetry.LlmCallDurationMs.Record(
+                    llmStopwatch.ElapsedMilliseconds, llmModelTag, llmTenantIdTag);
+                AgentTelemetry.TokensUsed.Record(
+                    llmResponse.TokensUsed, llmModelTag, llmTenantIdTag);
 
                 // ---- No tool_calls = final assistant turn = success ----
                 if (llmResponse.ToolCalls.Count == 0)
@@ -624,6 +647,19 @@ public sealed class AssistantAgentExecutor : IAgentExecutor
             _logger.LogInformation(
                 "AgentRun {RunId} cancelled at step {StepCount}.", runId, stepIndex);
         }
+
+        // Phase 3.J Thread B: emit per-agent-run wall-clock duration
+        // exactly once at terminal, just before returning. Tags per pin
+        // #3: tenant.id + outcome (mapped from terminalStatus); NO
+        // user.id, NO model (the run can span multiple models in
+        // principle and the per-call latency histogram already carries
+        // model). The mapping is bounded by AgentRunStatus's terminal
+        // enum values.
+        var runDurationMs = (DateTime.UtcNow - startedAt).TotalMilliseconds;
+        AgentTelemetry.AgentRunDurationMs.Record(
+            runDurationMs,
+            new KeyValuePair<string, object?>("tenant.id", orgId.ToString("D")),
+            new KeyValuePair<string, object?>("outcome", AgentTelemetry.Outcomes.Map(terminalStatus)));
 
         return new LoopResult
         {

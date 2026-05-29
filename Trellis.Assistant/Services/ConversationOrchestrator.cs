@@ -1,4 +1,6 @@
+using System.ComponentModel.DataAnnotations;
 using System.Text;
+using Microsoft.Extensions.Options;
 using Trellis.Assistant.AgentExecution;
 using Trellis.Core.Models;
 using Trellis.Core.Services;
@@ -62,21 +64,33 @@ namespace Trellis.Assistant.Services;
 /// </summary>
 public sealed class ConversationOrchestrator
 {
+    /// <summary>
+    /// Phase 3.J synthetic-system-turn marker. Prepended (after the
+    /// original system turn, if any) when the prior non-system history
+    /// is trimmed by the sliding-window cap. NEVER persisted; lives
+    /// only in the in-memory messages list passed to the LLM.
+    /// </summary>
+    internal const string TruncationNoticeText =
+        "[Earlier conversation history truncated to fit the context window.]";
+
     private readonly IAssistantConversationStore _store;
     private readonly IOllamaClient _llm;
     private readonly AssistantAgentExecutor _agentExecutor;
     private readonly IToolRegistry _toolRegistry;
+    private readonly ConversationOrchestratorOptions _options;
 
     public ConversationOrchestrator(
         IAssistantConversationStore store,
         IOllamaClient llm,
         AssistantAgentExecutor agentExecutor,
-        IToolRegistry toolRegistry)
+        IToolRegistry toolRegistry,
+        IOptions<ConversationOrchestratorOptions> options)
     {
         _store = store ?? throw new ArgumentNullException(nameof(store));
         _llm = llm ?? throw new ArgumentNullException(nameof(llm));
         _agentExecutor = agentExecutor ?? throw new ArgumentNullException(nameof(agentExecutor));
         _toolRegistry = toolRegistry ?? throw new ArgumentNullException(nameof(toolRegistry));
+        _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
     }
 
     /// <summary>
@@ -314,16 +328,18 @@ public sealed class ConversationOrchestrator
         // NOT inject one here, so executors can compose a system prompt
         // that reflects the actual resolvable tool catalogue (which the
         // executor knows about via its IToolRegistry dependency).
-        var messages = new List<ChatMessage>(prior.Count + 1);
-        foreach (var t in prior)
-        {
-            messages.Add(ToChatMessage(t));
-        }
-        messages.Add(new ChatMessage
-        {
-            Role = ChatRole.User,
-            Content = userContent,
-        });
+        //
+        // Phase 3.J Thread A: sliding-window cap on prior history. The
+        // last N non-system prior turns flow to the LLM (N =
+        // Assistant:MaxHistoryTurns, default 40). The persisted system
+        // turn (if any) is always kept — system content is load-bearing
+        // (persona / tenancy hints / tool-policy steering) and trimming
+        // it would silently change model behavior. When trimming occurs
+        // an ephemeral ChatRole.System note ("Earlier conversation
+        // history truncated...") slots in BETWEEN the original system
+        // turn and the windowed prior turns; it lives only in this
+        // in-memory list, never in the turns table.
+        var messages = BuildAgentMessages(prior, userContent, _options.MaxHistoryTurns);
 
         // Phase 3.G: TenantClaimsMiddleware validates UUID-shape at the
         // request boundary + rejects 401 on non-UUID. By the time the
@@ -416,6 +432,99 @@ public sealed class ConversationOrchestrator
     // semantic intent rather than reviving this one (which encoded the
     // pre-resolution behavior that Blocker 1 fixed).
 
+    /// <summary>
+    /// Phase 3.J Thread A: build the LLM-bound messages list for the
+    /// agent path under the sliding-window cap.
+    ///
+    /// <para>
+    /// Rules (locked by Phase 3.J Thread A decisions):
+    /// <list type="bullet">
+    /// <item>Original system turn (if any in <paramref name="prior"/>) is
+    /// ALWAYS included, regardless of window size — system content
+    /// (persona / tenancy hints / tool-policy steering) is load-bearing
+    /// and trimming it would silently change model behavior.</item>
+    /// <item>Last <paramref name="maxHistoryTurns"/> non-system prior
+    /// turns are included in original chronological order.</item>
+    /// <item>When trimming occurred (non-system count exceeded
+    /// <paramref name="maxHistoryTurns"/>), a synthetic
+    /// <see cref="ChatRole.System"/> message carrying
+    /// <see cref="TruncationNoticeText"/> is inserted AFTER the original
+    /// system turn but BEFORE the windowed non-system turns.</item>
+    /// <item>The new user message is always appended last.</item>
+    /// </list>
+    /// </para>
+    /// <para>
+    /// The synthetic truncation note is in-memory only — it MUST NOT
+    /// reach <c>AppendTurnsAsync</c> or the persisted turns table.
+    /// </para>
+    /// </summary>
+    internal static List<ChatMessage> BuildAgentMessages(
+        IReadOnlyList<AssistantTurn> prior,
+        string userContent,
+        int maxHistoryTurns)
+    {
+        // Split prior into [system turn?, non-system turns]. Today's
+        // persistence path doesn't write System rows from the
+        // conversation surface (Assistant + User + Tool only), but the
+        // store interface permits System, and Phase 3.A.2 didn't
+        // forbid it — keeping the split honest future-proofs against a
+        // later channel adapter that seeds a system turn at conversation
+        // creation. Multiple system turns (edge case): keep them all in
+        // their original positions among the non-system slice would
+        // mis-order; instead we group all system turns at the front of
+        // the output to honor the "system always included" rule
+        // unambiguously. In practice prior contains at most one system
+        // turn so the grouping is a no-op.
+        var systemTurns = new List<AssistantTurn>();
+        var nonSystemTurns = new List<AssistantTurn>(prior.Count);
+        foreach (var t in prior)
+        {
+            if (t.Role == AssistantTurnRole.System)
+            {
+                systemTurns.Add(t);
+            }
+            else
+            {
+                nonSystemTurns.Add(t);
+            }
+        }
+
+        var trimmed = nonSystemTurns.Count > maxHistoryTurns;
+        var windowStart = trimmed ? nonSystemTurns.Count - maxHistoryTurns : 0;
+        var windowCount = nonSystemTurns.Count - windowStart;
+
+        var capacity = systemTurns.Count + (trimmed ? 1 : 0) + windowCount + 1;
+        var messages = new List<ChatMessage>(capacity);
+
+        foreach (var t in systemTurns)
+        {
+            messages.Add(ToChatMessage(t));
+        }
+
+        if (trimmed)
+        {
+            // Synthetic note — ephemeral, must never be persisted.
+            messages.Add(new ChatMessage
+            {
+                Role = ChatRole.System,
+                Content = TruncationNoticeText,
+            });
+        }
+
+        for (var i = windowStart; i < nonSystemTurns.Count; i++)
+        {
+            messages.Add(ToChatMessage(nonSystemTurns[i]));
+        }
+
+        messages.Add(new ChatMessage
+        {
+            Role = ChatRole.User,
+            Content = userContent,
+        });
+
+        return messages;
+    }
+
     private static ChatMessage ToChatMessage(AssistantTurn turn)
     {
         return new ChatMessage
@@ -477,6 +586,25 @@ public sealed class ConversationOrchestratorOptions
     /// against the stub (which yielded ~200ms).
     /// </summary>
     public int TurnRequestTimeoutSeconds { get; set; } = 180;
+
+    /// <summary>
+    /// Phase 3.J Thread A: maximum number of non-system prior turns
+    /// included in the LLM-bound messages list on the agent path. The
+    /// original system turn (if any) is always included on top of this
+    /// budget; only non-system turns count toward the cap. When the
+    /// prior non-system count exceeds this limit, the oldest turns are
+    /// dropped and a synthetic <c>ChatRole.System</c> truncation note is
+    /// inserted before the windowed slice (in-memory only, never
+    /// persisted). 40 turns ≈ 20 user/assistant exchanges — comfortably
+    /// inside the 128k-context window of the default agent model while
+    /// keeping the prompt within an order of magnitude of what cache-
+    /// reuse heuristics can amortize. Operators with longer-context
+    /// models can raise this; the Range cap of 1000 is a sanity ceiling.
+    /// Phase 3.J Thread A explicitly defers summarization (Thread B
+    /// territory) — this knob is a sliding window, not a summarizer.
+    /// </summary>
+    [Range(1, 1000)]
+    public int MaxHistoryTurns { get; set; } = 40;
 
     /// <summary>
     /// LLM model tag for the startup warm-up call. Empty/whitespace
