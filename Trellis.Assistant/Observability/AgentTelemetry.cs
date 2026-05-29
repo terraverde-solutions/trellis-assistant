@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Diagnostics.Metrics;
+using Trellis.Core.Models;
 
 namespace Trellis.Assistant.Observability;
 
@@ -104,15 +105,97 @@ public static class AgentTelemetry
             description: "Agent-run halts triggered by the mid-iteration budget gate (Phase 3.E pin #6 path).");
 
     /// <summary>
+    /// Phase 3.J Thread B histogram: token usage recorded PER LLM CALL
+    /// (after each <c>ChatWithToolsAsync</c> returns successfully) rather
+    /// than once at terminal. Per-call emission lets operators spot
+    /// runaway loops mid-flight (e.g. a model that keeps emitting
+    /// tool_calls and burning tokens) rather than waiting for the run to
+    /// finish. Tagged with <c>model</c> + <c>tenant.id</c> per pin #3 —
+    /// NO <c>user.id</c> (unbounded cardinality); NO <c>agent.run.id</c>
+    /// or <c>step.index</c> (high cardinality; activity-only).
+    /// </summary>
+    public static readonly Histogram<double> TokensUsed =
+        Meter.CreateHistogram<double>(
+            "trellis.assistant.tokens.used",
+            unit: "{tokens}",
+            description: "Tokens consumed per LLM call (emitted after each ChatWithToolsAsync return) — tagged by model + tenant.id.");
+
+    /// <summary>
+    /// Phase 3.J Thread B histogram: per-LLM-call wall-clock latency in
+    /// milliseconds. Stopwatch-measured around the
+    /// <c>ChatWithToolsAsync</c> await; recorded ONLY on successful
+    /// return (failed LLM calls already terminate the loop and shouldn't
+    /// emit latency metrics for incomplete data). Tagged with
+    /// <c>model</c> + <c>tenant.id</c>.
+    /// </summary>
+    public static readonly Histogram<double> LlmCallDurationMs =
+        Meter.CreateHistogram<double>(
+            "trellis.assistant.llm.call.duration_ms",
+            unit: "ms",
+            description: "Per-LLM-call wall-clock duration in milliseconds — tagged by model + tenant.id.");
+
+    /// <summary>
+    /// Phase 3.J Thread B histogram: total agent-run wall-clock duration
+    /// in milliseconds. Emitted ONCE at the end of the loop body, just
+    /// before the executor returns the terminal <c>LoopResult</c>.
+    /// Tagged with <c>tenant.id</c> + <c>outcome</c> (mapped from the
+    /// terminal <see cref="AgentRunStatus"/> via
+    /// <see cref="Outcomes.Map"/>).
+    /// </summary>
+    public static readonly Histogram<double> AgentRunDurationMs =
+        Meter.CreateHistogram<double>(
+            "trellis.assistant.agent.run.duration_ms",
+            unit: "ms",
+            description: "Per-agent-run wall-clock duration in milliseconds — tagged by tenant.id + outcome.");
+
+    /// <summary>
     /// Outcome enum string values used as the <c>outcome</c> tag.
     /// Bounded set — operators can alert on any of these without
     /// cardinality concerns.
     /// </summary>
     public static class Outcomes
     {
+        // Shared vocabulary across Phase 3.H (per-tool-dispatch) +
+        // Phase 3.J (per-run) so an operator writing a cross-histogram
+        // PromQL query on the `outcome` tag gets consistent values for
+        // the same conceptual outcome. Originally 3.J emitted
+        // past-tense forms ("succeeded"/"failed"); the 3.J fix-up
+        // aligned to 3.H's noun forms ("success"/"failure"). Run-level
+        // additions (cap_reached, loop_detected) have no 3.H equivalent
+        // and stay run-specific.
         public const string Success = "success";
         public const string Failure = "failure";
         public const string Cancelled = "cancelled";
         public const string BudgetExhausted = "budget_exhausted";
+
+        // Phase 3.J Thread B run-specific additions. CapReached +
+        // LoopDetected have no per-dispatch equivalent in 3.H —
+        // they're properties of the agent run as a whole.
+        public const string CapReached = "cap_reached";
+        public const string LoopDetected = "loop_detected";
+        // Defensive bucket for in-flight states (Planning, Running) that
+        // shouldn't reach terminal mapping; an alert on outcome=unknown
+        // surfaces a programming regression without crashing the run.
+        public const string Unknown = "unknown";
+
+        /// <summary>
+        /// Map a terminal <see cref="AgentRunStatus"/> to its
+        /// <c>outcome</c> tag string for the
+        /// <see cref="AgentRunDurationMs"/> histogram. Bounded enum →
+        /// bounded tag values, safe for metric cardinality.
+        /// </summary>
+        public static string Map(AgentRunStatus status) => status switch
+        {
+            AgentRunStatus.Succeeded => Success,
+            AgentRunStatus.Failed => Failure,
+            AgentRunStatus.CapReached => CapReached,
+            AgentRunStatus.LoopDetected => LoopDetected,
+            AgentRunStatus.Cancelled => Cancelled,
+            // Planning + Running are in-flight; they shouldn't be the
+            // terminal status passed to the run-duration histogram. If
+            // a programming bug lets one through, the "unknown" bucket
+            // keeps the metric pipeline alive without crashing the run.
+            _ => Unknown,
+        };
     }
 }

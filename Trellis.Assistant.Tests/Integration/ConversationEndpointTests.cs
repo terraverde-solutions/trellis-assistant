@@ -1569,4 +1569,244 @@ public sealed class ConversationEndpointTests : IClassFixture<PostgresFixture>, 
             });
         resp.StatusCode.Should().Be(HttpStatusCode.NotFound);
     }
+
+    // ---------------- Phase 3.J Thread A: sliding-window history cap ----------------
+
+    /// <summary>
+    /// Seed N user+assistant turn pairs on the conversation via the
+    /// direct-LLM path (<c>Tools=[]</c>) so the agent-LLM stub stays
+    /// untouched during seeding — its call counter then reflects ONLY
+    /// the subsequent agent-path call the test exercises.
+    /// </summary>
+    private static async Task SeedDirectLlmTurnsAsync(
+        HttpClient client,
+        string conversationId,
+        int pairCount)
+    {
+        for (var i = 0; i < pairCount; i++)
+        {
+            var resp = await client.PostAsJsonAsync(
+                $"/api/conversations/{conversationId}/turns",
+                new ConversationEndpoints.AppendTurnRequest(Content: $"seed user message {i}")
+                {
+                    Tools = Array.Empty<string>(),
+                });
+            resp.StatusCode.Should().Be(HttpStatusCode.OK,
+                $"seed turn {i} must persist for the sliding-window pin to have known prior history");
+        }
+    }
+
+    [SkippableFact]
+    public async Task AgentPath_HistoryUnderLimit_SendsAllTurns()
+    {
+        // Phase 3.J Thread A pin #1: when prior non-system history count
+        // is <= MaxHistoryTurns, every prior turn flows to the LLM
+        // verbatim. No synthetic truncation note is injected. Caller's
+        // conversation context is intact for the model.
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        await using var customFactory = _factory!.WithWebHostBuilder(b =>
+        {
+            b.ConfigureAppConfiguration((_, cfg) =>
+            {
+                cfg.AddInMemoryCollection(new Dictionary<string, string?>
+                {
+                    ["Assistant:MaxHistoryTurns"] = "3",
+                });
+            });
+        });
+
+        using var client = customFactory.CreateClient();
+        client.DefaultRequestHeaders.Add(TenantClaimsMiddleware.TenantHeaderName, TestTenants.TenantA);
+        client.DefaultRequestHeaders.Add(TenantClaimsMiddleware.UserHeaderName, TestTenants.UserA);
+
+        var convResp = await client.PostAsJsonAsync("/api/conversations",
+            new ConversationEndpoints.CreateConversationRequest(Channel: "api"));
+        var conv = await convResp.Content.ReadFromJsonAsync<ConversationEndpoints.CreateConversationResponse>();
+
+        // Seed 1 user/assistant pair = 2 prior turns. Under the cap of 3.
+        await SeedDirectLlmTurnsAsync(client, conv!.Id, pairCount: 1);
+
+        // Snapshot agent-stub state AFTER seeding so we can isolate the
+        // agent-path call this test triggers next.
+        var agentCallsBefore = _factory.AgentLlmStub.Calls.Count;
+        _factory.AgentLlmStub.EnqueueAssistantText("under-limit response");
+
+        // New user turn via agent path (null Tools → default agent route).
+        var turnResp = await client.PostAsJsonAsync(
+            $"/api/conversations/{conv.Id}/turns",
+            new ConversationEndpoints.AppendTurnRequest(Content: "new turn within cap"));
+        turnResp.StatusCode.Should().Be(HttpStatusCode.OK);
+
+        _factory.AgentLlmStub.Calls.Count.Should().BeGreaterThan(agentCallsBefore,
+            "agent path must have invoked the agent LLM stub at least once for this request");
+
+        var call = _factory.AgentLlmStub.Calls[agentCallsBefore];
+
+        // No synthetic truncation note when prior count <= cap.
+        call.MessageContents.Should().NotContain(
+            c => c.Contains("Earlier conversation history truncated"),
+            "history count of 2 is under MaxHistoryTurns=3 → no synthetic truncation note");
+
+        // The seeded user message must reach the LLM verbatim.
+        call.MessageContents.Should().Contain("seed user message 0",
+            "prior user turn from seeding flows to the LLM intact");
+        call.MessageContents.Should().Contain("new turn within cap",
+            "new user message is the tail of the messages list");
+    }
+
+    [SkippableFact]
+    public async Task AgentPath_HistoryOverLimit_SendsWindowPlusSystemTurn()
+    {
+        // Phase 3.J Thread A pin #2: when prior non-system history count
+        // exceeds MaxHistoryTurns, only the last N non-system turns are
+        // included AND a ChatRole.System message (the synthetic
+        // truncation note) is prepended before the windowed slice. The
+        // oldest non-system turn is dropped.
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        await using var customFactory = _factory!.WithWebHostBuilder(b =>
+        {
+            b.ConfigureAppConfiguration((_, cfg) =>
+            {
+                cfg.AddInMemoryCollection(new Dictionary<string, string?>
+                {
+                    ["Assistant:MaxHistoryTurns"] = "3",
+                });
+            });
+        });
+
+        using var client = customFactory.CreateClient();
+        client.DefaultRequestHeaders.Add(TenantClaimsMiddleware.TenantHeaderName, TestTenants.TenantA);
+        client.DefaultRequestHeaders.Add(TenantClaimsMiddleware.UserHeaderName, TestTenants.UserA);
+
+        var convResp = await client.PostAsJsonAsync("/api/conversations",
+            new ConversationEndpoints.CreateConversationRequest(Channel: "api"));
+        var conv = await convResp.Content.ReadFromJsonAsync<ConversationEndpoints.CreateConversationResponse>();
+
+        // Seed 3 user/assistant pairs = 6 prior non-system turns. Over
+        // the cap of 3. Window must keep positions 3,4,5 (the last 3).
+        await SeedDirectLlmTurnsAsync(client, conv!.Id, pairCount: 3);
+
+        var agentCallsBefore = _factory.AgentLlmStub.Calls.Count;
+        _factory.AgentLlmStub.EnqueueAssistantText("windowed response");
+
+        var turnResp = await client.PostAsJsonAsync(
+            $"/api/conversations/{conv.Id}/turns",
+            new ConversationEndpoints.AppendTurnRequest(Content: "newest user message"));
+        turnResp.StatusCode.Should().Be(HttpStatusCode.OK);
+
+        var call = _factory.AgentLlmStub.Calls[agentCallsBefore];
+
+        // (a) System message present somewhere in the messages list. The
+        // executor injects its own tool-aware system prompt at index 0;
+        // additionally the synthetic truncation note (a second System
+        // message) lives between the executor system prompt and the
+        // windowed prior turns.
+        call.MessageRoles.Should().Contain(Trellis.Core.Models.ChatRole.System,
+            "agent path with trimmed history must surface a System message — either the executor's tool-aware prompt, the synthetic truncation note, or both");
+
+        // (c) The new user message is the tail of the LLM-bound list.
+        call.MessageContents.Last().Should().Be("newest user message",
+            "the new user message is appended as the final element of the messages list");
+
+        // (b) The LAST 3 non-system prior turns appear in original
+        // chronological order. With 3 seed pairs persisted at positions
+        // 0..5 (user@0, asst@1, user@2, asst@3, user@4, asst@5), the
+        // last 3 non-system turns are positions 3, 4, 5: assistant reply
+        // to pair 1, then pair 2's user message ("seed user message 2"),
+        // then pair 2's assistant reply. "seed user message 2" is the
+        // only user-content marker inside the window.
+        call.MessageContents.Should().Contain("seed user message 2",
+            "pair 2's user turn (position 4) is inside the last-3 window");
+
+        // Original chronological order pin: indexOf(seed 2) < indexOf(new).
+        var indexSeed2 = -1;
+        var indexNew = -1;
+        for (var i = 0; i < call.MessageContents.Count; i++)
+        {
+            if (call.MessageContents[i] == "seed user message 2") indexSeed2 = i;
+            if (call.MessageContents[i] == "newest user message") indexNew = i;
+        }
+        indexSeed2.Should().BeGreaterOrEqualTo(0);
+        indexNew.Should().BeGreaterThan(indexSeed2,
+            "new user message is appended after the windowed slice");
+
+        // FIRST prior turn ("seed user message 0", position 0) is
+        // dropped — it falls outside the last-3 window of 6 non-system
+        // priors. "seed user message 1" (position 2) is also dropped
+        // (only the assistant reply at position 3 lands in the window).
+        call.MessageContents.Should().NotContain("seed user message 0",
+            "the oldest seeded user turn (position 0) falls outside the last-3 window and is dropped from the LLM context");
+        call.MessageContents.Should().NotContain("seed user message 1",
+            "seed user message 1 at position 2 also falls outside the last-3 window (positions 3,4,5 stay)");
+    }
+
+    [SkippableFact]
+    public async Task AgentPath_HistoryOverLimit_InjectsTruncationNote()
+    {
+        // Phase 3.J Thread A pin #3: when trimming occurs, the synthetic
+        // ChatRole.System message carrying the canonical truncation
+        // notice text reaches the LLM. The same text MUST NOT appear in
+        // any persisted turn — it's ephemeral, in-memory only.
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        await using var customFactory = _factory!.WithWebHostBuilder(b =>
+        {
+            b.ConfigureAppConfiguration((_, cfg) =>
+            {
+                cfg.AddInMemoryCollection(new Dictionary<string, string?>
+                {
+                    ["Assistant:MaxHistoryTurns"] = "3",
+                });
+            });
+        });
+
+        using var client = customFactory.CreateClient();
+        client.DefaultRequestHeaders.Add(TenantClaimsMiddleware.TenantHeaderName, TestTenants.TenantA);
+        client.DefaultRequestHeaders.Add(TenantClaimsMiddleware.UserHeaderName, TestTenants.UserA);
+
+        var convResp = await client.PostAsJsonAsync("/api/conversations",
+            new ConversationEndpoints.CreateConversationRequest(Channel: "api"));
+        var conv = await convResp.Content.ReadFromJsonAsync<ConversationEndpoints.CreateConversationResponse>();
+
+        await SeedDirectLlmTurnsAsync(client, conv!.Id, pairCount: 3);
+
+        var agentCallsBefore = _factory.AgentLlmStub.Calls.Count;
+        _factory.AgentLlmStub.EnqueueAssistantText("truncation-note response");
+
+        var turnResp = await client.PostAsJsonAsync(
+            $"/api/conversations/{conv.Id}/turns",
+            new ConversationEndpoints.AppendTurnRequest(Content: "trigger truncation"));
+        turnResp.StatusCode.Should().Be(HttpStatusCode.OK);
+
+        // (A) The truncation note text reaches the LLM.
+        var call = _factory.AgentLlmStub.Calls[agentCallsBefore];
+        call.MessageContents.Should().Contain(
+            c => c.Contains("Earlier conversation history truncated"),
+            "synthetic ChatRole.System truncation note must reach the LLM-bound messages list when the cap trims prior history");
+
+        // (B) The synthetic note must NOT have been persisted. Pull
+        // turns via the store directly so the assertion exercises the
+        // real persistence boundary, not just the HTTP read shape.
+        using var scope = customFactory.Services.CreateScope();
+        var store = scope.ServiceProvider.GetRequiredService<IAssistantConversationStore>();
+        var conversationGuid = Ulid.Parse(conv.Id).ToGuid();
+        var persistedTurns = await store.GetTurnsAsync(
+            TestTenants.TenantA, TestTenants.UserA, conversationGuid, CancellationToken.None);
+
+        persistedTurns.Should().NotBeEmpty(
+            "the conversation has seeded + new turns persisted");
+        persistedTurns.Select(t => t.Content).Should().NotContain(
+            c => c.Contains("Earlier conversation history truncated"),
+            "the synthetic truncation note is ephemeral (in-memory only) — it MUST NOT appear in any persisted turn content");
+
+        // Belt-and-suspenders: also check via the GET endpoint shape
+        // (no truncation note in the wire response either).
+        var getResp = await client.GetAsync($"/api/conversations/{conv.Id}");
+        var getBody = await getResp.Content.ReadFromJsonAsync<ConversationEndpoints.GetConversationResponse>();
+        getBody!.Turns.Select(t => t.Content).Should().NotContain(
+            c => c.Contains("Earlier conversation history truncated"),
+            "wire shape exposes the same persisted turns — no leakage into client-visible content");
+    }
 }

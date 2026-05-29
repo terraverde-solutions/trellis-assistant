@@ -18,6 +18,7 @@ Read first:
 - [`docs/phase-3g-design.md`](docs/phase-3g-design.md) — Phase 3.G design rationale (middleware-level UUID validation: rejects non-UUID tenant_id at 401 before reaching endpoints; collapses 3× redundant `Guid.TryParse + defensive 400` branches downstream; upgrades 401 body to RFC 7807 ProblemDetails; closes the Phase 3.F untenanted-fallback bypass; pin #3 Guid-in-Items deferred to cross-repo Core widening)
 - [`docs/phase-3h-design.md`](docs/phase-3h-design.md) — Phase 3.H design rationale (OpenTelemetry tool-call observability: ActivitySource + 4 custom metrics + log-scope trace correlation; OTLP HTTP exporter opt-in via `OpenTelemetry:Endpoint`; cardinality discipline — NEVER tag with user_id; budget-exhausted distinct from failure counter)
 - [`docs/phase-3i-design.md`](docs/phase-3i-design.md) — Phase 3.I design rationale (cancellation-outcome OTel pin closing Phase 3.H non-blocking suggestion + WorkflowScheduleTool prototype: schedule-by-id branch only, JWT propagation via IHttpContextAccessor, LLM-readable failure envelopes — auth_failed/definition_not_found/transient/bad_request — opt-in `ExposeWorkflowSchedule` flag default false)
+- [`docs/phase-3j-design.md`](docs/phase-3j-design.md) — Phase 3.J design rationale (conversation history sliding window with ephemeral truncation note + token-usage / LLM-call-latency / agent-run-duration OTel metering closing the Phase 3.H observability gaps; cardinality discipline preserved — NEVER tag with user_id)
 
 ## What this component is
 
@@ -30,6 +31,26 @@ The component design lives in [`59-trellis-assistant.md`](https://github.com/ter
 phase + guard-rails for what NOT to do yet.
 
 ## Status
+
+**Phase 3.J — conversation history sliding window + token/latency/run-duration OTel metering scaffolded** on `kimi/phase-3j-history-window-plus-token-metering`. Two complementary self-contained threads:
+
+- **Thread A — history sliding window:** fixes the correctness gap where `ConversationOrchestrator.HandleAgentPathAsync` was sending EVERY prior turn to the LLM (a Phase 2-era comment flagged "context-window-aware truncation" but it was never built). New surface:
+  - `Services/ConversationOrchestratorOptions.cs` — new `MaxHistoryTurns` field (int, default 40, `[Range(1, 1000)]`), bound from top-level `Assistant:MaxHistoryTurns`.
+  - `Services/ConversationOrchestrator.cs` — new internal static helper `BuildAgentMessages(prior, userContent, maxHistoryTurns)`. Splits prior into system vs non-system; always includes the system turn; takes the LAST N non-system turns; if trimming occurred, prepends an ephemeral synthetic `ChatRole.System` message carrying `TruncationNoticeText` ("[Earlier conversation history truncated to fit the context window.]") AFTER the original system turn but BEFORE the windowed turns. The synthetic note is in-memory only — NEVER persisted to the turns table. `HandleAgentPathAsync` now calls the helper. Ctor takes `IOptions<ConversationOrchestratorOptions>`.
+  - `Trellis.Assistant.Tests/TestFixtures/StubAgentLlmClient.cs` — `RecordedCall` widened with `MessageContents` so tests can inspect content reaching the LLM, not just roles.
+  - 3 new pin tests in `ConversationEndpointTests`: under-limit forwards all, over-limit windows + injects note, over-limit confirms note NOT persisted.
+  - Sliding window only; NOT summarization (separate future phase).
+
+- **Thread B — token/latency/run-duration OTel metering:** closes three Phase 3.H observability gaps. New surface:
+  - `Observability/AgentTelemetry.cs` — three new `Histogram<double>` instruments:
+    - `TokensUsed` (`trellis.assistant.tokens.used`, unit `{tokens}`) — emitted **per LLM call** (not per run). Tags `{model, tenant.id}`. Per-call emission catches runaway loops mid-flight.
+    - `LlmCallDurationMs` (`trellis.assistant.llm.call.duration_ms`) — Stopwatch-measured around `_llm.ChatWithToolsAsync`. Tags `{model, tenant.id}`. Closes the "LLM vs tool" gap in traces.
+    - `AgentRunDurationMs` (`trellis.assistant.agent.run.duration_ms`) — emitted ONCE at terminal, end of `ExecuteLoopAsync`. Tags `{tenant.id, outcome}` where outcome is mapped from `AgentRunStatus` via `Outcomes.Map(...)`. Outcome vocabulary is the **canonical fleet-wide cross-service set**: `"success"` / `"failure"` / `"cancelled"` (shared with Phase 3.H per-dispatch histograms AND qwen Workflow's run-duration metering per qwen PR #19), plus Assistant-run-specific additions `"cap_reached"` / `"loop_detected"` (no cross-service equivalent), with defensive `"unknown"` for in-flight states (Planning/Running) that shouldn't reach terminal mapping.
+  - `AgentExecution/AssistantAgentExecutor.cs` — `Stopwatch` wraps the LLM call in `ExecuteLoopAsync`; on success emits `LlmCallDurationMs` + `TokensUsed`. Failure-path catch stops the stopwatch but does NOT emit (incomplete data). Run-duration emitted from `startedAt` → `DateTime.UtcNow` at the end of the loop, mapped via `AgentTelemetry.Outcomes.Map`.
+  - `Observability/AgentTelemetryTests.cs` — 3 new pin tests reusing the existing `MetricCapture.Start(_testOrgId)` + per-test fresh tenant Guid filter pattern (Phase 3.H cross-test-pollution fix). Each negative-asserts `user.id` absence per Phase 3.H pin #3.
+  - Cardinality discipline preserved: NEVER tag with `user.id`. NEVER tag metrics with `agent.run.id` or `step.index` (activity-only).
+
+**Numbers:** 283 → 289 passing across 3 deterministic Release runs (293 total incl. 4 Ollama-gated skips). Cumulative LoC: +608 (production +264, tests +344). Test:prod ratio = 1.30.
 
 **Phase 3.I — cancellation-outcome OTel pin + WorkflowScheduleTool prototype scaffolded** on `kimi/phase-3i-cancellation-pin-plus-workflow-schedule-tool`. Two threads bundled:
 
@@ -312,6 +333,18 @@ Steady-state QA redeploys: `trellis-deploy/scripts/qa/Deploy-Assistant-Standalon
 - Unit: `trellis-assistant-qa.service`
 - Auth: shared `trellisqa` HTTP Basic credential at the Hetzner edge (same as web-qa + trainer-qa); GB10-side nginx is auth-free
 - Bootstrap walkthrough: `trellis-deploy/scripts/qa/bootstrap-assistant.md`
+
+## Don't (Phase 3.J)
+
+- **Don't drift from the canonical fleet outcome-tag vocabulary.** The values `"success"` / `"failure"` / `"cancelled"` are the cross-service canonical set used by Phase 3.H per-dispatch histograms, Phase 3.J per-run histograms, AND qwen Workflow's run-duration metering (qwen PR #19). `"cap_reached"` / `"loop_detected"` are Assistant-run-specific additions with no cross-service equivalent. Any new metric emitting an `outcome` tag MUST use these strings, sourced from the `Outcomes` constants in `AgentTelemetry.cs` — never inline a string literal. Cross-service dashboards depend on this consistency.
+- **Don't apply the sliding window to the persisted turn list.** Phase 3.J windowing is LLM-context-only. `IAssistantConversationStore.GetTurnsAsync` still returns the full history; the orchestrator windows what it forwards to the LLM. Pruning the `turns` table for storage reasons is a separate orthogonal plate.
+- **Don't drop the system turn from the window.** Pin A3 — system prompt + persona + tool catalogue is load-bearing. The system turn lives at index 0 of the LLM-bound list; the windowing operates only on non-system turns. Pinned by `AgentPath_HistoryOverLimit_SendsWindowPlusSystemTurn`.
+- **Don't persist the synthetic truncation note.** Pin A4. The note's purpose is to inform the LLM about its truncated context for THIS request only; persisting it would clutter the conversation history with operational metadata that's stale by the next turn. Pinned by `AgentPath_HistoryOverLimit_InjectsTruncationNote` (queries the store + asserts no persisted turn carries the marker).
+- **Don't add summarization in v0.** Pin A2 — the summarization variant ("summarize older turns via an extra LLM call before truncating") needs a faithful-summary steering layer + adds an extra LLM call per trim. Heavier + deferred. Sliding window only.
+- **Don't emit `tokens.used` only at run completion.** Pin B1 — per-LLM-call emission is what catches runaway loops mid-flight. Aggregating to per-run loses the mid-run pattern operators need.
+- **Don't emit `llm.call.duration_ms` on the failure path.** Pin B2 — failed LLM calls don't carry useful latency data (HttpClient.Timeout vs Ollama-returned-error vs network blip have different distributions). The Stopwatch is started but the Record fires only after a successful return. If failure-rate alerting becomes useful later, that's a separate `llm.call.failure.count` counter.
+- **Don't add `agent.run.id` or `step.index` as METRIC tags on the new histograms.** Phase 3.H pin discipline — high cardinality lives on activity tags only. The new tokens/latency/run-duration histograms must stay on bounded tag sets.
+- **Don't tag the new histograms with `user.id`.** Phase 3.H pin #3, preserved + actively enforced by all 3 Thread B pins (each negative-asserts `user.id` absence). Adding it would explode collector cardinality across the fleet's users.
 
 ## Don't (Phase 3.I)
 
