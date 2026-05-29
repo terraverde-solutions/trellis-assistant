@@ -1,6 +1,6 @@
 # Phase 3.J design — conversation history windowing + token/latency OTel metering
 
-**Status:** scaffolded on `kimi/phase-3j-history-window-plus-token-metering`. Two complementary, self-contained threads landed in parallel (no file overlap; orchestrated via a workflow).
+**Status:** scaffolded on `kimi/phase-3j-history-window-plus-token-metering`. **PR #17 fix-up applied** post-review: appsettings.json default surfaced, helper signature cleaned, `outcome` tag vocabulary aligned across Phase 3.H + 3.J, tokens histogram value pinned, non-success terminal outcome pin added. Two complementary, self-contained threads landed in parallel (no file overlap; orchestrated via a workflow).
 
 - **Thread A — history sliding window:** fixes a correctness gap flagged by an explicit "Phase 2+ adds context-window-aware truncation" comment that was never built. Today `ConversationOrchestrator.HandleAgentPathAsync` sends EVERY prior turn to the LLM — a long conversation overflows the model's context window. Thread A adds a configurable sliding window with an ephemeral truncation note.
 - **Thread B — token/latency/run-duration OTel metering:** closes three observability gaps the Phase 3.H instrumentation left open. Tokens were accumulated correctly in `AgentRun.TokensUsed` but never exported. LLM-call latency was unmeasured (traces couldn't distinguish "LLM was slow" from "tool was slow"). Run-duration had no histogram for completion-time tracking.
@@ -18,7 +18,7 @@
 | B2 | LLM-call latency via `Stopwatch` around the await | Closes the "LLM-vs-tool" gap in traces. Recorded ONLY on successful return — failed LLM calls already terminate the loop and don't carry useful latency data. |
 | B3 | Run-duration emitted once at terminal | Wall-clock from `startedAt` to `DateTime.UtcNow` at the end of `ExecuteLoopAsync`, just before the `return new LoopResult`. Single emission per run; bounded cardinality. |
 | B4 | Tags: NEVER `user.id` | Phase 3.H pin #3 — unbounded cardinality across the fleet's users. Tokens + LLM-call latency: `{ model, tenant.id }`. Run-duration: `{ tenant.id, outcome }`. Negative-asserted in every new test. |
-| B5 | Outcome tag = AgentRunStatus mapped via `Outcomes.Map(...)` | Snake_case lowercase per existing convention (`succeeded` / `failed` / `cap_reached` / `loop_detected` / `cancelled`). In-flight states (Planning/Running) defensively fall through to `"unknown"` so a programming bug surfaces via an alertable outcome rather than crashing the metric pipeline. |
+| B5 | Outcome tag = AgentRunStatus mapped via `Outcomes.Map(...)` | Snake_case lowercase per existing convention. **Fix-up:** vocabulary aligned to Phase 3.H — happy path emits `"success"` (not `"succeeded"`); failure emits `"failure"` (not `"failed"`). `Cancelled` was already shared. Run-specific additions `"cap_reached"` / `"loop_detected"` stay run-specific (no 3.H equivalent). In-flight states (Planning/Running) defensively fall through to `"unknown"`. Operators get friction-free PromQL groupings on the `outcome` tag across both per-dispatch (3.H) and per-run (3.J) histograms. |
 
 ## What landed
 

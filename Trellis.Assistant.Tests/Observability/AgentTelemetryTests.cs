@@ -320,8 +320,8 @@ public sealed class AgentTelemetryTests : IClassFixture<PostgresFixture>, IAsync
         var tokens = capture.GetMeasurements("trellis.assistant.tokens.used");
         tokens.Should().HaveCountGreaterThanOrEqualTo(1,
             "TokensUsed fires at least once per successful LLM call");
-        tokens[0].Value.Should().BeGreaterThanOrEqualTo(0,
-            "token count is non-negative; stub enqueued tokensUsed=123 so >= 0 holds trivially");
+        tokens[0].Value.Should().Be(123,
+            "stub enqueued tokensUsed=123 → histogram MUST record the actual value, not just any non-negative number; pins the llmResponse.TokensUsed → Record value-propagation path");
         var tags = tokens[0].Tags;
         tags.Should().ContainKey("model").WhoseValue.Should().Be("stub-model",
             "TokensUsed is tagged with the configured model so operators can break out token cost per model");
@@ -387,13 +387,50 @@ public sealed class AgentTelemetryTests : IClassFixture<PostgresFixture>, IAsync
         runDuration[0].Value.Should().BeGreaterThanOrEqualTo(0,
             "duration is non-negative wall-clock ms");
         var tags = runDuration[0].Tags;
-        tags.Should().ContainKey("outcome").WhoseValue.Should().Be("succeeded",
-            "happy path → terminal AgentRunStatus.Succeeded → outcome=succeeded per Outcomes.Map");
+        tags.Should().ContainKey("outcome").WhoseValue.Should().Be("success",
+            "happy path → terminal AgentRunStatus.Succeeded → outcome=success per Outcomes.Map. Phase 3.J fix-up aligned the vocabulary across 3.H + 3.J so cross-histogram PromQL groupings on `outcome` are friction-free.");
         tags.Should().ContainKey("tenant.id").WhoseValue.Should().Be(_testOrgId.ToString("D"));
         tags.Should().NotContainKey("user.id",
             "Phase 3.H pin #3: never tag metrics with user.id");
         tags.Should().NotContainKey("agent.run.id",
             "Phase 3.H pin #3: agent.run.id is high-cardinality, activity-only");
+    }
+
+    [SkippableFact]
+    public async Task AgentRun_OnCompletion_CapReached_RecordsOutcomeCapReached()
+    {
+        // Phase 3.J fix-up: covers a non-success terminal branch of
+        // Outcomes.Map. Without this pin, only the happy path
+        // (succeeded → "success") was tested; the failed / cap_reached /
+        // loop_detected branches were dead code from a coverage POV. A
+        // refactor that swapped Map's mapping (e.g. CapReached →
+        // "loop_detected" by mistake) would have shipped silently.
+        Skip.IfNot(_pg.IsAvailable, "Docker not available; Testcontainers integration test skipped.");
+
+        // Same pattern as AssistantAgentExecutorTests.BudgetGate_StepCapReached:
+        // MaxSteps=1, stub keeps emitting tool_calls so the budget gate
+        // fires at the top of the second iteration → terminal
+        // AgentRunStatus.CapReached → outcome=cap_reached.
+        using var capture = MetricCapture.Start(_testOrgId);
+        var executor = NewExecutor(
+            new StubAgentLlmClient()
+                .EnqueueToolCall("echo", """{"text":"step 0"}""")
+                .EnqueueToolCall("echo", """{"text":"won't reach"}"""));
+
+        await executor.RunAsync(AgentRunRequest.Create(
+            orgId: _testOrgId,
+            userPrompt: "force cap_reached",
+            availableTools: new List<AgentToolDescriptor> { new EchoTool().Descriptor },
+            budgetOverrides: new AgentBudgetOverrides { MaxSteps = 1 }));
+
+        var runDuration = capture.GetMeasurements("trellis.assistant.agent.run.duration_ms");
+        runDuration.Should().HaveCount(1,
+            "AgentRunDurationMs fires exactly once per agent run, even on cap-reached terminal");
+        runDuration[0].Tags.Should().ContainKey("outcome").WhoseValue.Should().Be("cap_reached",
+            "AgentRunStatus.CapReached → Outcomes.Map → \"cap_reached\". Pins the non-success branch of the mapping.");
+        runDuration[0].Tags.Should().ContainKey("tenant.id").WhoseValue.Should().Be(_testOrgId.ToString("D"));
+        runDuration[0].Tags.Should().NotContainKey("user.id",
+            "Phase 3.H pin #3 cardinality discipline preserved on the non-success branch too");
     }
 
     // ---------------- helpers ----------------

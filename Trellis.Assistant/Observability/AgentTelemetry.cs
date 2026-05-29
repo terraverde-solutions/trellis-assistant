@@ -155,22 +155,27 @@ public static class AgentTelemetry
     /// </summary>
     public static class Outcomes
     {
+        // Shared vocabulary across Phase 3.H (per-tool-dispatch) +
+        // Phase 3.J (per-run) so an operator writing a cross-histogram
+        // PromQL query on the `outcome` tag gets consistent values for
+        // the same conceptual outcome. Originally 3.J emitted
+        // past-tense forms ("succeeded"/"failed"); the 3.J fix-up
+        // aligned to 3.H's noun forms ("success"/"failure"). Run-level
+        // additions (cap_reached, loop_detected) have no 3.H equivalent
+        // and stay run-specific.
         public const string Success = "success";
         public const string Failure = "failure";
         public const string Cancelled = "cancelled";
         public const string BudgetExhausted = "budget_exhausted";
 
-        // Phase 3.J Thread B: terminal AgentRunStatus → outcome tag for
-        // the AgentRunDurationMs histogram. Snake_case lowercase per the
-        // Phase 3.H tag conventions. The in-flight states (Planning,
-        // Running) shouldn't reach terminal mapping; defensive fallback
-        // to "unknown" keeps the metric pipeline alive if a programming
-        // bug lets one slip through (an alert on outcome=unknown would
-        // surface the regression).
-        public const string Succeeded = "succeeded";
-        public const string Failed = "failed";
+        // Phase 3.J Thread B run-specific additions. CapReached +
+        // LoopDetected have no per-dispatch equivalent in 3.H —
+        // they're properties of the agent run as a whole.
         public const string CapReached = "cap_reached";
         public const string LoopDetected = "loop_detected";
+        // Defensive bucket for in-flight states (Planning, Running) that
+        // shouldn't reach terminal mapping; an alert on outcome=unknown
+        // surfaces a programming regression without crashing the run.
         public const string Unknown = "unknown";
 
         /// <summary>
@@ -181,8 +186,8 @@ public static class AgentTelemetry
         /// </summary>
         public static string Map(AgentRunStatus status) => status switch
         {
-            AgentRunStatus.Succeeded => Succeeded,
-            AgentRunStatus.Failed => Failed,
+            AgentRunStatus.Succeeded => Success,
+            AgentRunStatus.Failed => Failure,
             AgentRunStatus.CapReached => CapReached,
             AgentRunStatus.LoopDetected => LoopDetected,
             AgentRunStatus.Cancelled => Cancelled,

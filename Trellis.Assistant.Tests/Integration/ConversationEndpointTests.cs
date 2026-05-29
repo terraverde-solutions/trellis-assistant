@@ -1573,13 +1573,12 @@ public sealed class ConversationEndpointTests : IClassFixture<PostgresFixture>, 
     // ---------------- Phase 3.J Thread A: sliding-window history cap ----------------
 
     /// <summary>
-    /// Seed N user+assistant turns on the conversation via the direct-LLM
-    /// path (Tools=[]) so the agent stub stays untouched during seeding.
-    /// Returns the agent stub's call count snapshot taken AFTER seeding
-    /// so the test can find the agent-path call deterministically among
-    /// any prior leakage from other tests in the same factory.
+    /// Seed N user+assistant turn pairs on the conversation via the
+    /// direct-LLM path (<c>Tools=[]</c>) so the agent-LLM stub stays
+    /// untouched during seeding — its call counter then reflects ONLY
+    /// the subsequent agent-path call the test exercises.
     /// </summary>
-    private static async Task<int> SeedDirectLlmTurnsAsync(
+    private static async Task SeedDirectLlmTurnsAsync(
         HttpClient client,
         string conversationId,
         int pairCount)
@@ -1595,7 +1594,6 @@ public sealed class ConversationEndpointTests : IClassFixture<PostgresFixture>, 
             resp.StatusCode.Should().Be(HttpStatusCode.OK,
                 $"seed turn {i} must persist for the sliding-window pin to have known prior history");
         }
-        return 0;
     }
 
     [SkippableFact]
